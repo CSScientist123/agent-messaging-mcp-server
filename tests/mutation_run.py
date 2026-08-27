@@ -63,6 +63,64 @@ LOCK = REPO / ".mutation_running"
 #: (label, file, find, replace, the invariant it breaks)
 MUTANTS: list[tuple[str, str, str, str, str]] = [
     (
+        "an-error-ends-the-exchange", "schema/schema.sql",
+        "    ('[ERROR]',            2, NULL, 0, '[MESSAGE-RESPONSE]'),",
+        "    ('[ERROR]',            2, NULL, 0, NULL),",
+        "an [ERROR] is delivered, acted on, and the slot frees with nothing sent back, so "
+        "a Caller that corrects a blocked Partner never learns the correction landed",
+    ),
+    (
+        "a-hold-is-typed-at-the-agent", "messaging_core/core.py",
+        '            if task["behavior"] == INTERRUPT_BEHAVIOR:\n'
+        '                task["remote_call_id"] = None',
+        '            if False and task["behavior"] == INTERRUPT_BEHAVIOR:\n'
+        '                task["remote_call_id"] = None',
+        "an [IDLE] is rendered and delivered, so a deliberately stopped agent is handed a "
+        "paragraph to act on",
+    ),
+    (
+        "a-partner-does-not-park-itself", "messaging_core/core.py",
+        "            behavior in _RAISES_UPWARD",
+        "            False and behavior in _RAISES_UPWARD",
+        "a Partner that raises a question upward keeps working, so the next queued message "
+        "reaches an agent blocked on an unanswered question and the two interleave",
+    ),
+    (
+        "a-caller-parks-itself-dispatching-work", "messaging_core/core.py",
+        "            and travelling_up\n",
+        "",
+        "the direction test is dropped, so an orchestrator stops itself every time it asks "
+        "a worker anything and halts everything it drives",
+    ),
+    (
+        "a-lineage-may-fork", "messaging_core/core.py",
+        '                    "gemini_already_inherited",',
+        '                    "duplicate_handshake",',
+        "a second conversation may claim the same predecessor, so 'which conversation "
+        "succeeds this one' has more than one answer",
+    ),
+    (
+        "inheritance-costs-the-orchestrator-its-reach", "messaging_core/core.py",
+        '                "  AND pr.source_prefix = \'science_\'",',
+        '                "  AND pr.source_prefix != \'\'",',
+        "gemini_single_science_source counts every inbound handshake again, so an inherited "
+        "conversation becomes unreachable by the orchestrator that pays budget for it",
+    ),
+    (
+        "a-notebook-is-asked-like-an-agent", "messaging_core/core.py",
+        '        if task["behavior"] == "[QUERY]" and self._partner_type(partner) == "nlm_":',
+        '        if False and self._partner_type(partner) == "nlm_":',
+        "a notebook receives the agent relay, including an identity block inviting it to "
+        "call send -- which it cannot, having can_send = 0",
+    ),
+    (
+        "deleting-a-project-drops-work-in-flight", "messaging_core/core.py",
+        "            if in_flight is not None:",
+        "            if False and in_flight is not None:",
+        "deleting a Project cascades away queued work with no way to tell whoever is "
+        "waiting, and no notice can survive the DELETE that would warn them",
+    ),
+    (
         "delivers-into-an-unready-tui", "adapters/antigravity/adapter.py",
         "        if not self._await_idle(session):",
         "        if False and not self._await_idle(session):",

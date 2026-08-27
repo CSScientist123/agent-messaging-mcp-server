@@ -206,3 +206,47 @@ def test_a_report_to_an_archived_caller_does_not_raise(db, core):
 
     assert result is not None
     assert not result.get("delivered", False)
+
+
+def test_deleting_a_project_with_work_in_flight_is_refused(db, core):
+    """A Project deletion cannot report itself either, and cascades wider.
+
+    Every queue row under the project goes, and `message_queue.caller_id` is
+    `ON DELETE CASCADE` too — so a notice written to warn a waiting Caller is
+    destroyed by the very DELETE it warns about, exactly as in
+    `delete_partner`. There is no shape of message that survives, so it
+    refuses and names the route that does report.
+    """
+    caller, worker = make_pair(core)
+    core.send(
+        requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+        message="investigate x", behavior="[RESEARCH]",
+    )
+    project_title = db.read_one(
+        "SELECT pr.title AS title FROM projects pr JOIN partners p ON p.project_id = pr.id "
+        "WHERE p.id = ?", (worker["id"],)
+    )["title"]
+
+    with pytest.raises(Rejected) as exc_info:
+        core.delete_project(requester_uuid=caller["uuid"], project_title=project_title)
+
+    assert exc_info.value.code == "partner_has_work_in_flight", (
+        f"expected a refusal naming the work in flight, got {exc_info.value.code!r}"
+    )
+    assert db.read_one("SELECT 1 AS x FROM partners WHERE id = ?", (worker["id"],)) is not None, (
+        "a refused deletion must leave the project and its partners in place"
+    )
+
+
+def test_deleting_a_project_with_nothing_in_flight_still_works(db, core):
+    """The refusal is scoped to work in flight, not a new blanket ban."""
+    caller, worker = make_pair(core)
+    project_title = db.read_one(
+        "SELECT pr.title AS title FROM projects pr JOIN partners p ON p.project_id = pr.id "
+        "WHERE p.id = ?", (worker["id"],)
+    )["title"]
+
+    result = core.delete_project(requester_uuid=caller["uuid"], project_title=project_title)
+
+    assert result["partners_deleted"] >= 2
+    assert db.read_one("SELECT 1 AS x FROM partners WHERE id = ?", (worker["id"],)) is None

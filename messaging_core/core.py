@@ -84,6 +84,12 @@ _PREFIXES: tuple[str, ...] = ("nlm_", "code_", "science_", "gemini_")
 #: delegation -- letting it through would bypass the hierarchy rule `send`
 #: enforces. `[IDLE]` is a hold rather than a message and has no meaning in a
 #: Caller's queue.
+#: The two labels a Partner raises when it cannot finish without its Caller --
+#: a question about what was meant, or a statement that something blocked it.
+#: Sent UPWARD (see `travelling_up` in `send`) they park the sender, because an
+#: agent waiting on an answer must not also be receiving new work.
+_RAISES_UPWARD: tuple[str, ...] = ("[QUERY]", "[ERROR]")
+
 _NOT_REPORTABLE: tuple[str, ...] = ("[RESEARCH]", INTERRUPT_BEHAVIOR)
 
 #: Rejection codes meaning "this remote has no cancel", as opposed to "the
@@ -921,7 +927,53 @@ class MessagingCore:
             row = conn.execute(
                 "SELECT COUNT(*) AS n FROM partners WHERE project_id = ?", (project["id"],)
             ).fetchone()
-            conn.execute("DELETE FROM projects WHERE id = ?", (project["id"],))
+            # The same two guards `delete_partner` carries, for the same two
+            # reasons, applied to every Partner the cascade would take.
+            #
+            # Work in flight first: deleting the project cascades away every
+            # queue row under it, and `message_queue.caller_id` is
+            # `ON DELETE CASCADE` too, so a notice written to warn a waiting
+            # Caller is destroyed by the very DELETE it warns about. There is
+            # no shape of message that survives this, which is why it refuses
+            # rather than reporting.
+            in_flight = conn.execute(
+                "SELECT p.title AS title FROM partners p "
+                "JOIN message_queue q ON q.partner_id = p.id "
+                "WHERE p.project_id = ? LIMIT 1",
+                (project["id"],),
+            ).fetchone()
+            if in_flight is None:
+                for held in self.slots.occupied():
+                    owner = conn.execute(
+                        "SELECT title FROM partners WHERE id = ? AND project_id = ?",
+                        (held, project["id"]),
+                    ).fetchone()
+                    if owner is not None:
+                        in_flight = owner
+                        break
+            if in_flight is not None:
+                raise Rejected(
+                    "partner_has_work_in_flight",
+                    f"{project['title']!r} still holds work in flight (for example against "
+                    f"{in_flight['title']!r}); deleting it now would drop that work with no "
+                    "way to tell whoever is waiting.",
+                    next_call="Call archive_sessions on its partners instead; archiving "
+                    "reports the loss to every caller waiting.",
+                )
+            try:
+                conn.execute("DELETE FROM projects WHERE id = ?", (project["id"],))
+            except sqlite3.IntegrityError as exc:
+                # A budget grant made by one of these partners references it
+                # with no `ON DELETE` clause, so the cascade stops on a foreign
+                # key rather than a rule -- and a raw IntegrityError reaching a
+                # caller is a stack trace where an explanation belongs.
+                raise Rejected(
+                    "partner_has_dependents",
+                    "This project cannot be deleted because a record outside it still refers "
+                    "to one of its partners (for example, a gemini budget grant one of them "
+                    "made). Archive its partners instead.",
+                    next_call="Call archive_sessions instead.",
+                ) from exc
             return row["n"]
 
         partners_deleted = self.db.write(_delete)
@@ -1255,6 +1307,59 @@ class MessagingCore:
                     "bridge_single_code_partner",
                     "This bridge-scientist is already handshaken with a different code_ partner.",
                 )
+        # A gemini_ pair is decided here, above the orchestrator check, for
+        # exactly the reason the code_ branch is: neither participant holds a
+        # role and neither ever will. All three orchestrator roles are Claude
+        # Science roles (`orchestrator_requires_science_project`), so a gemini_
+        # requester can never satisfy the general rule below, and the
+        # cross-Project branch further down would refuse it a second time for
+        # not matching a role its counterpart also does not hold.
+        #
+        # What this permits is one Antigravity conversation continuing another.
+        # A Project holds at most `max_live_partners` live Partners, so an
+        # effort outlasting one conversation needs another Project rather than
+        # a larger ceiling -- and `project_extension` is how two Projects are
+        # declared parts of one effort. Nothing is carried across: not
+        # permissions, not queued work. It is a handshake and only that.
+        elif req_type == "gemini_" and tgt_type == "gemini_":
+            if requester["project_id"] == target["project_id"]:
+                raise Rejected(
+                    "no_handshake_between_gemini",
+                    "Two Antigravity conversations in one project already answer to the "
+                    "same gemini-orchestrator; there is nothing for one to inherit from "
+                    "the other.",
+                )
+            lo, hi = sorted((requester["project_id"], target["project_id"]))
+            link = self.db.read_one(
+                "SELECT 1 AS ok FROM project_extension WHERE project_a = ? AND project_b = ?",
+                (lo, hi),
+            )
+            if link is None:
+                raise Rejected(
+                    "different_project",
+                    "These two Antigravity conversations belong to projects that have not "
+                    "been declared extensions of one another.",
+                    next_call="Have the gemini-orchestrator call extend_project on the two "
+                    "projects first.",
+                )
+            # A lineage is a line, not a fork. Without this, "which conversation
+            # continues this one" has more than one answer, and every message
+            # travelling back up the chain has more than one place to arrive.
+            successor = self.db.read_one(
+                "SELECT h.from_partner FROM handshakes h "
+                "JOIN partners p ON p.id = h.from_partner "
+                "JOIN projects pr ON pr.id = p.project_id "
+                "WHERE h.to_partner = ? AND pr.source_prefix = 'gemini_' "
+                "  AND p.id != ? AND p.archived_at IS NULL",
+                (target["id"], requester["id"]),
+            )
+            if successor is not None:
+                raise Rejected(
+                    "gemini_already_inherited",
+                    "Another Antigravity conversation already continues this one. A "
+                    "conversation is inherited from once, so that which conversation "
+                    "succeeds it has exactly one answer.",
+                )
         elif requester["orchestrator_type"] is None:
             raise Rejected(
                 "requester_not_orchestrator", "Only an orchestrator may initiate a handshake."
@@ -1268,8 +1373,13 @@ class MessagingCore:
         # therefore scoped to same-source pairs only -- rejecting a
         # cross-source handshake for being cross-Project would reject the one
         # shape that is supposed to work.
-        extended = False
-        if req_type == tgt_type and requester["project_id"] != target["project_id"]:
+        # A gemini_ pair was already decided above, extension row and all --
+        # by the one branch that knows neither side holds a role. Falling into
+        # the general cross-project rule here would ask them for a matching
+        # role a second time and refuse every one of them.
+        gemini_pair = req_type == "gemini_" and tgt_type == "gemini_"
+        extended = gemini_pair
+        if not gemini_pair and req_type == tgt_type and requester["project_id"] != target["project_id"]:
             lo, hi = sorted((requester["project_id"], target["project_id"]))
             link = self.db.read_one(
                 "SELECT 1 AS ok FROM project_extension WHERE project_a = ? AND project_b = ?",
@@ -1312,10 +1422,12 @@ class MessagingCore:
         if existing is not None:
             raise Rejected("duplicate_handshake", "A handshake already exists in this direction.")
 
-        if req_type == "gemini_" and tgt_type == "gemini_":
-            raise Rejected(
-                "no_handshake_between_gemini", "Two gemini_ partners cannot handshake each other."
-            )
+        # A gemini_ pair reaching here has already been through the branch
+        # above, which is the only place that knows what a legal one looks
+        # like: different Projects, linked by an extension, and no successor
+        # already claimed. Refusing it again here would make that branch
+        # unreachable -- the pair-of-sources rules below are about who directs
+        # whom, and inheritance is not a direction of command.
         if req_type == "gemini_" and tgt_type == "science_":
             raise Rejected(
                 "gemini_to_science_illegal", "The gemini_ -> science_ direction is never legal."
@@ -1351,8 +1463,17 @@ class MessagingCore:
                     "Only the gemini-orchestrator may handshake a science_ partner to a "
                     "gemini_ partner.",
                 )
+            # Scoped to science_ sources, which is what this rule has always
+            # said it counts. Counting every inbound handshake would make an
+            # inherited conversation permanently unreachable by the
+            # orchestrator that pays budget for it -- the successor's
+            # inheritance row would read as a second master.
             other_source = self.db.read_one(
-                "SELECT from_partner FROM handshakes WHERE to_partner = ? AND from_partner != ?",
+                "SELECT h.from_partner FROM handshakes h "
+                "JOIN partners p ON p.id = h.from_partner "
+                "JOIN projects pr ON pr.id = p.project_id "
+                "WHERE h.to_partner = ? AND h.from_partner != ? "
+                "  AND pr.source_prefix = 'science_'",
                 (target["id"], requester["id"]),
             )
             if other_source is not None:
@@ -1451,33 +1572,72 @@ class MessagingCore:
         }
 
 
-    def extend_project(self, *, requester_uuid: str, project_title: str) -> dict:
-        """Declare the requester's Project and another one extensions of each other.
+    def extend_project(
+        self, *, requester_uuid: str, project_title: str,
+        other_project_title: str | None = None,
+    ) -> dict:
+        """Declare two Projects extensions of each other.
 
         A Project holds at most `source_caps.max_live_partners` live Partners,
         and that ceiling is deliberate -- it is what `archive_sessions` exists
         to manage. Research at scale therefore needs more Projects, not a
         larger ceiling, and this is how two of them are declared to be parts
         of one effort. Once linked, Partners under them may handshake across
-        the boundary, but only sideways: same role to same role. Read
-        `handshake`.
+        the boundary. Read `handshake` for what that then permits.
+
+        Two forms, and the second exists because the first cannot reach every
+        pair it should.
+
+        With `other_project_title` omitted, the requester's OWN Project is
+        linked to the named one, and only its project-orchestrator may do it.
+
+        With `other_project_title` given, the two NAMED Projects are linked and
+        neither need be the requester's own -- permitted to a
+        gemini-orchestrator linking two `gemini_` Projects. A `gemini_` Project
+        can hold no role at all (all three are Claude Science roles), so it has
+        no project-orchestrator to extend it and no "requester's own Project"
+        to be extended from; without this form two Antigravity Projects could
+        never be linked, and one conversation could never continue another.
+        The gemini-orchestrator is the authority because it is already the only
+        role that may reach an Antigravity conversation, and the one whose
+        budget is spent per conversation.
 
         Symmetric, and stored once: the pair goes in with the lower project id
         first, so "is A an extension of B" has exactly one row to look at and
         cannot answer differently depending on which way it is asked.
+
+        Raises:
+            Rejected: `requires_project_orchestrator`, `requires_gemini_orchestrator`,
+                `self_extension`, `cross_source_extension`, `no_such_project`.
         """
         requester = self._resolve_requester(requester_uuid)
-        if requester["orchestrator_type"] != "project-orchestrator":
-            raise Rejected(
-                "requires_project_orchestrator",
-                "Only the project-orchestrator may extend its project.",
-            )
-        other = self._resolve_project_by_title(project_title)
-        if other["id"] == requester["project_id"]:
+        if other_project_title is None:
+            if requester["orchestrator_type"] != "project-orchestrator":
+                raise Rejected(
+                    "requires_project_orchestrator",
+                    "Only the project-orchestrator may extend its project.",
+                )
+            mine = self._project_by_id(requester["project_id"])
+            other = self._resolve_project_by_title(project_title)
+        else:
+            if requester["orchestrator_type"] != "gemini-orchestrator":
+                raise Rejected(
+                    "requires_gemini_orchestrator",
+                    "Only the gemini-orchestrator may link two projects it does not "
+                    "belong to, and only two gemini_ projects.",
+                )
+            mine = self._resolve_project_by_title(project_title)
+            other = self._resolve_project_by_title(other_project_title)
+            if mine["source_prefix"] != "gemini_" or other["source_prefix"] != "gemini_":
+                raise Rejected(
+                    "requires_gemini_orchestrator",
+                    "The two-project form links gemini_ projects only; a project of any "
+                    "other source is extended by its own project-orchestrator.",
+                )
+        if other["id"] == mine["id"]:
             raise Rejected(
                 "self_extension", "A project cannot be declared an extension of itself."
             )
-        mine = self._project_by_id(requester["project_id"])
         if other["source_prefix"] != mine["source_prefix"]:
             # A cross-source pair already handshakes without an extension --
             # that is the ordinary delegation shape (science_ -> gemini_). An
@@ -1488,7 +1648,7 @@ class MessagingCore:
                 "Two projects of different sources are already able to handshake across the "
                 "project boundary; an extension would grant nothing.",
             )
-        lo, hi = sorted((requester["project_id"], other["id"]))
+        lo, hi = sorted((mine["id"], other["id"]))
 
         def _link(conn: sqlite3.Connection) -> bool:
             cur = conn.execute(
@@ -1826,8 +1986,10 @@ class MessagingCore:
             # been told to abandon.
             raise Rejected(
                 "idle_not_sendable",
-                f"{INTERRUPT_BEHAVIOR} is not a message; it is how an interruption is carried.",
-                next_call="Call interrupt_partner.",
+                f"{INTERRUPT_BEHAVIOR} is not a message; it is a hold, and no tool sends "
+                "one. A Partner is parked by the Polling Server when it is waiting on an "
+                "answer, or by a human -- stopping a Partner mid-turn is never an agent's "
+                "decision, so there is nothing here for you to call instead.",
             )
 
         req_cap = self._source_cap(self._partner_type(requester))
@@ -1859,6 +2021,11 @@ class MessagingCore:
                     "report back.",
                 )
 
+        # Whether this message travels back ALONG a handshake rather than out
+        # along one. Only the park below reads it, and it is False for a target
+        # that needs no handshake at all (nlm_), where there is no direction to
+        # speak of -- and nothing behind it that could be waiting on an answer.
+        travelling_up = False
         if self._needs_handshake(target):
             # A handshake row only ever gets written in the direction an
             # orchestrator claims it (see `handshake`'s `requester_not_orchestrator`
@@ -1892,6 +2059,7 @@ class MessagingCore:
                     "SELECT id FROM handshakes WHERE from_partner = ? AND to_partner = ?",
                     (target["id"], requester["id"]),
                 )
+                travelling_up = reverse_row is not None
                 if reverse_row is None:
                     raise Rejected(
                         "no_handshake",
@@ -1946,6 +2114,35 @@ class MessagingCore:
             "queue_depth": depth,
             "partner_id": target["id"],
         }
+        # A Partner that has just raised a question upward stops and waits.
+        #
+        # Without this, the next queued message reaches an agent that is
+        # blocked on an unanswered question, and it interleaves the two: the
+        # work it cannot finish and whatever arrived next, in one context, with
+        # nothing marking where one ends. The hold is what keeps the unfinished
+        # work paused and intact until the answer comes.
+        #
+        # `travelling_up` is what makes this precise, and it is the condition
+        # that must not be dropped. A Caller dispatching a routine [QUERY] down
+        # to a worker holds a working slot too, and stopping ITSELF every time
+        # it asked a worker anything would halt the orchestrator that drives
+        # everything. Only a message travelling back along a handshake -- which
+        # is a worker answering the Caller that claimed it -- is a Partner
+        # raising a question about work it is in the middle of.
+        #
+        # The hold ends by itself: anything displaces an [IDLE], so the
+        # Caller's answer takes the slot and the paused work resumes behind it.
+        # Nothing has to remember to release it.
+        if (
+            behavior in _RAISES_UPWARD
+            and travelling_up
+            and self.slots.get(requester["id"]) is not None
+        ):
+            self._park(
+                requester, behavior=behavior,
+                target_title=target["title"], waiting_on_id=target["id"],
+            )
+
         try:
             advanced = self.advance(partner_id=target["id"])
         except (Rejected, NeedsRemote) as exc:
@@ -2107,6 +2304,28 @@ class MessagingCore:
             task = dict(head)
             self.slots.clear(partner_id)
 
+            # An [IDLE] is a hold, and nothing is said to a held agent. Its
+            # remote was stopped above, before the swap; typing a paragraph at
+            # a stopped agent hands it something to act on when the entire
+            # point of the hold is that it should be doing nothing. So the
+            # slot is taken and no prompt is rendered or delivered.
+            #
+            # It also means an [IDLE] cannot fail to deliver, which is why
+            # there is no requeue path for one -- and none is wanted: a hold
+            # that had to be retried would stop the partner twice.
+            if task["behavior"] == INTERRUPT_BEHAVIOR:
+                task["remote_call_id"] = None
+                task["prompt"] = None
+                task["started_at"] = _now()
+                self.slots.set(partner_id, task)
+                return {
+                    "delivered": None,
+                    "held": True,
+                    "resumed": False,
+                    "displaced": None if working is None or holding else working["behavior"],
+                    "remote_call_id": None,
+                }
+
             prompt = self._render(task, partner)
             try:
                 remote_call_id = ext.deliver_message(
@@ -2180,16 +2399,6 @@ class MessagingCore:
             "SELECT title FROM partners WHERE id = ?", (task["caller_id"],)
         )
         caller_title = caller["title"] if caller is not None else "an unknown caller"
-        # [IDLE] is checked BEFORE in_process, and the order is the fix for a real
-        # bug. An [IDLE] whose delivery failed is requeued like anything else --
-        # marked in_process, because from the queue's point of view it is a task
-        # that started and stopped. But an [IDLE] is never *resumed*: it is a
-        # hold, and re-rendering it as "resume your previous [IDLE]" would drop
-        # the stop reason on the retry while the reason still sat in the row's
-        # body column. The Caller would see its interruption delivered with the
-        # one thing it was for removed.
-        if task["behavior"] == INTERRUPT_BEHAVIOR:
-            return templates.idle_interruption(caller_title=caller_title, reason=task["body"])
         # Checked BEFORE the general in_process branch below, for the same
         # reason [IDLE] is: a displaced-and-resumed summary phase is not an
         # ordinary paused task, and the general branch renders it wrong. Its
@@ -2213,6 +2422,17 @@ class MessagingCore:
                 write_paths=paths["write"],
                 partner_uuid=partner["uuid"],
                 partner_title=partner["title"],
+            )
+        # A notebook is asked in its own terms. `relay` is written for an
+        # agent -- it names a speaker and closes with the call the recipient
+        # may answer with -- and two of those three mean nothing to a source
+        # that holds documents and never acts. See `templates.notebook_query`
+        # for what replaces them, and why it carries no identity block.
+        if task["behavior"] == "[QUERY]" and self._partner_type(partner) == "nlm_":
+            return templates.notebook_query(
+                caller_title=caller_title,
+                source=partner["partner_id_in_remote"],
+                body=task["body"],
             )
         # A [TRUTHFUL-REPORT] reaching this point is always a summary being
         # DELIVERED, never a request for one -- a request still in progress
@@ -2422,6 +2642,55 @@ class MessagingCore:
     def working_task(self, *, partner_id: int) -> dict | None:
         """The task this Partner is being worked on, or None."""
         return self.slots.get(partner_id)
+
+    def _park(self, requester, *, behavior: str, target_title: str,
+              waiting_on_id: int) -> None:
+        """Stop `requester` until the question it just asked is answered.
+
+        The hold is pushed through the same door as everything else -- admitted
+        as an `[IDLE]` and promoted by `advance` -- rather than written into the
+        slot directly. `advance` is the one place a swap happens, and it is
+        what marks the displaced task `in_process` so it resumes with its body
+        intact; a slot written behind its back would strand the work it
+        replaced.
+
+        The `[IDLE]` is attributed to the Partner being waited ON, which is
+        both true and the only value the schema permits: `message_queue` has
+        `CHECK (caller_id <> partner_id)`, so a Partner cannot be recorded as
+        the caller of its own hold.
+
+        Failure here is logged and swallowed, deliberately. By this point the
+        question is already committed to the Caller's queue, and the two
+        outcomes are not symmetric: a hold that did not take leaves a Partner
+        working while it waits, which the next arriving message will correct
+        anyway, whereas raising would fail a `send` whose message has already
+        been accepted and send the Caller looking for a message it will find.
+        """
+        body = (
+            f"Waiting on {target_title} to answer the {behavior} just sent. "
+            "The work paused behind this hold resumes when that answer arrives."
+        )
+
+        def _push(conn: sqlite3.Connection) -> tuple[int | None, int]:
+            return self._admit(
+                conn,
+                partner_id=requester["id"],
+                caller_id=waiting_on_id,
+                behavior=INTERRUPT_BEHAVIOR,
+                body=body,
+                store=False,
+                from_partner=waiting_on_id,
+            )
+
+        try:
+            with self.slots.lock_for(requester["id"]):
+                self.db.write(_push)
+            self.advance(partner_id=requester["id"])
+        except (Rejected, NeedsRemote) as exc:
+            logger.warning(
+                "could not park %s after it raised a %s: %s",
+                requester["title"], behavior, exc,
+            )
 
     def interrupt_partner(self, *, requester_uuid: str, partner_title: str, reason: str) -> dict:
         """Stop a Partner by pushing an `[IDLE]` into its queue.

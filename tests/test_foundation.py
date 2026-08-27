@@ -570,12 +570,16 @@ def test_resume_displaced_does_not_name_a_behavior_it_was_not_given():
     assert "[RESEARCH]" not in prompt
 
 
-def test_idle_interruption_contains_the_reason_and_caller():
-    prompt = templates.idle_interruption(
-        caller_title="orchestrator", reason="a very specific stopping reason"
+def test_there_is_no_template_for_a_hold():
+    """An [IDLE] is not a message, so nothing renders one.
+
+    The remote is stopped before the swap. Handing a stopped agent a paragraph
+    gives it something to act on when the entire point of the hold is that it
+    should be doing nothing -- so the slot is taken and nothing is sent.
+    """
+    assert not hasattr(templates, "idle_interruption"), (
+        "a template for [IDLE] means something is being said to a held agent"
     )
-    assert "a very specific stopping reason" in prompt
-    assert "orchestrator" in prompt
 
 
 def test_relay_contains_behavior_body_and_caller():
@@ -612,7 +616,6 @@ def test_instructing_templates_open_with_the_instructs_header():
             partner_uuid="u-worker-1", partner_title="the-worker",
             caller_title="c", body="b", read_paths=[], write_paths=[]
         ),
-        templates.idle_interruption(caller_title="c", reason="r"),
         templates.resume_displaced(behavior="[QUERY]"),
         templates.truthful_report_request(caller_title="c", original_request="r"),
     ]

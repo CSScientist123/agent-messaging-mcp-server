@@ -186,6 +186,29 @@ over instead of continue.
 
 The row's `body` stays the **original request** throughout, precisely so this holds.
 
+## A Partner that cannot finish on its own
+
+A Partner working a `[RESEARCH]` sometimes hits something only the agent that sent it can
+resolve — a path it was not granted, a question about what was actually meant. It raises a
+`[QUERY]` or an `[ERROR]` **upward**, along the reverse handshake, and then stops.
+
+The stopping is the part worth explaining. Without it the next queued message reaches an
+agent that is blocked on an unanswered question, and the two interleave in one context with
+nothing marking where either begins. So `send` parks the sender: an `[IDLE]` takes its
+working slot, and the unfinished work sits paused in its own queue.
+
+Three conditions, all required. The label is `[QUERY]` or `[ERROR]`; the sender holds a
+working slot; and the message travels back **along** a handshake rather than out along one.
+That last condition is what makes it precise. A Caller dispatching a routine `[QUERY]` down
+to a worker holds a slot too, and an orchestrator that stopped itself every time it asked a
+worker anything would halt everything it was driving.
+
+On the receiving side nothing new is needed. The `[QUERY]` or `[ERROR]` arrives at priority
+2 and displaces whatever the Caller was doing — that displacement *is* the interruption. The
+Caller resolves it and answers; the `[MESSAGE-RESPONSE]` lands in the Partner's queue and
+displaces the hold, because anything displaces a hold. The paused work resumes behind it.
+Nothing has to remember to release anything.
+
 ## Interruption is a normal push
 
 `interrupt_partner` does not have a mechanism of its own. It pushes a dummy `[IDLE]` into

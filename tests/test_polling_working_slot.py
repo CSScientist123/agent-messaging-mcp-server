@@ -352,12 +352,17 @@ def test_research_round_trip_runs_the_summary_phase_exactly_once(db, stub, core,
 
 
 # ---------------------------------------------------------------------------
-# 7. Termination: [ERROR], [MESSAGE-RESPONSE], and a delivered
-#    [TRUTHFUL-REPORT] must each send nothing back.
+# 7. Termination: [MESSAGE-RESPONSE] and a delivered [TRUTHFUL-REPORT] must
+#    each send nothing back.
+#
+#    [ERROR] is deliberately NOT in this set. It is a question -- "this is what
+#    stopped me" -- and is answered with a [MESSAGE-RESPONSE], which is itself
+#    the label that replies with nothing. The exchange still terminates, one
+#    hop later.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("behavior", ["[ERROR]", "[MESSAGE-RESPONSE]"])
+@pytest.mark.parametrize("behavior", ["[MESSAGE-RESPONSE]"])
 def test_termination_produces_nothing_back(db, stub, core, server, behavior):
     """The single most important property in this file: a completed task whose
     label's `reply_behavior` is NULL must push nothing back to the caller, or

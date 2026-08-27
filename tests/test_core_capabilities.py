@@ -706,17 +706,17 @@ def test_handshake_requires_project_orchestrator_among_science_partners(core, wo
 
 
 def test_a_gemini_partner_can_never_initiate_a_handshake(core):
-    """Two gemini_ partners cannot pair -- and the reason changed.
+    """Two gemini_ partners in ONE project cannot pair.
 
-    It used to be `no_handshake_between_gemini`, reached by first giving the
-    requester a role. Now that every orchestrator role is Claude Science only, a
-    gemini_ partner can hold no role at all, so it never clears the generic
-    orchestrator gate and is refused earlier.
+    A gemini_ partner holds no role and cannot acquire one -- every
+    orchestrator role is Claude Science only -- so the generic orchestrator
+    gate was never going to be the rule that decides this pair. It is decided
+    before that gate, on what actually separates a legal pairing from an
+    illegal one: whether the two conversations sit in different Projects
+    declared extensions of each other.
 
-    `no_handshake_between_gemini` therefore became **unreachable through the tool
-    surface**. It is deliberately kept in `handshake` as defence in depth -- it
-    still fires against a role written straight into the database, bypassing
-    `claim_orchestrator` -- but the rule an agent actually meets is this one.
+    Inside one Project they already answer to the same gemini-orchestrator, so
+    there is nothing for one to inherit from the other.
     """
     pid = mk_project(core, title="GeminiPod", source_prefix="gemini_", system_id="g1")
     project = {"id": pid, "source_prefix": "gemini_"}
@@ -730,8 +730,8 @@ def test_a_gemini_partner_can_never_initiate_a_handshake(core):
 
     with pytest.raises(Rejected) as exc:
         core.handshake(requester_uuid=g1["uuid"], partner_title="gemini-two")
-    assert exc.value.code == "requester_not_orchestrator", (
-        f"expected requester_not_orchestrator, got {exc.value.code!r}"
+    assert exc.value.code == "no_handshake_between_gemini", (
+        f"expected no_handshake_between_gemini, got {exc.value.code!r}"
     )
 
 
@@ -1577,9 +1577,11 @@ def test_reply_behavior_matches_label_caps(core):
     cases = {
         "[RESEARCH]": "[TRUTHFUL-REPORT]",
         "[QUERY]": "[MESSAGE-RESPONSE]",
+        # An [ERROR] is answered like any other question. A Caller that corrects
+        # a blocked Partner otherwise has no way to know the correction landed.
+        "[ERROR]": "[MESSAGE-RESPONSE]",
         "[IDLE]": None,
         "[TRUTHFUL-REPORT]": None,
-        "[ERROR]": None,
         "[MESSAGE-RESPONSE]": None,
     }
     for behavior, expected in cases.items():

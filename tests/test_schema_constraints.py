@@ -204,11 +204,15 @@ def main() -> int:
        set(b for b, v in caps.items() if v[2]) == {"[QUERY]", "[TRUTHFUL-REPORT]",
                                                    "[MESSAGE-RESPONSE]"},
        "exactly the three answerable labels are stored; transport labels are not")
-    ok(caps["[QUERY]"][3] == "[MESSAGE-RESPONSE]" and caps["[RESEARCH]"][3] == "[TRUTHFUL-REPORT]",
-       "the two labels that ask for something name what comes back")
-    ok(all(caps[b][3] is None for b in ("[IDLE]", "[ERROR]", "[TRUTHFUL-REPORT]",
+    ok(caps["[QUERY]"][3] == "[MESSAGE-RESPONSE]"
+       and caps["[ERROR]"][3] == "[MESSAGE-RESPONSE]"
+       and caps["[RESEARCH]"][3] == "[TRUTHFUL-REPORT]",
+       "the three labels that ask for something name what comes back")
+    ok(all(caps[b][3] is None for b in ("[IDLE]", "[TRUTHFUL-REPORT]",
                                         "[MESSAGE-RESPONSE]")),
        "every other label replies with nothing -- that NULL is what terminates an exchange")
+    ok(caps[caps["[ERROR]"][3]][3] is None,
+       "an [ERROR]'s answer itself replies with nothing, so the correction ends in one hop")
     ok(rejects(db, "UPDATE label_caps SET reply_behavior='[QUERY]' WHERE behavior='[QUERY]'"),
        "a label cannot reply with itself -- that is an exchange with no end")
 

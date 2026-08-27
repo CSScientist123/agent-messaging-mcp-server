@@ -19,6 +19,11 @@ answers the quotation.
 **A resume line at the end of every interruption.** An interrupted agent with
 no closing instruction treats the interruption as its new task and never goes
 back.
+
+**And nothing at all for an `[IDLE]`.** A hold is not a message. The remote is
+already stopped before the swap, so there is no prompt to render and none is
+rendered -- handing a stopped agent a paragraph gives it something to act on
+when the entire point is that it should be doing nothing.
 """
 
 from __future__ import annotations
@@ -182,21 +187,56 @@ def truthful_report_request(*, caller_title: str, original_request: str) -> str:
     ])
 
 
-def idle_interruption(*, caller_title: str, reason: str) -> str:
-    """Render the `[IDLE]` forced interruption.
+def notebook_query(*, caller_title: str, source: str, body: str) -> str:
+    """Render a `[QUERY]` aimed at a NotebookLM source.
 
-    Two sentences, deliberately. An interrupted agent handed a paragraph
-    starts working on the paragraph.
+    A notebook is not an agent. It holds sources and answers questions about
+    them; it never acts, and `source_caps` says so -- `can_execute = 0`,
+    `can_send = 0`, `accepts_research = 0`. The generic `relay` is written for
+    an agent: it announces a speaker, hands over a message, and closes with the
+    call the recipient may answer with. Only the middle third means anything
+    here.
+
+    So this carries no identity block. With `can_send = 0` there is no agent
+    behind the notebook to make that call, and an instruction nothing can
+    follow is worse than no instruction -- it invites the reader to look for a
+    capability that does not exist.
+
+    `source` names which of the notebook's sources the question is aimed at,
+    and naming it is the only aiming there is: the `nlm` CLI has no per-source
+    query, so `deliver_message` asks the whole notebook. The section is an
+    instruction about where to look, not a filter the remote enforces, and the
+    wording says so rather than implying a precision that is not there.
+
+    Args:
+        caller_title: Title of the Caller asking the question.
+        source: The `partner_id_in_remote` of the source being addressed --
+            for a notebook, that is the source's own URL or id.
+        body: The Caller's question, verbatim.
+
+    Returns:
+        The full prompt text to hand to the remote.
     """
     return "\n".join([
-        INSTRUCTS,
+        RELAYS,
         "",
-        f"Caller {caller_title} stopped you:",
+        f"{caller_title} asks this notebook a question.",
         "",
-        reason,
+        "## Targeted URLs inside current Notebook",
         "",
-        "Stop what you are doing and wait. You will be told when to continue, and the work "
-        "you were stopped on is remembered - do not restart it and do not summarize it yet.",
+        source,
+        "",
+        "The question reaches the whole notebook; the source above is where the answer "
+        "should be drawn from. Where the notebook's other sources contradict it, say so "
+        "rather than silently preferring one.",
+        "",
+        "## Context",
+        "",
+        f"Asked by {caller_title}.",
+        "",
+        "## Query",
+        "",
+        body,
     ])
 
 

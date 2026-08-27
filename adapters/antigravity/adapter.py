@@ -154,6 +154,71 @@ _APPROVAL_PROMPT_MARKERS = (
     "reason: outside workspace",
 )
 
+# Of the five headers above, only two ever name a path. `requesting
+# permission for:` echoes the exact `action(target)` rule syntax
+# `add_permissions`/`delete_permissions` read and write elsewhere in this file
+# (`_read_project_rules`, `_type_rule`) -- confirmed live:
+# `requesting permission for: write_file(/x)` -- so both the permission kind
+# and the path are read straight off that one echoed rule, not guessed.
+# `allow access to this file?` names a path too, but not through that rule
+# syntax; its path is read with a generic filesystem-path pattern instead,
+# since the exact layout of that prompt has not been confirmed against a live
+# pane the way the rule echo has.
+_RULE_ECHO_RE = re.compile(r"\b(read_file|write_file)\(([^)]*)\)")
+_PATH_RE = re.compile(r"(/[^\s()<>]+)")
+_PERMISSION_BY_ACTION = {"read_file": "READ", "write_file": "WRITE"}
+
+
+def _approval_prompt_detail(pane: str) -> str:
+    """Two labelled lines naming what an approval/trust prompt on `pane` asked for.
+
+    Returned as ready-to-read text -- "Permission asked: ...\\nPath requested:
+    ..." -- so `poll_completion` and `_await_idle` can fold it straight into
+    the same `Rejected` message they already raise, and
+    `polling.server.APPROVAL_ERROR_TEMPLATE` can quote that message verbatim
+    rather than re-deriving these two facts itself. This adapter is the one
+    place that actually read the pane; a second, independent guess at the
+    same two facts elsewhere could disagree with this one.
+
+    `pane` must be the RAW capture, not lowercased -- a path is
+    case-sensitive, and handing a Caller a lowercased path could name one
+    that does not exist on disk.
+
+    A trust prompt (`do you trust the contents of this project?`) and a bare
+    `do you want to proceed?` confirmation (see the fixture in
+    `test_antigravity_poll_completion_raises_on_approval_prompt`) name
+    neither a permission nor a path -- there is nothing on either pane to
+    extract. Both fields say so explicitly in that case rather than being
+    left out: a Caller reading a missing line cannot tell "this prompt names
+    nothing" from "we failed to read it".
+    """
+    match = _RULE_ECHO_RE.search(pane)
+    if match:
+        action, path = match.group(1), match.group(2).strip()
+        permission = _PERMISSION_BY_ACTION[action]
+        return (
+            f"Permission asked: {permission}\n"
+            f"Path requested: {path or 'empty in the prompt text'}"
+        )
+
+    lowered = pane.lower()
+    if "allow access to this file?" in lowered or "reason: outside workspace" in lowered:
+        path_match = _PATH_RE.search(pane)
+        path = path_match.group(1) if path_match else "not found in the prompt text"
+        return (
+            "Permission asked: not named by this prompt -- it asks for file "
+            "access, not a read or write operation\n"
+            f"Path requested: {path}"
+        )
+
+    return (
+        "Permission asked: not named by this prompt -- this prompt type "
+        "names no permission or path\n"
+        "Path requested: not named by this prompt -- this prompt type names "
+        "no permission or path"
+    )
+
+
 # Where agy keeps project-scoped permissions, and where it keeps the id of the
 # project a CLI conversation belongs to. Both confirmed against a live
 # install; see the module docstring for how.
@@ -399,10 +464,12 @@ class AntigravityExtension(RemoteExtension):
         already there, so that nothing is sent into it at all.
         """
         for _ in range(attempts):
-            pane = self._capture(session).lower()
+            pane_raw = self._capture(session)
+            pane = pane_raw.lower()
             if any(marker in pane for marker in _APPROVAL_PROMPT_MARKERS):
                 raise Rejected(
                     "approval_is_an_error",
+                    f"{_approval_prompt_detail(pane_raw)}\n\n"
                     f"tmux session {session!r} is showing an approval/trust prompt before "
                     "delivery could even begin, so nothing has been typed into it. This is "
                     "always an error, never a question this extension answers -- most likely "
@@ -840,7 +907,10 @@ class AntigravityExtension(RemoteExtension):
 
         Raises `Rejected("approval_is_an_error", ...)` if the pane shows a
         blocking approval/permission prompt -- that is never treated as
-        "busy" or answered here; see the module docstring.
+        "busy" or answered here; see the module docstring. The message opens
+        with the permission kind and path the prompt asked for (see
+        `_approval_prompt_detail`), so the Caller `polling.server` reports
+        this to does not have to go looking for either.
         """
         session = self._session_name(partner_id_in_remote)
         result = self._tmux("capture-pane", "-t", session, "-p")
@@ -850,11 +920,13 @@ class AntigravityExtension(RemoteExtension):
                 f"could not read tmux session {session!r} for conversation "
                 f"{partner_id_in_remote!r}: {result.stderr.strip()}",
             )
-        pane = result.stdout.lower()
+        pane_raw = result.stdout
+        pane = pane_raw.lower()
 
         if any(marker in pane for marker in _APPROVAL_PROMPT_MARKERS):
             raise Rejected(
                 "approval_is_an_error",
+                f"{_approval_prompt_detail(pane_raw)}\n\n"
                 f"Antigravity conversation {partner_id_in_remote!r} is blocked on an "
                 "approval/permission prompt. That is always an error, never a question "
                 "for this extension to answer -- there is no method here that responds "

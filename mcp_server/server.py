@@ -540,9 +540,11 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             message: The message body.
             behavior: One of "[RESEARCH]", "[QUERY]", "[ERROR]",
                 "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]". [IDLE] is not
-                accepted here -- it is how interrupt_partner carries an
-                interruption, and sending one directly would stop a partner
-                without stopping its remote.
+                accepted here -- no tool sends it. It is how the Polling
+                Server parks a Partner that is waiting on an answer (or how a
+                human intervenes); stopping a Partner mid-turn is never an
+                agent's decision, and sending one directly would stop a
+                partner without stopping its remote.
         """
         try:
             result = core.send(
@@ -612,7 +614,7 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
 
     @mcp.tool()
     def read(requester_uuid: str, partner_title: str, page: int = 1, page_size: int = 10) -> str:
-        """Page through a partner's received [QUERY]/[TRUTHFUL-REPORT] message history.
+        """Page through a partner's received [QUERY]/[TRUTHFUL-REPORT]/[MESSAGE-RESPONSE] message history.
 
         An empty page is a real, non-error answer.
 
@@ -634,43 +636,6 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
         except RemoteFailure as exc:
             return _remote_failed_body(exc)
         return responses.ok(_render_read(result))
-
-    @mcp.tool()
-    def interrupt_partner(requester_uuid: str, partner_title: str, reason: str) -> str:
-        """Stop a partner by pushing an [IDLE] to the front of its queue.
-
-        Not a special mechanism: [IDLE] simply holds the highest priority, so
-        pushing one takes the working slot by construction. Whatever the
-        partner was working on is marked paused and stays in its queue, and it
-        resumes there once the interruption clears -- which happens when you
-        send it the thing it was stopped for.
-
-        Only meaningful for partners that execute; non-executing partners
-        (e.g. nlm_) are rejected outright since there is nothing to stop.
-
-        Args:
-            requester_uuid: The caller's own identity; must share a project
-                with the target.
-            partner_title: The exact title of the partner to interrupt.
-            reason: Why this partner is being interrupted. It is shown to the
-                partner verbatim, so write it for that reader.
-        """
-        try:
-            result = core.interrupt_partner(
-                requester_uuid=requester_uuid, partner_title=partner_title, reason=reason
-            )
-        except Rejected as exc:
-            return _rejected_body(exc)
-        except NeedsRemote as exc:
-            return _needs_remote_body(exc)
-        except RemoteFailure as exc:
-            return _remote_failed_body(exc)
-        displaced = result["displaced"]
-        what = f"Its {displaced} is paused and will resume." if displaced else "It was idle."
-        return responses.ok(
-            f"Partner {partner_title!r} (id={result['partner_id']}) is stopped. {what}",
-            next_call="Send the partner what it was stopped for; that is what resumes it.",
-        )
 
     @mcp.tool()
     def extend_project(requester_uuid: str, project_title: str) -> str:

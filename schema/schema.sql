@@ -73,7 +73,7 @@ INSERT INTO agent_layers (source_prefix, orchestrator_type, layer) VALUES
     ('science_', '*',                    2),
     ('gemini_',  '*',                    4);
 
--- The four-plus-two message labels, their relative priority, and how many of each one
+-- The three-plus-three message labels, their relative priority, and how many of each one
 -- caller may have outstanding against one partner.
 --
 -- Priority is what decides which task holds the working slot: a lower number wins. [IDLE]
@@ -87,11 +87,12 @@ INSERT INTO agent_layers (source_prefix, orchestrator_type, layer) VALUES
 -- ones, so it limits work in flight, not merely work waiting.
 -- reply_behavior is what a Partner sends back when a task carrying this label finishes,
 -- and NULL is the important value in the column: it is what makes the exchange terminate.
--- Two labels expect an answer -- [RESEARCH] is answered with a summary, [QUERY] with a
--- response. The other four ARE answers, or are not messages at all. Without a label whose
--- reply is nothing, every completed task would produce a message that produced a task that
--- produced a message, and two agents would talk to each other until one of them was
--- archived.
+-- Three labels expect an answer -- [RESEARCH] is answered with a summary, and [QUERY] and
+-- [ERROR] are each answered with a [MESSAGE-RESPONSE], since a Caller that corrects a
+-- blocked Partner otherwise has no way to know the correction landed. The other three ARE
+-- answers, or are not messages at all. Without a label whose reply is nothing, every
+-- completed task would produce a message that produced a task that produced a message, and
+-- two agents would talk to each other until one of them was archived.
 CREATE TABLE label_caps (
     behavior        TEXT PRIMARY KEY
                     CHECK (behavior IN ('[IDLE]', '[TRUTHFUL-REPORT]', '[QUERY]',
@@ -107,7 +108,7 @@ INSERT INTO label_caps (behavior, priority, max_outstanding, stored, reply_behav
     ('[IDLE]',             0, NULL, 0, NULL),
     ('[TRUTHFUL-REPORT]',  1, NULL, 1, NULL),
     ('[QUERY]',            2,    3, 1, '[MESSAGE-RESPONSE]'),
-    ('[ERROR]',            2, NULL, 0, NULL),
+    ('[ERROR]',            2, NULL, 0, '[MESSAGE-RESPONSE]'),
     ('[MESSAGE-RESPONSE]', 3, NULL, 1, NULL),
     ('[RESEARCH]',         4,    2, 0, '[TRUTHFUL-REPORT]');
 
@@ -226,8 +227,10 @@ CREATE TABLE messages (
     -- [ERROR] and [IDLE] are transport: they travel in a queue, are acted on, and are never
     -- written down. The rule is enforced by the trigger below rather than by a CHECK
     -- listing the labels, because a list here is a second copy of label_caps.stored and two
-    -- copies of one fact eventually disagree. NotebookLM exchanges are never stored at all
-    -- -- NotebookLM already holds them.
+    -- copies of one fact eventually disagree. Storage follows label_caps.stored alone -- the
+    -- three stored labels are stored no matter which remote sends or receives them, an nlm_
+    -- Partner included, because label_caps.stored is deliberately the one place this is
+    -- decided.
     behavior      TEXT NOT NULL REFERENCES label_caps(behavior),
     body          TEXT NOT NULL,
     created_at    TEXT NOT NULL

@@ -259,7 +259,8 @@ Opens a one-directional authorization from the caller to another Partner, subjec
 | `different_project` | Both sides share a source but have different `project_id`, and no `project_extension` row links the two projects. | Call `extend_project` to link them, or handshake within one project. |
 | `cross_project_requires_same_role` | The two projects ARE linked by an extension, but the two partners hold different orchestrator roles (or one holds none). An extension branches a research effort sideways; it is not a second chain of command, so a `gemini-orchestrator` cannot inherit from a `project-orchestrator` across one. | Pair two partners holding the same role. |
 | `duplicate_handshake` | This exact `(from, to)` direction already exists — caught once by a pre-check `SELECT` and again by the insert's `IntegrityError` as a fallback. | Skip `handshake`; call `send` directly. |
-| `no_handshake_between_gemini` | Both sides are `gemini_`. | This pairing never succeeds in either direction. |
+| `no_handshake_between_gemini` | Both sides are `gemini_` **and in the same Project**. Two conversations under one gemini-orchestrator are peers; there is nothing for one to inherit from the other. | Inherit across a project extension instead, or send through the orchestrator that directs both. |
+| `gemini_already_inherited` | The target Antigravity conversation is already continued by another one. A lineage is a line rather than a fork, so that "which conversation succeeds this one" has exactly one answer. | Continue the successor instead, or inherit from a conversation nothing has claimed. |
 | `gemini_to_science_illegal` | Requester is `gemini_`, target is `science_`. | This direction never succeeds; only `science_ → gemini_` can bridge these two sources. |
 | `bridge_handshakes_orchestrator_or_code` | Both sides `science_`, requester is `bridge-scientist`, target is not the `project-orchestrator`. The bridge hands work down to the orchestrator and takes it back; it wires up nothing else. | Target the `project-orchestrator`, or handshake a `code_` partner instead. |
 | `requires_project_orchestrator` | Both sides `science_`, requester is neither `bridge-scientist` nor `project-orchestrator`. | Have that project's `project-orchestrator` initiate it. |
@@ -386,33 +387,6 @@ There is deliberately **no** `role` parameter and **no** path parameters. There 
 | `over_queue` | This caller already holds `label_caps.max_outstanding` tasks of this label against this partner — **counting the one in the working slot**, which is why the queue can look one short and still refuse. Three for `[QUERY]`, two for `[RESEARCH]`; the other four labels are uncapped and can never raise this. | Wait for one to complete; do not retry immediately. |
 
 **Remote dependency.** Raises `NeedsRemote("deliver_message", ...)` if no extension is configured for the target's `source_prefix`. Admission is fully local and **already committed** by the time this can be raised — a `NeedsRemote` on `send` means the message is genuinely queued even though it was never handed to the remote.
-
-### interrupt_partner
-
-Stops a Partner by pushing a dummy `[IDLE]` into its queue. Not a mechanism of its own: `[IDLE]` holds the highest priority, so it takes the working slot by construction, which means interruption and ordinary delivery are the same code path.
-
-**Parameters**
-
-| Name | Type | Required | Default | Allowed values | Description |
-|---|---|---|---|---|---|
-| `requester_uuid` | `str` | required | — | must name a live partner | Caller's identity; must share a project with the target. |
-| `partner_title` | `str` | required | — | exact title of a live partner | The partner to stop. |
-| `reason` | `str` | required | — | any string | Why. Shown to the partner verbatim inside the `[IDLE]` prompt, so write it for that reader. |
-
-**Returns** `dict`: `{"partner_id": int, "behavior": "[IDLE]", "queue_depth": int, "displaced": str | None, "remote_call_id": str | None}`. `displaced` names the label of the task that was pushed out of the working slot, or `None` if the partner was idle.
-
-**What happens to the displaced task.** It is marked `in_process = 1` and stays in the queue. It resumes once the `[IDLE]` hold is displaced — which happens when the next message of any label arrives, since an `[IDLE]` in the slot is a hold rather than a task. There is no timeout: the Caller that interrupted is expected to send what the Partner was stopped for.
-
-**Rejections**
-
-| Code | Cause | Remediation |
-|---|---|---|
-| `unknown_requester` | `requester_uuid` not live. | Re-check the uuid. |
-| `no_such_partner` | `partner_title` names no live partner. | Call `search_partner`. |
-| `different_project` | Requester and target are in different projects. | Only a partner in the same project may interrupt. |
-| `not_executable` | The target's source has `can_execute = 0` — `nlm_`. | Nothing to stop. |
-
-**Remote dependency.** The `[IDLE]` is admitted regardless; `NeedsRemote` is raised only when stopping the remote and delivering the interruption needs an extension that is not configured.
 
 ### extend_project
 
@@ -564,7 +538,7 @@ Both handshake lists filter out archived counterparts explicitly — an archived
 
 Every code raised by `Rejected(...)` in `messaging_core/core.py`, extracted directly from source.
 
-Codes raised by more than one capability list every raiser. `unknown_requester` is raised by all sixteen capabilities that accept a `requester_uuid` (every capability except `create_project` and `create_partner`, which take none) and is omitted from capability-specific rows below to avoid repeating it sixteen times — see its own row.
+Codes raised by more than one capability list every raiser. `unknown_requester` is raised by all fifteen capabilities that accept a `requester_uuid` (every capability except `create_project` and `create_partner`, which take none) and is omitted from capability-specific rows below to avoid repeating it fifteen times — see its own row.
 
 | Code | Raised by | Remediation |
 |---|---|---|
@@ -584,7 +558,7 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `gemini_budget_exceeded` | `handshake` | Call `grant_gemini_budget` to raise the budget. |
 | `orchestrator_requires_science_project` | `claim_orchestrator` | **All three** orchestrator roles are Claude Science roles. Claim any of them only from a `science_` partner. |
 | `gemini_single_science_source` | `handshake` | Target a different `gemini_` partner. |
-| `gemini_to_science_illegal` | `handshake` | Never succeeds; use `science_ → gemini_`. **Unreachable through the tools**, for the same reason as `no_handshake_between_gemini`. |
+| `gemini_to_science_illegal` | `handshake` | Never succeeds; use `science_ → gemini_`. **Unreachable through the tools** — a `gemini_` partner can hold no role, so a pair that is not `gemini_ → gemini_` is refused at `requester_not_orchestrator` first. Kept as defence in depth against a role written straight into the database. |
 | `grantee_not_gemini_orchestrator` | `grant_gemini_budget` | Have the grantee claim `gemini-orchestrator` first. |
 | `handshake_not_needed` | `handshake` | Call `send` directly; `nlm_` needs no handshake. |
 | `idle_not_sendable` | `send` | `[IDLE]` is not a message. Call `interrupt_partner`. |
@@ -595,7 +569,8 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `live_partner_limit` | `create_partner` | Call `archive_sessions` to free a slot. |
 | `no_gemini_budget` | `handshake` | Call `grant_gemini_budget` first. |
 | `no_handshake` | `send` | Call `handshake` first (unless the target's source needs none). |
-| `no_handshake_between_gemini` | `handshake` | Never succeeds. **Unreachable through the tools** — a `gemini_` partner can hold no role, so it is refused at `requester_not_orchestrator` first. Kept as defence in depth against a role written straight into the database. |
+| `no_handshake_between_gemini` | `handshake` | Two Antigravity conversations in one Project. Inherit across a project extension instead. |
+| `gemini_already_inherited` | `handshake` | That conversation is already continued by another. Inherit from one nothing has claimed. |
 | `no_paths` | `add_permissions`, `delete_permissions` | Give at least one path. |
 | `not_reportable` | `report_back` (queue machinery, §8 — not a client tool) | `[RESEARCH]` is delegation and `[IDLE]` is a hold; neither is something a Partner reports. Delegating is what `send` is for, and `send` is where the hierarchy rules live. |
 | `no_such_partner` | `delete_partner`, `handshake`, `send`, `read`, `interrupt_partner`, `get_permissions`, `add_permissions`, `delete_permissions` | Call `search_partner` to find the exact title. |
@@ -1062,13 +1037,19 @@ Caller's raw text; the template names who is speaking, what the reply must conta
 |---|---|
 | `research_dispatch` | A `[RESEARCH]` task. Inlines `partner_paths`, and says explicitly when there are none. |
 | `truthful_report_request` | The summary phase. Quotes the original request back verbatim and excludes resumed-from work. |
-| `idle_interruption` | An `[IDLE]`. Two sentences — an interrupted agent handed a paragraph starts working on the paragraph. |
 | `resume_displaced` | A task returning to the slot. One line. |
 | `relay` | Every other label, passed through with a `[Polling Server]` header rather than `[Polling Server messages you]` — the Server is showing the agent something, not telling it something. |
+| `notebook_query` | A `[QUERY]` whose target is `nlm_`. Names the source it aims at, and carries no identity block. |
 | `identity_block` | Not a template of its own — a section appended to `research_dispatch` and `relay`. |
 
 Each mirrors a template in the project note "Prompt templates". Where the two disagree, the
 note is the source of truth and the code is the bug.
+
+**`notebook_query` exists because a notebook is not an agent.** `source_caps` says so in three columns — `can_execute = 0`, `can_send = 0`, `accepts_research = 0`. The generic `relay` announces a speaker, hands over a message, and closes with the call the recipient may answer with; only the middle third means anything to a source that holds documents and never acts.
+
+It names the source it aims at, and that naming is the only aiming there is: the `nlm` CLI has no per-source query, so `deliver_message` asks the whole notebook and the prompt says where the answer should be drawn from. The template states that rather than implying a precision the remote does not enforce.
+
+It carries no identity block, deliberately. With `can_send = 0` there is no agent behind the notebook to make that call, and an instruction nothing can follow is worse than none — it invites the reader to look for a capability that does not exist.
 
 **`identity_block` exists because `send`'s first argument is `requester_uuid` — the agent's
 own uuid — and no prompt ever stated it.** The research dispatch tells an agent, in so many
@@ -1086,5 +1067,10 @@ finishing: a `[QUERY]` for missing context, an `[ERROR]` when blocked.
 It is appended to `research_dispatch` (long autonomous work, the case the dispatch itself
 tells the agent to interrupt) and to `relay` (which is what hands an agent an `[ERROR]`
 saying something is blocked). It is deliberately **absent** from `truthful_report_request`,
-`idle_interruption` and `resume_displaced`: a summary is harvested, an interrupted agent is
-told to wait, and a resume line is one line on purpose.
+`truthful_report_request`, `notebook_query` and `resume_displaced`: a summary is harvested, a
+notebook cannot send, and a resume line is one line on purpose.
+
+**There is no template for an `[IDLE]`, and that is the point.** A hold is not a message. The
+remote is stopped by `stop_remote_execution` before the swap, so the slot is taken and nothing
+is rendered or delivered — handing a stopped agent a paragraph gives it something to act on
+when the entire purpose of the hold is that it should be doing nothing.

@@ -919,22 +919,28 @@ def test_bridge_holds_at_most_one_code_partner(world: World):
 
 
 def test_two_gemini_partners_can_never_handshake(world: World):
-    """ATTACK, two layers, and the outer one got stronger.
+    """ATTACK: a gemini_ pair is decided on projects, never on roles.
 
-    A gemini_ partner has no role, so it is refused at the generic orchestrator
-    gate. It also cannot ACQUIRE one any more: every orchestrator role is Claude
-    Science only, so `claim_orchestrator` refuses it outright. An earlier version
-    of this test exploited exactly that gap to get past the gate.
+    Neither side holds a role and neither can acquire one -- every orchestrator
+    role is Claude Science only, so `claim_orchestrator` refuses a gemini_
+    partner outright. The pair is therefore decided before the generic
+    orchestrator gate, on the only thing that separates a legal pairing from an
+    illegal one: whether the two conversations sit in different Projects that
+    have been declared extensions of each other.
 
-    The attack therefore goes around `claim_orchestrator` entirely and writes the
-    role straight into the database -- which is the only remaining way to reach
-    the deeper check, and precisely the code path a rule enforced in one
-    capability alone would miss. The unconditional `no_handshake_between_gemini`
-    in `handshake()` still catches it.
+    Unlinked projects give `different_project`; one project gives
+    `no_handshake_between_gemini`, because two conversations under the same
+    gemini-orchestrator are peers with nothing to inherit.
+
+    The attack forces a role straight into the database, bypassing
+    `claim_orchestrator` entirely -- the code path a rule enforced in one
+    capability alone would miss. It changes neither answer.
     """
     with pytest.raises(Rejected) as exc_plain:
         world.gem.handshake(requester_uuid=world.gemini_partner["uuid"], partner_title="gemw2")
-    assert exc_plain.value.code == "requester_not_orchestrator"
+    # Two conversations in unlinked projects: refused on the projects, and the
+    # code says which fact did it.
+    assert exc_plain.value.code == "different_project"
 
     same_project_pid = world.gem_pid
     peer = mk_partner(world.gem, project_id=same_project_pid, title="gemw-peer", remote_id="rg-peer")

@@ -66,6 +66,17 @@ MAX_RECORDED_ERRORS = 200
 #: started -- so the message names the conversation, names what was asked for,
 #: and names the two capabilities that fix it. A Caller handed a full incident
 #: report starts debugging instead of granting.
+#:
+#: `{detail}` is the raising extension's own `Rejected` message, carried
+#: through verbatim rather than re-derived here -- the same reasoning as
+#: `mcp_server.server._needs_remote_body` uses for `NeedsRemote.reason`: the
+#: extension is the thing that actually read the prompt, so a second guess at
+#: what it asked for, made here from a stringified exception, could only ever
+#: disagree with it. `AntigravityExtension` -- the only extension that raises
+#: this code today -- opens that message with two labelled lines, "Permission
+#: asked: READ/WRITE" and "Path requested: <path>", precisely so this template
+#: does not have to parse them back out to be scannable; see
+#: `adapters.antigravity.adapter._approval_prompt_detail`.
 APPROVAL_ERROR_TEMPLATE = """\
 An approval was requested by {title}. This is unexpected: an approval means a
 permission was missing before the work started, and nothing in this system
@@ -437,7 +448,13 @@ class PollingServer:
             # polls again forever: the slot stays held, the thread never retires,
             # and nobody is ever told.
             self._stop_quietly(extension, remote_id, "stopped on an approval prompt")
-            self._raise_approval_to_caller(core, partner_id, task, str(exc))
+            # `exc.message`, not `str(exc)`: the latter prefixes the code, so a
+            # message the extension wrote to be read as labelled lines --
+            # "Permission asked: WRITE" -- arrives as
+            # "[approval_is_an_error] Permission asked: WRITE" and stops
+            # scanning cleanly. The code is this branch's own condition; it
+            # tells the Caller nothing it needs.
+            self._raise_approval_to_caller(core, partner_id, task, exc.message)
             return False
         if not finished:
             return False
