@@ -42,6 +42,18 @@ T = TypeVar("T")
 # Sentinel placed on the job queue to tell the writer thread to shut down.
 _STOP = object()
 
+#: Columns added to the schema after a database may already have been created.
+#: `_apply_schema_if_needed` only ever runs `schema.sql` against an empty
+#: database, so a column added here to an existing table would silently be
+#: missing from any database file created before the change -- and the first
+#: read or write that touches it would fail with "no such column" instead of
+#: at startup, where the cause is obvious. Each entry is reconciled by
+#: `_reconcile_added_columns` on every open, not only a fresh one.
+_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("message_queue", "summary_phase INTEGER NOT NULL DEFAULT 0 CHECK (summary_phase IN (0, 1))"),
+    ("message_queue", "origin_behavior TEXT REFERENCES label_caps(behavior)"),
+)
+
 
 class Database:
     """A thread-safe SQLite handle with one writer thread and many readers."""
@@ -83,12 +95,14 @@ class Database:
             # (see read/read_one) instead of getting their own connections.
             self._shared_conn: sqlite3.Connection | None = self._new_connection()
             self._apply_schema_if_needed(self._shared_conn)
+            self._reconcile_added_columns(self._shared_conn)
             self._configure_connection(self._shared_conn, wal=False)
         else:
             self._shared_conn = None
             bootstrap = self._new_connection()
             try:
                 self._apply_schema_if_needed(bootstrap)
+                self._reconcile_added_columns(bootstrap)
                 self._configure_connection(bootstrap, wal=True)
             finally:
                 bootstrap.close()
@@ -143,6 +157,35 @@ class Database:
         if row[0] == 0:
             script = self._schema_path.read_text()
             conn.executescript(script)
+
+    def _reconcile_added_columns(self, conn: sqlite3.Connection) -> None:
+        """Add any column listed in `_ADDITIVE_COLUMNS` that a database predates.
+
+        This is the whole migration story this project has: there is no
+        version table and no migration runner, because every schema change
+        so far has been adding a column with a default. This method does
+        exactly that and nothing more -- it does NOT drop a column, does NOT
+        change a column's type, does NOT reorder columns, and has no way to
+        express a non-additive change (renaming a column, tightening a
+        constraint on existing data, splitting a table). A change like that
+        needs a real migration, not another entry here.
+
+        Runs on every open, including a fresh database that
+        `_apply_schema_if_needed` just built from `schema.sql` -- checking
+        `PRAGMA table_info` first, before ever issuing an ALTER, is what
+        keeps that overwhelmingly common case a no-op instead of a write.
+        """
+        for table, ddl in _ADDITIVE_COLUMNS:
+            columns = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if not columns:
+                # The table itself doesn't exist -- e.g. a schema change that
+                # is still ahead of this database in some other way. Nothing
+                # additive can be reconciled onto a table that isn't there.
+                continue
+            column_name = ddl.split(maxsplit=1)[0]
+            existing = {row[1] for row in columns}
+            if column_name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
     # -- writer thread ------------------------------------------------------
 
