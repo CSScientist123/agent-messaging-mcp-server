@@ -120,6 +120,30 @@ for flag in ("can_execute", "needs_handshake", "can_send", "accepts_research"):
 def codes_in(path: str) -> set[str]:
     return set(re.findall(r'Rejected\(\s*\n?\s*"([a-z_]+)"', read(path)))
 
+# A docstring's `Raises:` list is documentation an agent reads at tool-listing
+# time. A code named there that no longer exists sends the caller looking for a
+# branch that cannot fire; one that exists under a different name is worse,
+# because the caller writes a check against a string that never matches. Both
+# are invisible to the section-3 check below, which compares the code to the
+# reference doc and never to what the docstring beside it claims.
+#
+# Scoped to the `Rejected:` sentence itself, and stopping at its closing
+# period: the rest of a Raises: block is prose, and prose backticks parameter
+# names too.
+_ALL_CODES = codes_in("messaging_core/core.py") | codes_in("polling/server.py")
+_CLAIMED: set[str] = set()
+for _block in re.findall(r"Raises:\n(.*?)(?=\n\n|\n +\"\"\")",
+                         read("messaging_core/core.py"), re.S):
+    for _sentence in re.findall(r"Rejected:(.*?)\.", _block, re.S):
+        # Cut at the first qualifier: "`not_reportable` if `behavior` is ..."
+        # names a code and then a PARAMETER, and only the part before the
+        # qualifier is the list of codes this method can raise.
+        _sentence = re.split(r"\b(?:if|when|unless|for|where)\b", _sentence)[0]
+        _CLAIMED |= set(re.findall(r"`([a-z][a-z_]{3,})`", _sentence))
+for _claimed in sorted(_CLAIMED):
+    check(_claimed in _ALL_CODES, "rejections/docstrings",
+          f"a docstring's Raises: names {_claimed!r}, which no Rejected(...) raises")
+
 core_codes = codes_in("messaging_core/core.py")
 sec3 = ref.split("## 3. Rejection code index")[1].split("Three further code families")[0]
 indexed = set(re.findall(r"^\| `([a-z_]+)` \|", sec3, re.M))
