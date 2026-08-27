@@ -31,12 +31,29 @@ class Rejected(MessagingError):
             (e.g. ``"unknown_behavior"``, ``"queue_full"``).
         message: A human-readable explanation of the refusal.
         next_call: An optional concrete next action the caller can take.
+        already_committed: False by default -- "nothing was changed" above is
+            the normal case. Some callers raise this same exception AFTER an
+            earlier step of theirs has already landed (`MessagingCore.send`
+            commits the queue push, then calls `advance()`, which can itself
+            raise); for exactly those, the raiser sets this to True on the
+            exception before it escapes. It means the request's local effect
+            stands and only a later step failed, so nothing about the failure
+            should invite a retry of the whole call -- retrying would repeat
+            the part that already succeeded.
     """
 
-    def __init__(self, code: str, message: str, *, next_call: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        next_call: str | None = None,
+        already_committed: bool = False,
+    ) -> None:
         self.code = code
         self.message = message
         self.next_call = next_call
+        self.already_committed = already_committed
         super().__init__(str(self))
 
     def __str__(self) -> str:
@@ -52,11 +69,15 @@ class NeedsRemote(MessagingError):
     Attributes:
         capability: The name of the missing capability (e.g. ``"send_email"``).
         reason: Why the abstract layer cannot provide it itself.
+        already_committed: Same meaning as `Rejected.already_committed` --
+            False unless a raiser sets it after its own earlier effect has
+            already landed. See there for why the distinction matters.
     """
 
-    def __init__(self, capability: str, reason: str) -> None:
+    def __init__(self, capability: str, reason: str, *, already_committed: bool = False) -> None:
         self.capability = capability
         self.reason = reason
+        self.already_committed = already_committed
         super().__init__(str(self))
 
     def __str__(self) -> str:

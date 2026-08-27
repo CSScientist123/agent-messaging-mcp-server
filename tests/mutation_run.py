@@ -63,6 +63,57 @@ LOCK = REPO / ".mutation_running"
 #: (label, file, find, replace, the invariant it breaks)
 MUTANTS: list[tuple[str, str, str, str, str]] = [
     (
+        "notebook-id-never-recovered", "adapters/notebooklm/adapter.py",
+        "                notebook_id = self._resolve_project_system_id(partner_id_in_remote)",
+        "                notebook_id = None",
+        "a NotebookLM adapter that did not itself register the partner can never find "
+        "its notebook again, so every delivery after a restart fails and the caller is "
+        "never told",
+    ),
+    (
+        "project-id-never-recovered", "adapters/claude_science/adapter.py",
+        "                project_id = self._resolve_project_system_id(frame_id)",
+        "                project_id = None",
+        "same for Claude Science: a frame's project cannot be recovered from the "
+        "database, so a restarted process cannot deliver to any existing partner",
+    ),
+    (
+        "resolver-crosses-sources", "mcp_server/config.py",
+        '_RESOLVABLE_SOURCES = frozenset({"nlm_", "science_"})',
+        '_RESOLVABLE_SOURCES = frozenset({"nlm_", "science_", "gemini_"})',
+        "an adapter is handed a resolver for a source it does not speak for, so a "
+        "partner_id_in_remote shared across projects resolves to the wrong container",
+    ),
+    (
+        "label-order-ignores-fresh-arrival", "messaging_core/core.py",
+        "          MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) ASC,",
+        "",
+        "_HEAD_LABEL_SQL ranks a label by its OLDEST row rather than its earliest "
+        "FRESH one, so a [QUERY] holding a paused row plus a fresh one beats a fresh "
+        "[ERROR] of equal priority and the correction is never delivered",
+    ),
+    (
+        "idle-hold-spins", "polling/server.py",
+        "                    stop_event.wait(self.hold_interval)",
+        "                    stop_event.wait(max(self.poll_interval / 4, 0.0))",
+        "an [IDLE] hold polls at four times the poll rate forever, for a partner "
+        "deliberately stopped with nothing to poll",
+    ),
+    (
+        "send-claims-nothing-changed-after-committing", "mcp_server/server.py",
+        "            if getattr(exc, \"already_committed\", False):",
+        "            if False and getattr(exc, \"already_committed\", False):",
+        "send renders a post-admission failure as 'Nothing was changed.', so the agent "
+        "retries and double-sends work the system already accepted",
+    ),
+    (
+        "no-column-reconciliation", "messaging_core/db.py",
+        "_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (",
+        "_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = () or (",
+        "a database created before a column was added never gains it, so every read "
+        "of that column fails with `no such column` against an existing deployment",
+    ),
+    (
         "drains-any-source", "polling/server.py",
         "        if source_prefix not in self.extensions:",
         "        if False and source_prefix not in self.extensions:",

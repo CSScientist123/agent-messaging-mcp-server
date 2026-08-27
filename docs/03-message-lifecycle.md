@@ -324,6 +324,42 @@ Sideways is deliberately allowed: two Partners at the same layer in Projects lin
 Every other label travels freely in both directions. That is what lets an answer, an error,
 or a report come back at all.
 
+## The answer direction
+
+A handshake row is directional, and the direction is not arbitrary: `handshake` refuses
+`requester_not_orchestrator`, so `from_partner` is always the orchestrator and `to_partner`
+always the worker it directs. A worker therefore has no row of its own pointing back, and no
+way to create one.
+
+So `send` accepts the **reverse** row as well. Nothing new becomes reachable — it is the same
+pair, already joined by the same orchestrator — and what it adds is the only thing a Partner
+could not otherwise do: say something. Without it, the `[RESEARCH]` dispatch's own instruction
+to "message back a `[QUERY]` and idle" named an action the system refused.
+
+`[RESEARCH]` is the exception, and needs to be. The layer rule does not cover this case: a
+project-orchestrator and the plain `science_` worker it directs sit at the *same* layer, so
+`research_cannot_flow_upward` — which refuses only a strictly higher target — would not fire.
+The forward-row requirement was what prevented a worker delegating back to its own director,
+and accepting the reverse row for every label would have given that away as a side effect. So
+delegation still requires the handshake to point at its target: `research_needs_a_forward_handshake`.
+
+Answers travel back along a handshake. Delegated work only travels along it in the direction
+the orchestrator claimed.
+
+## Telling an agent who it is
+
+`send`'s first argument is `requester_uuid` — the caller's own uuid — and a Partner running
+inside a remote has never been told what its own is. `templates.identity_block` puts it in the
+prompt, alongside the Caller's title and the call already filled in, and is appended to the
+`[RESEARCH]` dispatch and to every relay.
+
+It also says the opposite thing, which matters just as much. Whatever the agent produces is
+read back off the session by the Polling Server and delivered when the turn ends, so an agent
+handed only its identity would reasonably use it to send its answer — and the Caller would
+receive the same work twice, once harvested and once sent. The block states that answering is
+automatic, and that `send` is for the case where the turn is *not* finishing: a `[QUERY]` for
+context only the Caller holds, an `[ERROR]` when blocked.
+
 ## When delivery fails
 
 If the remote raises while a promoted task is being delivered, the task is put **back** into

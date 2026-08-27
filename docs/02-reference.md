@@ -180,6 +180,7 @@ Permanently deletes a live Partner by title. Irreversible, and scoped to the req
 | `no_such_partner` | `partner_title` names no live partner. | Call `search_partner` to find the exact title. |
 | `not_authorized` | Requester is not `project-orchestrator` of the target's own project. | Have that project's `project-orchestrator` perform the deletion. |
 | `partner_has_dependents` | The `DELETE` violates a foreign key — in practice, `budget_grants.granted_by` references this partner and that reference has no `ON DELETE CASCADE` (see §4). | Call `archive_sessions` on this partner instead. |
+| `partner_has_work_in_flight` | The target has queued rows or holds a working slot. Deletion is irreversible and, uniquely, cannot even report itself: `message_queue.caller_id` is `ON DELETE CASCADE`, so a notice attributed to the vanishing Partner is destroyed by the very `DELETE` it warns about, and attributing it to the requester collides with `CHECK (caller_id <> partner_id)` in the normal case where the requester **is** the Caller waiting. | Call `archive_sessions` instead — archiving leaves the row in place, so it can report the loss to every Caller waiting. |
 
 **Remote dependency.** None.
 
@@ -371,7 +372,8 @@ There is deliberately **no** `role` parameter and **no** path parameters. There 
 | `source_cannot_send` | The requester's source has `can_send = 0` — today, `nlm_`. A notebook has no agent behind it, so nothing there ever decides to speak. | Nothing to do; a NotebookLM Partner is reachable but never a Caller. |
 | `research_not_accepted` | `behavior` is `[RESEARCH]` and the target's source has `accepts_research = 0` — today, `nlm_`. It answers questions about what it holds; it does not go and do things. | Send `[QUERY]` instead. |
 | `research_cannot_flow_upward` | `behavior` is `[RESEARCH]` and the requester's `agent_layers` layer is greater than the target's. Delegated work travels down or sideways; a lower agent handing it up would be reassigning its own director's work. | Use `[QUERY]` to ask, or `[TRUTHFUL-REPORT]` to report back. Every other label travels freely in both directions. |
-| `no_handshake` | Target's source has `needs_handshake = 1`, and no `handshakes` row exists `requester → target`. | Call `handshake` first. |
+| `research_needs_a_forward_handshake` | `behavior` is `[RESEARCH]`, and the only `handshakes` row for the pair points `target → requester`. Answers travel back along a handshake; delegated work only travels along it in the direction the orchestrator claimed. Without this, a plain worker could hand `[RESEARCH]` to its own project-orchestrator — they share a layer, so `research_cannot_flow_upward` does not fire. | Have an orchestrator `handshake` in that direction, if the delegation is genuinely intended. |
+| `no_handshake` | Target's source has `needs_handshake = 1`, and no `handshakes` row exists in **either** direction for the pair. | Call `handshake` first. |
 | `over_queue` | This caller already holds `label_caps.max_outstanding` tasks of this label against this partner — **counting the one in the working slot**, which is why the queue can look one short and still refuse. Three for `[QUERY]`, two for `[RESEARCH]`; the other four labels are uncapped and can never raise this. | Wait for one to complete; do not retry immediately. |
 
 **Remote dependency.** Raises `NeedsRemote("deliver_message", ...)` if no extension is configured for the target's `source_prefix`. Admission is fully local and **already committed** by the time this can be raised — a `NeedsRemote` on `send` means the message is genuinely queued even though it was never handed to the remote.
@@ -593,7 +595,9 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `not_executable` | `interrupt_partner` | The target's source never executes; there is nothing to stop. |
 | `not_path_configurable` | `get_permissions`, `add_permissions`, `delete_permissions` | Only Antigravity conversations carry path permissions. |
 | `over_queue` | `send` | This caller's allowance for this label is full, counting the working slot. Wait for one to complete. |
+| `partner_has_work_in_flight` | `delete_partner` | Archive it instead — archiving reports the loss to every caller waiting. |
 | `partner_has_dependents` | `delete_partner` | Call `archive_sessions` instead of deleting. |
+| `partner_has_work_in_flight` | `delete_partner` | Archive it instead; archiving reports the loss to every caller waiting. |
 | `partner_id_in_remote_not_found` | `create_partner` | Confirm the id exists in the remote app. |
 | `partner_id_in_remote_taken` | `create_partner` | Use the existing partner, or a different remote id. |
 | `permission_not_applied` | `add_permissions`, `delete_permissions` | The remote does not show the change; **nothing was recorded locally**. Call `get_permissions`. |
@@ -602,6 +606,7 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `requires_gemini_orchestrator` | `handshake` | Have the project's `gemini-orchestrator` initiate it. |
 | `requires_project_orchestrator` | `handshake`, `extend_project` | Have the project's `project-orchestrator` do it. |
 | `research_cannot_flow_upward` | `send` | `[RESEARCH]` travels down or sideways. Use `[QUERY]` or `[TRUTHFUL-REPORT]` instead. |
+| `research_needs_a_forward_handshake` | `send` | Only the reverse handshake exists. Answers travel back along it; delegation does not. |
 | `research_not_accepted` | `send` | That source does not take delegated work. Send `[QUERY]`. |
 | `role_already_claimed` | `claim_orchestrator` | Use the existing holder, or claim a different role. |
 | `self_extension` | `extend_project` | Name a different project. |
@@ -1047,6 +1052,26 @@ Caller's raw text; the template names who is speaking, what the reply must conta
 | `idle_interruption` | An `[IDLE]`. Two sentences — an interrupted agent handed a paragraph starts working on the paragraph. |
 | `resume_displaced` | A task returning to the slot. One line. |
 | `relay` | Every other label, passed through with a `[Polling Server]` header rather than `[Polling Server messages you]` — the Server is showing the agent something, not telling it something. |
+| `identity_block` | Not a template of its own — a section appended to `research_dispatch` and `relay`. |
 
 Each mirrors a template in the project note "Prompt templates". Where the two disagree, the
 note is the source of truth and the code is the bug.
+
+**`identity_block` exists because `send`'s first argument is `requester_uuid` — the agent's
+own uuid — and no prompt ever stated it.** The research dispatch tells an agent, in so many
+words, to message back a `[QUERY]` when it is missing context the Caller holds; without its
+own uuid that is an instruction it has no credentials to carry out. The block states the
+agent's title and uuid, and gives it the call already filled in.
+
+The second half of the block is load-bearing in the opposite direction. Whatever the agent
+produces is harvested by the Polling Server and delivered to the Caller when the turn ends,
+so an agent handed only its identity would reasonably use it to send its answer — and the
+Caller would receive the same work twice, once harvested and once sent. So the block says
+plainly that answering is automatic, and that `send` is for the case where the turn is *not*
+finishing: a `[QUERY]` for missing context, an `[ERROR]` when blocked.
+
+It is appended to `research_dispatch` (long autonomous work, the case the dispatch itself
+tells the agent to interrupt) and to `relay` (which is what hands an agent an `[ERROR]`
+saying something is blocked). It is deliberately **absent** from `truthful_report_request`,
+`idle_interruption` and `resume_displaced`: a summary is harvested, an interrupted agent is
+told to wait, and a resume line is one line on purpose.

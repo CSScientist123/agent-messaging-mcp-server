@@ -129,12 +129,34 @@ SELECT :pid, :cid, :behavior, :body, :mid
 # label's rows: 0 when the label has any unstarted work, 1 when every row of it
 # is paused. So at equal priority a label with something new to say outranks
 # one that is only waiting to be resumed.
+#
+# That is not quite enough once a label holds BOTH a paused row and a fresh
+# one. MIN(in_process) is then 0 -- tied with a label that has only fresh rows
+# -- and the next key, MIN(enqueued_at), falls back to the OLDEST row in the
+# label, which is exactly the paused one: pausing is what happens to the thing
+# that has been waiting longest. A fresh `[ERROR]` then loses the label to a
+# `[QUERY]` that is part paused, part fresh, arriving via the tie-break itself
+# -- the same failure this two-statement design exists to prevent, showing up
+# one level in.
+#
+# So a key sits between the two: the earliest arrival among only the label's
+# FRESH rows (`in_process = 0`), via a CASE that maps a paused row to NULL so
+# it cannot supply the label's timestamp. No NULLS LAST is needed, and none
+# should be added -- the preceding MIN(q.in_process) ASC key already separates
+# a label with at least one fresh row from one with none, so this new key is
+# only ever compared between two labels that both have fresh rows (both
+# non-NULL) or both have none (both NULL); the mixed case a NULLS LAST choice
+# would matter for never reaches this key. MIN(q.enqueued_at) ASC stays last,
+# unchanged, to break a tie between two labels' fresh rows (or the absence of
+# any) that lands exactly even.
 _HEAD_LABEL_SQL = """
 SELECT q.behavior AS behavior
   FROM message_queue q JOIN label_caps c ON c.behavior = q.behavior
  WHERE q.partner_id = :pid
  GROUP BY q.behavior
- ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC, MIN(q.enqueued_at) ASC
+ ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC,
+          MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) ASC,
+          MIN(q.enqueued_at) ASC
  LIMIT 1
 """
 
@@ -591,6 +613,100 @@ class MessagingCore:
             result.append(item)
         return result
 
+    def _report_lost_work(self, conn: sqlite3.Connection, partner_id: int) -> None:
+        """Tell every Caller with a stake in `partner_id` that its work is gone, not delayed.
+
+        `archive_sessions` makes a Partner permanently unreachable, and used to
+        do it with no regard for what was in flight: `advance()` later DELETEs
+        the archived Partner's whole queue outright the moment anything next
+        looks at it -- correctly, since an archived Partner can never be
+        messaged again -- so every Caller waiting on one of those messages just
+        never heard back.
+
+        Called from INSIDE `archive_sessions`'s own `db.write` closure, on the
+        open `conn`, right after `archived_at` is set and while the queue this
+        Partner owes answers on is still readable. It must stay that way:
+        `self.db.write` blocks the calling thread until the single writer
+        thread finishes running whatever it was given, and that thread is this
+        closure -- calling it again from here would wait on itself forever.
+        `report_back` opens its own `db.write` for the exact same reason and is
+        equally off limits.
+
+        A Caller can have a stake two ways, and both are checked: a row
+        already sitting in `partner_id`'s queue, and -- separately, because it
+        lives in memory rather than in that table -- the Caller of whatever
+        this Partner's in-memory working slot currently holds. Missing the
+        second would leave the one task actually in flight unreported, since
+        `advance()` promoted it out of the queue before either of these
+        callers ran.
+
+        The notice is attributed to the vanishing Partner itself, as
+        `caller_id` -- not to the requester archiving it. The row surviving
+        the row it names is exactly why: `archived_at` leaves the Partner's own
+        row in place, so it stays a valid, permanent `caller_id` to attribute
+        to, while the requester usually is NOT a safe choice -- only a
+        project-orchestrator may handshake a plain `science_` worker at all, so
+        the requester calling `archive_sessions` is normally the SAME partner
+        as the one Caller with work queued against it, and attributing the
+        notice to the requester would then name the notice's own recipient as
+        its sender, which `message_queue`'s `CHECK (caller_id <> partner_id)`
+        refuses outright. (This is also why `delete_partner` cannot reuse this
+        helper: deleting the row instead of archiving it would cascade the
+        just-inserted notice away along with everything else that named it,
+        since `message_queue.caller_id` is `ON DELETE CASCADE` -- see
+        `delete_partner`'s own `partner_has_work_in_flight` refusal.)
+
+        A Caller that is the vanishing Partner itself is skipped (the
+        `message_queue` row that produced it already enforces `caller_id <>
+        partner_id`, but the working slot is not that table, so the check is
+        repeated rather than assumed) and so is one that is already archived
+        or deleted -- writing an `[ERROR]` into a queue nothing will ever
+        drain is the same silent loss, one Caller removed.
+        """
+        partner = conn.execute(
+            "SELECT title FROM partners WHERE id = ?", (partner_id,)
+        ).fetchone()
+        title = partner["title"] if partner is not None else "an unknown partner"
+
+        caller_ids = {
+            row["caller_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT caller_id FROM message_queue WHERE partner_id = ?",
+                (partner_id,),
+            ).fetchall()
+        }
+        working = self.slots.get(partner_id)
+        if working is not None:
+            caller_ids.add(working["caller_id"])
+
+        body = (
+            f"{title!r} was just archived. Work you sent it will not run and no answer is "
+            "coming back -- it is gone, not delayed."
+        )
+        for caller_id in caller_ids:
+            if caller_id == partner_id:
+                continue
+            live = conn.execute(
+                "SELECT id FROM partners WHERE id = ? AND archived_at IS NULL", (caller_id,)
+            ).fetchone()
+            if live is None:
+                continue
+            # `[ERROR]` is uncapped and `stored = 0` in `label_caps` -- no cap
+            # to check, no `messages` row to create, so `message_id` is left
+            # NULL rather than run through `_admit`. At priority 2 this
+            # displaces whatever the Caller is doing on its own; that IS the
+            # interruption, and no separate mechanism is needed to deliver it.
+            conn.execute(
+                "INSERT INTO message_queue (partner_id, caller_id, behavior, body) "
+                "VALUES (?, ?, '[ERROR]', ?)",
+                (caller_id, partner_id, body),
+            )
+
+        # The vanishing Partner cannot be polled again either way, so nothing
+        # will ever act on its working slot -- leaving it set would just be a
+        # second place the same stale fact could be read from.
+        self.slots.clear(partner_id)
+
     def delete_partner(self, *, requester_uuid: str, partner_title: str) -> dict:
         requester = self._resolve_requester(requester_uuid)
         target = self._resolve_live_partner_by_title(partner_title)
@@ -616,6 +732,36 @@ class MessagingCore:
             )
 
         def _delete(conn: sqlite3.Connection) -> None:
+            # Deletion is irreversible and, unlike archive_sessions, has no way
+            # to tell anyone about it afterward: message_queue.caller_id is ON
+            # DELETE CASCADE, so an [ERROR] inserted here to explain the loss
+            # would be deleted right along with everything else naming this
+            # partner, by the DELETE two lines below -- the notice cannot
+            # outlive the row it depends on. Attributing the notice to the
+            # requester instead does not fix it either: only a
+            # project-orchestrator may handshake a plain worker at all, so the
+            # requester deleting it is normally the SAME partner as the one
+            # Caller with work queued against it, and a notice cannot name its
+            # own recipient as its sender (message_queue's own `CHECK
+            # (caller_id <> partner_id)` refuses that). So this refuses instead
+            # of silently dropping the work or crashing a later report_back --
+            # archive_sessions is the version of this that CAN tell every
+            # waiting Caller, because it leaves the row in place.
+            has_queued = (
+                conn.execute(
+                    "SELECT 1 FROM message_queue WHERE partner_id = ? LIMIT 1", (target["id"],)
+                ).fetchone()
+                is not None
+            )
+            if has_queued or self.slots.get(target["id"]) is not None:
+                raise Rejected(
+                    "partner_has_work_in_flight",
+                    f"{target['title']!r} still has work queued or in progress against it; "
+                    "deleting it now would drop that work with no way to tell whoever is "
+                    "waiting.",
+                    next_call="Call archive_sessions instead; it reports the loss to every "
+                    "caller waiting.",
+                )
             try:
                 conn.execute("DELETE FROM partners WHERE id = ?", (target["id"],))
             except sqlite3.IntegrityError as exc:
@@ -812,6 +958,13 @@ class MessagingCore:
                     "WHERE id = ?",
                     (row["id"],),
                 )
+                # An archived partner can never be messaged again, and its
+                # whole queue is deleted outright the moment advance() next
+                # looks at it (see advance()'s own comment). Report it here,
+                # while the queue this partner owes answers on is still
+                # readable, rather than let every Caller on it wait forever
+                # for a reply that was never going to come.
+                self._report_lost_work(conn, row["id"])
                 archived.append(t)
             return archived, skipped
 
@@ -1510,7 +1663,11 @@ class MessagingCore:
         Raises:
             Rejected: `unknown_behavior`, `idle_not_sendable`,
                 `source_cannot_send`, `research_not_accepted`,
-                `research_cannot_flow_upward`, `no_handshake`, `over_queue`.
+                `research_cannot_flow_upward`, `research_needs_a_forward_handshake`,
+                `no_handshake`, `over_queue`. Any `Rejected` or `NeedsRemote` raised
+                by the `advance()` call at the end carries `already_committed =
+                True` -- the queue push above it already landed, so that failure
+                is not grounds to retry the whole call.
             NeedsRemote: after the message is admitted, if no matching
                 extension can deliver it. Admission stands; delivery does not.
         """
@@ -1564,16 +1721,56 @@ class MessagingCore:
                 )
 
         if self._needs_handshake(target):
-            handshake_row = self.db.read_one(
+            # A handshake row only ever gets written in the direction an
+            # orchestrator claims it (see `handshake`'s `requester_not_orchestrator`
+            # check): `from_partner` is always the orchestrator, `to_partner`
+            # always the worker it directs. A worker replying to that Caller has
+            # no row of its own to point back with -- it was never the one who
+            # called `handshake` -- so requiring the forward row for every label
+            # would make every reply direction permanently unreachable. Accepting
+            # the reverse row for an ANSWER opens nothing new: it is still the
+            # same pair, already joined by the same orchestrator, and the only
+            # thing this adds is a reply travelling back along a link that
+            # already exists.
+            #
+            # `[RESEARCH]` is not a reply, and the layer rule alone does not
+            # stand in for the row here: `research_cannot_flow_upward` refuses
+            # only a STRICTLY higher target, and a `project-orchestrator` sits at
+            # the SAME layer as the plain `science_` worker it directs (both 2 in
+            # `agent_layers`). Accepting the reverse row for every label would
+            # therefore hand that worker exactly what requiring the forward row
+            # used to prevent -- the ability to delegate `[RESEARCH]` back to its
+            # own director -- as a side effect of opening the answer direction.
+            # So the two directions are told apart: an answer travels back along
+            # a handshake, but delegated work only ever travels ALONG it in the
+            # direction the orchestrator claimed, never back.
+            forward_row = self.db.read_one(
                 "SELECT id FROM handshakes WHERE from_partner = ? AND to_partner = ?",
                 (requester["id"], target["id"]),
             )
-            if handshake_row is None:
-                raise Rejected(
-                    "no_handshake",
-                    "No handshake exists from the requester to this partner.",
-                    next_call="Call handshake first.",
+            if forward_row is None:
+                reverse_row = self.db.read_one(
+                    "SELECT id FROM handshakes WHERE from_partner = ? AND to_partner = ?",
+                    (target["id"], requester["id"]),
                 )
+                if reverse_row is None:
+                    raise Rejected(
+                        "no_handshake",
+                        "No handshake exists from the requester to this partner.",
+                        next_call="Call handshake first.",
+                    )
+                if behavior == "[RESEARCH]":
+                    raise Rejected(
+                        "research_needs_a_forward_handshake",
+                        "A handshake exists between these two, but only in the reverse "
+                        "direction -- this partner is the one who claimed it, not the one it "
+                        "was claimed against. An answer may travel back along that row; "
+                        "[RESEARCH] delegates NEW work, and delegated work only travels a "
+                        "handshake in the direction an orchestrator claimed it.",
+                        next_call="If this partner is genuinely meant to receive delegated "
+                        "work, have an orchestrator call handshake naming it as the target, "
+                        "in that direction.",
+                    )
 
         store = self._stored(behavior)
         lock = self.slots.lock_for(target["id"])
@@ -1602,7 +1799,18 @@ class MessagingCore:
             "queue_depth": depth,
             "partner_id": target["id"],
         }
-        result.update(self.advance(partner_id=target["id"]) or {"delivered": None})
+        try:
+            advanced = self.advance(partner_id=target["id"])
+        except (Rejected, NeedsRemote) as exc:
+            # The push above already committed; only what happens next --
+            # delivery -- failed. Marking the SAME exception object (not a new
+            # one, which would drop the code and the traceback) is what lets
+            # whoever renders this tell "nothing happened, retry" from "it
+            # happened, only delivery didn't" -- without the flag, a retry
+            # burns the caller's cap re-doing work the system already holds.
+            exc.already_committed = True
+            raise
+        result.update(advanced or {"delivered": None})
         return result
 
     def advance(self, *, partner_id: int) -> dict | None:
@@ -1848,6 +2056,8 @@ class MessagingCore:
                 body=task["body"],
                 read_paths=paths["read"],
                 write_paths=paths["write"],
+                partner_uuid=partner["uuid"],
+                partner_title=partner["title"],
             )
         # A [TRUTHFUL-REPORT] reaching this point is always a summary being
         # DELIVERED, never a request for one -- a request still in progress
@@ -1857,7 +2067,11 @@ class MessagingCore:
         # from meaning two opposite things depending on which end of the
         # exchange is reading it.
         return templates.relay(
-            caller_title=caller_title, behavior=task["behavior"], body=task["body"]
+            caller_title=caller_title,
+            behavior=task["behavior"],
+            body=task["body"],
+            partner_uuid=partner["uuid"],
+            partner_title=partner["title"],
         )
 
     def begin_summary_phase(self, *, partner_id: int) -> str | None:
@@ -1965,6 +2179,21 @@ class MessagingCore:
         The last two are the cases a Partner cannot report itself -- an agent
         stopped on a prompt is not running, and nothing else is watching.
 
+        The recipient is checked live before anything is inserted, and a dead
+        one is a quiet non-delivery -- `delivered: False` in the result --
+        rather than the `sqlite3.IntegrityError` `message_queue`'s own foreign
+        key would otherwise raise. `archive_sessions` and `delete_partner` can
+        each make `to_partner_id` disappear (archived, or gone outright) after
+        the task this is reporting on was already handed out, and the Polling
+        Server calls this AFTER it has released the working slot the task
+        held. A raise at that point cannot be recovered from where it is
+        caught: the slot is already empty, so the answer cannot be put back
+        there, and the drain thread that called this is left stranded on an
+        exception nobody reads. Returning quietly instead lets that caller
+        move on -- the Caller was already told its work is gone, by whichever
+        of archiving or deleting caused this, so there is nothing left for
+        this particular answer to do.
+
         Raises:
             Rejected: `not_reportable` if `behavior` is `[RESEARCH]` or `[IDLE]`.
         """
@@ -1982,19 +2211,38 @@ class MessagingCore:
                 f"{behavior!r} is not a recognized behavior label; expected one of {BEHAVIORS}.",
             )
         store = self._stored(behavior)
-        with self.slots.lock_for(to_partner_id):
-            message_id, depth = self.db.write(
-                lambda conn: self._admit(
-                    conn,
-                    partner_id=to_partner_id,
-                    caller_id=from_partner_id,
-                    behavior=behavior,
-                    body=body,
-                    store=store,
-                    from_partner=from_partner_id,
-                )
+
+        def _push(conn: sqlite3.Connection) -> tuple[int | None, int, bool]:
+            # Checked INSIDE the same write transaction that would otherwise
+            # insert, not as a separate read before it -- a separate read
+            # leaves a window between "was live" and "still is" for
+            # delete_partner's DELETE to land in, which is exactly the
+            # read-then-write shape _ADMIT_SQL's own comment refuses to use
+            # for the cap check, for the same reason.
+            live = conn.execute(
+                "SELECT id FROM partners WHERE id = ? AND archived_at IS NULL", (to_partner_id,)
+            ).fetchone()
+            if live is None:
+                return None, 0, False
+            message_id, depth = self._admit(
+                conn,
+                partner_id=to_partner_id,
+                caller_id=from_partner_id,
+                behavior=behavior,
+                body=body,
+                store=store,
+                from_partner=from_partner_id,
             )
-        return {"message_id": message_id, "queue_depth": depth, "behavior": behavior}
+            return message_id, depth, True
+
+        with self.slots.lock_for(to_partner_id):
+            message_id, depth, delivered = self.db.write(_push)
+        return {
+            "message_id": message_id,
+            "queue_depth": depth,
+            "behavior": behavior,
+            "delivered": delivered,
+        }
 
     def release(self, *, partner_id: int) -> dict | None:
         """Empty the working slot because the remote finished its turn.

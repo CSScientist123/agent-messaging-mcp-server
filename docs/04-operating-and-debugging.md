@@ -17,13 +17,28 @@ All commands run from the repository root, `messaging-MCP/`.
 
 ## Configuration
 
-Three environment variables control a server:
+Three environment variables control the server itself:
 
 | Variable | Meaning |
 |---|---|
 | `MESSAGING_MCP_SOURCE` | Which source this server speaks: `nlm_`, `science_`, or `gemini_` |
 | `MESSAGING_MCP_DB` | Database path. Defaults to `~/.messaging-mcp/messaging.sqlite3` |
 | `MESSAGING_MCP_STUB` | Set to `1` to use a stub extension instead of the real adapter |
+
+Each adapter then needs whatever reaches its own remote. These are **not** optional for a
+real deployment, and none of them fails at start-up — an adapter builds fine without them and
+the first delivery is what fails:
+
+| Variable | Used by | Meaning |
+|---|---|---|
+| `CLAUDE_SCIENCE_BASE_URL` | `science_` | Where Claude Science is listening. Defaults to `http://127.0.0.1:8000` |
+| `CLAUDE_SCIENCE_COOKIE` | `science_` | Session cookie for that instance. Defaults to empty, which authenticates as nobody |
+| — | `nlm_` | The `nlm` CLI must be on `PATH` (or pass `nlm_path=`). A missing binary raises `NlmBinaryMissing` |
+| — | `gemini_` | The `tmux` binary must be on `PATH` (or pass `tmux_path=`). A missing binary raises `TmuxBinaryMissing` |
+
+An empty `CLAUDE_SCIENCE_COOKIE` is the one worth watching: it is a valid configuration that
+produces authentication failures on every request rather than a refusal to start, so the
+symptom shows up as `[remote failed]` on the first `send` rather than anywhere near the cause.
 
 `code_` has no adapter. A Claude Code session is local and has no remote presence for an
 adapter to reach; it participates by handshaking one `bridge-scientist` on the Claude Science

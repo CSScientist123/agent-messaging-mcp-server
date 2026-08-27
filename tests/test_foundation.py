@@ -490,6 +490,7 @@ def test_outstanding_requires_both_caller_and_behavior_to_match():
 
 def test_research_dispatch_contains_every_path_it_was_given():
     prompt = templates.research_dispatch(
+        partner_uuid="u-worker-1", partner_title="the-worker",
         caller_title="orchestrator",
         body="do the thing",
         read_paths=["/proj/read-a", "/proj/read-b"],
@@ -501,6 +502,7 @@ def test_research_dispatch_contains_every_path_it_was_given():
 
 def test_research_dispatch_does_not_contain_a_path_it_was_not_given():
     prompt = templates.research_dispatch(
+        partner_uuid="u-worker-1", partner_title="the-worker",
         caller_title="orchestrator",
         body="do the thing",
         read_paths=["/proj/only-this-one"],
@@ -510,6 +512,7 @@ def test_research_dispatch_does_not_contain_a_path_it_was_not_given():
 
     # Two renders with disjoint path sets must not leak into each other.
     other_prompt = templates.research_dispatch(
+        partner_uuid="u-worker-1", partner_title="the-worker",
         caller_title="orchestrator",
         body="do the thing",
         read_paths=["/proj/a-completely-different-path"],
@@ -521,6 +524,7 @@ def test_research_dispatch_does_not_contain_a_path_it_was_not_given():
 
 def test_research_dispatch_with_no_paths_says_so_explicitly():
     prompt = templates.research_dispatch(
+        partner_uuid="u-worker-1", partner_title="the-worker",
         caller_title="orchestrator", body="do the thing", read_paths=[], write_paths=[]
     )
     # An agent handed silence about paths has no reason to think it holds
@@ -530,6 +534,7 @@ def test_research_dispatch_with_no_paths_says_so_explicitly():
 
 def test_research_dispatch_contains_the_body_and_caller_title():
     prompt = templates.research_dispatch(
+        partner_uuid="u-worker-1", partner_title="the-worker",
         caller_title="the-delegating-caller",
         body="a distinctive instruction string",
         read_paths=[],
@@ -574,15 +579,27 @@ def test_idle_interruption_contains_the_reason_and_caller():
 
 
 def test_relay_contains_behavior_body_and_caller():
-    prompt = templates.relay(caller_title="worker", behavior="[QUERY]", body="what is X?")
+    prompt = templates.relay(partner_uuid="u-worker-1", partner_title="the-worker", caller_title="worker", behavior="[QUERY]", body="what is X?")
     assert "[QUERY]" in prompt
     assert "what is X?" in prompt
     assert "worker" in prompt
 
 
-def test_relay_does_not_contain_a_behavior_it_was_not_given():
-    prompt = templates.relay(caller_title="worker", behavior="[QUERY]", body="what is X?")
-    assert "[ERROR]" not in prompt
+def test_relay_does_not_misattribute_the_behavior_it_was_given():
+    """Asserted on the announcement line, not the whole prompt.
+
+    The identity block names [QUERY] and [ERROR] as the two reasons an agent
+    may call `send` itself, so both strings legitimately appear further down.
+    What must never happen is the line that tells the agent WHICH label just
+    arrived naming a different one.
+    """
+    prompt = templates.relay(
+        partner_uuid="u-worker-1", partner_title="the-worker",
+        caller_title="worker", behavior="[QUERY]", body="what is X?",
+    )
+    announcement = next(line for line in prompt.splitlines() if "sends you a" in line)
+    assert "[QUERY]" in announcement
+    assert "[ERROR]" not in announcement
 
 
 def test_instructing_templates_open_with_the_instructs_header():
@@ -592,6 +609,7 @@ def test_instructing_templates_open_with_the_instructs_header():
     # with the same, distinct marker.
     instructing_prompts = [
         templates.research_dispatch(
+            partner_uuid="u-worker-1", partner_title="the-worker",
             caller_title="c", body="b", read_paths=[], write_paths=[]
         ),
         templates.idle_interruption(caller_title="c", reason="r"),
@@ -603,7 +621,7 @@ def test_instructing_templates_open_with_the_instructs_header():
 
 
 def test_relay_opens_with_the_relays_header_not_instructs():
-    prompt = templates.relay(caller_title="c", behavior="[QUERY]", body="b")
+    prompt = templates.relay(partner_uuid="u-worker-1", partner_title="the-worker", caller_title="c", behavior="[QUERY]", body="b")
     assert prompt.startswith(templates.RELAYS)
     assert not prompt.startswith(templates.INSTRUCTS)
 

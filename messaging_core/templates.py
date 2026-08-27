@@ -27,8 +27,48 @@ INSTRUCTS = "[Polling Server messages you]"
 RELAYS = "[Polling Server]"
 
 
+def identity_block(*, partner_uuid: str, partner_title: str, caller_title: str) -> list[str]:
+    """Lines telling the agent who it is and how a reply actually leaves it.
+
+    Every call into `send` takes `requester_uuid` -- the agent's OWN uuid --
+    and no prompt ever states it. Without this block an agent told to
+    "message back a [QUERY]" holds an instruction it has no credentials to
+    carry out. `partner_uuid` and `partner_title` are what let it fill in
+    that call itself instead of guessing at an identity it was never given.
+
+    The "answering is automatic" sentence is the other half, and it is not
+    optional framing -- it is the fix for a distinct failure from the one
+    above. This session's result is harvested and delivered to the Caller
+    the moment the turn ends, whether or not the agent ever calls `send`. An
+    agent that was only handed its own identity, with no word that delivery
+    already happens, would reasonably use it to send its answer -- and the
+    Caller would receive that answer twice, once harvested and once sent.
+    Stating plainly that `send` is for the turn NOT finishing -- a [QUERY]
+    for missing context, an [ERROR] when blocked -- is what keeps the two
+    delivery paths from overlapping.
+    """
+    return [
+        f"You are {partner_title}. Your own requester_uuid, for any `send` call you make, is:",
+        "",
+        f"  {partner_uuid}",
+        "",
+        f"Answering is automatic: whatever you produce in this session is read back and "
+        f"delivered to {caller_title} when this turn finishes. Do NOT send your answer "
+        "yourself -- doing so delivers it twice.",
+        "",
+        "`send` is for one thing only: something that cannot wait for the turn to end. Use "
+        "[QUERY] when you are missing context only the Caller holds, or [ERROR] when you are "
+        "blocked and cannot continue. Then stop and wait.",
+        "",
+        "The call, with your real identity already filled in:",
+        "",
+        f'  send(requester_uuid="{partner_uuid}", queried_partner_title="{caller_title}", '
+        'behavior="[QUERY]", message="...")',
+    ]
+
+
 def research_dispatch(*, caller_title: str, body: str, read_paths: list[str],
-                      write_paths: list[str]) -> str:
+                      write_paths: list[str], partner_uuid: str, partner_title: str) -> str:
     """Render the `[RESEARCH]` dispatch, with the partner's configured paths inlined.
 
     The path block is the part that matters and the part that is easy to get
@@ -38,12 +78,19 @@ def research_dispatch(*, caller_title: str, body: str, read_paths: list[str],
     rather than a question. So the paths are stated, and the instruction not
     to leave them is stated in the same breath as the reason.
 
+    Also carries the identity block (see `identity_block`), because this
+    template is the one that tells the agent to "message back a [QUERY] and
+    idle" -- an instruction it cannot follow without its own uuid, sent to
+    it nowhere else.
+
     Args:
         caller_title: Title of the Caller delegating the work.
         body: The Caller's message, verbatim.
         read_paths: Paths the partner may read. May be empty.
         write_paths: Paths the partner may write, including files that do not
             exist yet.
+        partner_uuid: This partner's own uuid, for the identity block.
+        partner_title: This partner's own title, for the identity block.
 
     Returns:
         The full prompt text to hand to the remote.
@@ -66,6 +113,12 @@ def research_dispatch(*, caller_title: str, body: str, read_paths: list[str],
         "Never request an approval. If you find yourself blocked on a permission, that is a "
         "configuration error on the Caller's side, not a question for you to ask. Say what "
         "you were missing and stop.",
+        "",
+    ]
+    lines += identity_block(
+        partner_uuid=partner_uuid, partner_title=partner_title, caller_title=caller_title
+    )
+    lines += [
         "",
         "Begin now. You will be asked to summarize when you are done.",
     ]
@@ -160,12 +213,22 @@ def resume_displaced(*, behavior: str) -> str:
     return f"{INSTRUCTS}\n\nResume your previous {behavior}."
 
 
-def relay(*, caller_title: str, behavior: str, body: str) -> str:
+def relay(*, caller_title: str, behavior: str, body: str, partner_uuid: str,
+          partner_title: str) -> str:
     """Render a plain relay: a Partner's message passed through unaltered.
 
     Used for every label with no template of its own -- `[QUERY]`, `[ERROR]`,
     `[MESSAGE-RESPONSE]`. The header is `[Polling Server]`, not
     `[Polling Server messages you]`, because the Server is showing the agent
     something rather than telling it something.
+
+    Also carries the identity block (see `identity_block`). This is the
+    template that hands an agent an `[ERROR]` telling it something is
+    blocked -- exactly the shape of agent that may need to answer back with
+    its own `[QUERY]` or `[ERROR]`, and it needs its own uuid to do that.
     """
-    return "\n".join([RELAYS, "", f"{caller_title} sends you a {behavior}:", "", body])
+    lines = [RELAYS, "", f"{caller_title} sends you a {behavior}:", "", body, ""]
+    lines += identity_block(
+        partner_uuid=partner_uuid, partner_title=partner_title, caller_title=caller_title
+    )
+    return "\n".join(lines)
