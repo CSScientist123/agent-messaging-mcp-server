@@ -74,17 +74,32 @@ what went wrong, and the correction was never delivered. That is the exact flow 
 doctrine in rule 20 depends on.
 
 So the head is read in two steps. `_HEAD_LABEL_SQL` picks the label: lowest priority, then a
-label with any unpaused work over one whose rows are all paused, then arrival.
-`_HEAD_ROW_SQL` picks the row within it: paused first, then arrival.
+label with any unpaused work over one whose rows are all paused, then **its earliest fresh
+arrival**, then arrival. `_HEAD_ROW_SQL` picks the row within it: paused first, then arrival.
+
+**Why the third key is not redundant.** "Has any unpaused work" separates a wholly paused
+label from one with fresh work, and nothing more. A label holding a paused row *and* a fresh
+one ties `[ERROR]` on that key — and then loses on arrival, because its paused row is by
+construction the oldest thing in the queue. The same bug, through the tie-break: a Partner
+interrupted mid-`[QUERY]` that also has a second `[QUERY]` waiting is handed "resume your
+previous `[QUERY]`" and never sees the `[ERROR]`. Ranking a label by when it last had
+something *new* to say fixes it. No `NULLS LAST` is needed, and adding one would be wrong:
+the preceding key already guarantees the comparison only happens between two labels that both
+have fresh rows or both have none.
 
 **The consequence that makes the resume prompt possible.** Among the tasks carrying one
 label, at most one is paused and it is always picked first — so "resume your previous
 `[RESEARCH]`" refers to exactly one thing, and the prompt can be a single line.
 
 **Where enforced.** `_HEAD_LABEL_SQL` and `_HEAD_ROW_SQL` in `messaging_core/core.py`.
-Covered by three mutants: `in-process-ignored` (drops the paused-first tie-break within a
+Covered by four mutants: `in-process-ignored` (drops the paused-first tie-break within a
 label), `in-process-crosses-labels` (restores the global tie-break that caused the bug above),
-and `displaced-not-paused` (requeues a displaced task without the flag at all).
+`displaced-not-paused` (requeues a displaced task without the flag at all), and
+`label-order-ignores-fresh-arrival` (drops the third key, restoring the bug through the tie).
+
+The single-paused-row consequence above is itself checked by
+`tests/test_paused_row_invariant.py`, which drives seeded sequences of sends, interruptions
+and injected delivery failures and asserts it after every step.
 
 ## 4. Draining deletes
 
@@ -111,9 +126,17 @@ one starts, and a cap of three means four.
 `rowcount == 0`. A read-then-write can be passed by two concurrent callers simultaneously,
 which is exactly how a cap of three admits four.
 
+**Why the label is the one it was admitted under.** A `[RESEARCH]` task is relabelled
+`[TRUTHFUL-REPORT]` in place when it enters its summary phase, so a cap keyed on the *current*
+label stops counting it the moment it is relabelled — and the same Caller gets one more
+`[RESEARCH]` in flight than the cap allows, for exactly as long as the summary takes. The
+queue row and the working slot both carry `origin_behavior`, and both sides of the count read
+`COALESCE(origin_behavior, behavior)`.
+
 **Where enforced.** `_ADMIT_SQL` in `messaging_core/core.py`, with the working-slot term
-supplied by `WorkingSlots.outstanding` under the Partner's slot lock. Covered by the
-`cap-ignores-working` mutant.
+supplied by `WorkingSlots.outstanding` under the Partner's slot lock. Covered by three
+mutants: `cap-ignores-working`, `cap-ignores-the-origin-label` (slot side) and
+`admit-ignores-the-origin-label` (queue side).
 
 ## 6. Only labels marked `stored` reach `messages`
 
@@ -170,6 +193,16 @@ resumed.
 it upward would be reassigning its own director's work. An answer, an error or a report has to
 be able to come back, which is why the rule is scoped to one label rather than applied to the
 pair.
+
+**Why the layer rule is not sufficient on its own.** It refuses only a *strictly* higher
+target, and a `project-orchestrator` and the plain `science_` worker it directs sit at the
+same layer — so between exactly the pair delegation normally runs along, it does not fire.
+What used to prevent the inversion was the handshake: a worker had no row pointing at its own
+director and could not create one. Opening the reverse direction so that answers can come
+home (see `docs/03`, "The answer direction") would have given that away as a side effect, so
+`[RESEARCH]` alone still requires the handshake to point at its target —
+`research_needs_a_forward_handshake`. Answers travel back along a handshake; delegated work
+only travels along it in the direction the orchestrator claimed.
 
 **Where enforced.** Two places, and the second is what makes the first a rule rather than a
 convention. `MessagingCore.send` reads `agent_layers` — not literals, so a deployment that adds
