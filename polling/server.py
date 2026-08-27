@@ -98,11 +98,17 @@ class PollingServer:
         poll_interval: float = 0.25,
         core: MessagingCore | None = None,
         supervisor_interval: float = 1.0,
+        hold_interval: float = 2.0,
     ) -> None:
         self.db = db
         self.extensions = extensions
         self.poll_interval = poll_interval
         self.supervisor_interval = supervisor_interval
+        #: How long a drain thread waits between passes while the working
+        #: slot holds an `[IDLE]`. Deliberately coarser than `poll_interval`
+        #: -- see the wait call in `_drain_loop` for why a slow poll is safe
+        #: here.
+        self.hold_interval = hold_interval
         # One core, holding the slots every per-source view shares.
         self.core = core if core is not None else MessagingCore(db)
 
@@ -345,7 +351,28 @@ class PollingServer:
                             retire = False
                             return
                     continue
-                stop_event.wait(max(self.poll_interval / 4, 0.0))
+                held_task = self.core.slots.get(partner_id)
+                if held_task is not None and held_task["behavior"] == INTERRUPT_BEHAVIOR:
+                    # An [IDLE] hold is not something this thread waits to
+                    # change -- it is something SOMEBODY ELSE changes. The
+                    # message that ends a hold is delivered by whoever sends
+                    # it: `send` calls `advance()` directly, which displaces
+                    # the hold and delivers the new task in the sender's own
+                    # call, synchronously. So this loop is never racing to
+                    # notice a resume; it is only re-checking a slot that, if
+                    # it has changed at all, already changed before this wait
+                    # even started. Polling it 16x/second, forever, for a
+                    # partner deliberately stopped and with nothing to poll,
+                    # bought nothing but wakeups.
+                    #
+                    # `hold_interval` is still kept small rather than backed
+                    # off indefinitely, though: once the swap DOES happen,
+                    # this is the only thread that will ever poll the new
+                    # task for completion, and a long sleep taken right
+                    # before that swap would delay noticing it.
+                    stop_event.wait(self.hold_interval)
+                else:
+                    stop_event.wait(max(self.poll_interval / 4, 0.0))
             # Left because stop() asked, not because the work ran out.
             retire = False
         finally:

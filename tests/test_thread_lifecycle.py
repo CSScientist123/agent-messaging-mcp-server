@@ -428,3 +428,85 @@ def test_a_failure_to_arm_never_turns_a_successful_send_into_an_error(db, core, 
     ) is not None or core.working_task(partner_id=worker["id"]) is not None, (
         "the message really was admitted, which is why the receipt must stand"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. An [IDLE] hold waits; it does not spin.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingEvent:
+    """A stop event that records every wait and stops the loop after N of them."""
+
+    def __init__(self, stop_after: int = 2) -> None:
+        self.waits: list[float | None] = []
+        self._stop_after = stop_after
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(timeout)
+        if len(self.waits) >= self._stop_after:
+            self._set = True
+        return self._set
+
+
+def test_an_idle_hold_waits_instead_of_spinning(db, core, server):
+    """A held Partner is deliberately stopped and has nothing to poll.
+
+    `drain_once` returns False for an [IDLE] -- correctly, since the queue may
+    hold the task the interruption displaced, so the thread must not retire.
+    But the loop then waited a QUARTER of the poll interval, which at the
+    default is a wake-up roughly sixteen times a second, forever, for a
+    Partner that will not change until something displaces the hold.
+    """
+    caller = make_orchestrator(core)
+    worker = make_worker(core, caller, "science_")
+    # Interrupted with nothing queued behind it. That is what makes the hold
+    # PERSIST: anything in the queue outranks an [IDLE] and displaces it on the
+    # very next advance(), so a hold only lasts while there is nothing to take
+    # it -- which is exactly the state that used to spin.
+    core.interrupt_partner(
+        requester_uuid=caller["uuid"], partner_title=worker["title"], reason="stop"
+    )
+    working = core.working_task(partner_id=worker["id"])
+    assert working is not None and working["behavior"] == "[IDLE]", (
+        f"setup failed: expected an [IDLE] hold, got {working}"
+    )
+    assert queued_behaviors(db, worker["id"]) == [], (
+        "setup failed: a queued task would displace the hold immediately"
+    )
+
+    event = _RecordingEvent(stop_after=2)
+    server._drain_loop(worker["id"], event)
+
+    assert event.waits, "the loop should have waited at least once"
+    assert all(w == server.hold_interval for w in event.waits), (
+        f"a hold must wait hold_interval ({server.hold_interval}s), not a fraction of "
+        f"the poll interval; recorded waits: {event.waits}"
+    )
+
+
+def test_a_working_partner_is_still_polled_at_the_poll_interval(db, core, server):
+    """The slow path is for holds only -- real work must not be slowed down."""
+    caller = make_orchestrator(core)
+    worker = make_worker(core, caller, "science_")
+    core.send(
+        requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+        message="investigate x", behavior="[RESEARCH]",
+    )
+    working = core.working_task(partner_id=worker["id"])
+    assert working is not None and working["behavior"] != "[IDLE]"
+
+    event = _RecordingEvent(stop_after=1)
+    server._drain_loop(worker["id"], event)
+
+    assert event.waits, "the loop should have waited at least once"
+    assert all(w != server.hold_interval for w in event.waits), (
+        f"a working partner must not be polled at the hold interval; waits: {event.waits}"
+    )
