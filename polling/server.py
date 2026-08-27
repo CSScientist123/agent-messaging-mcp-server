@@ -49,6 +49,31 @@ __all__ = ["PollingServer"]
 # bookkeeping deterministic instead of leaving a queue push half-made.
 NO_READABLE_RESULT = "[result reported by the remote through its own channel]"
 
+#: What a Caller is told when its Partner stops on a permission it does not hold.
+#:
+#: Deliberately short, and deliberately prescriptive. An approval prompt is not a
+#: question anybody answers -- it means the grant was missing before the work
+#: started -- so the message names the conversation, names what was asked for,
+#: and names the two capabilities that fix it. A Caller handed a full incident
+#: report starts debugging instead of granting.
+APPROVAL_ERROR_TEMPLATE = """\
+An approval was requested by {title}. This is unexpected: an approval means a
+permission was missing before the work started, and nothing in this system
+answers one.
+
+Conversation: {remote_id}
+What it asked for:
+{detail}
+
+How to resolve it:
+
+- Call get_permissions for {title} to see what that conversation currently allows.
+- Call add_permissions (or delete_permissions) so the set covers the work you
+  asked for. Write paths must include files that do not exist yet.
+- Then send the work again. Correcting the grant and sending again IS the
+  resumption; there is nothing else to resume.
+"""
+
 
 class PollingServer:
     """Polls remotes on behalf of every agent, so agents never have to.
@@ -283,11 +308,36 @@ class PollingServer:
 
         extension = core.extension
         remote_id = self._partner_remote_id(partner_id)
-        if not self._is_complete(extension, remote_id):
+        try:
+            finished = self._is_complete(extension, remote_id)
+        except Rejected as exc:
+            if exc.code != "approval_is_an_error":
+                raise
+            # The Partner is stopped on a permission it does not hold. It is
+            # neither busy nor finished, and no amount of polling changes that --
+            # so this is reported to the Caller rather than retried. Without this
+            # branch the exception escapes to the drain loop, which records it and
+            # polls again forever: the slot stays held, the thread never retires,
+            # and nobody is ever told.
+            self._stop_quietly(extension, remote_id, "stopped on an approval prompt")
+            self._raise_approval_to_caller(core, partner_id, task, str(exc))
+            return False
+        if not finished:
             return False
 
         self._complete(core, partner_id, task, extension, remote_id)
         return False
+
+    def _stop_quietly(self, extension: RemoteExtension, remote_id: str, reason: str) -> None:
+        """Stop the remote, tolerating a remote that cannot be stopped.
+
+        Not every remote can be cancelled, and one that cannot must not turn a
+        report into a failure. The report is the point; the stop is hygiene.
+        """
+        try:
+            extension.stop_remote_execution(partner_id_in_remote=remote_id, reason=reason)
+        except (Rejected, NeedsRemote) as exc:
+            self.last_errors.append(exc)
 
     def _is_complete(self, extension: RemoteExtension, remote_id: str) -> bool:
         """Whether the remote has finished its turn.
@@ -302,6 +352,46 @@ class PollingServer:
             return extension.poll_completion(partner_id_in_remote=remote_id)
         except NeedsRemote:
             return True
+
+    def _raise_approval_to_caller(
+        self, core: MessagingCore, partner_id: int, task: dict[str, Any], detail: str
+    ) -> None:
+        """Tell the Caller its Partner is stopped on a permission it does not hold.
+
+        A Partner blocked on an approval is not busy and is not finished -- it is
+        waiting for something no amount of polling will produce. Left alone it
+        holds the working slot indefinitely and nobody is told, because the
+        Partner cannot report it (an agent stopped on a prompt is not running)
+        and the Caller has no reason to look.
+
+        So the Polling Server reports it, on the Partner's behalf. The slot is
+        released, the Partner's remote is stopped so it is not left sitting on
+        the prompt, and an `[ERROR]` naming the conversation and the missing
+        permission is pushed into the Caller's queue -- where, at priority 2, it
+        displaces whatever the Caller was doing. That displacement IS the
+        interruption; no separate mechanism is needed.
+        """
+        released = core.release(partner_id=partner_id)
+        caller_id = (released or task)["caller_id"]
+        partner = self.db.read_one(
+            "SELECT title, partner_id_in_remote FROM partners WHERE id = ?", (partner_id,)
+        )
+        body = APPROVAL_ERROR_TEMPLATE.format(
+            title=partner["title"] if partner else f"partner {partner_id}",
+            remote_id=partner["partner_id_in_remote"] if partner else "unknown",
+            detail=detail.strip(),
+        )
+        core.report_back(
+            to_partner_id=caller_id,
+            from_partner_id=partner_id,
+            behavior="[ERROR]",
+            body=body,
+        )
+        caller = self.db.read_one(
+            "SELECT uuid FROM partners WHERE id = ? AND archived_at IS NULL", (caller_id,)
+        )
+        if caller is not None:
+            self._ensure_thread(caller_id, caller["uuid"])
 
     def _read_result(self, extension: RemoteExtension, remote_id: str) -> str:
         """Best-effort fetch of what a finished turn produced."""

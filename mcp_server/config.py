@@ -1,4 +1,4 @@
-"""Env-driven wiring for one MCP server process: Database + MessagingCore + extension.
+"""Env-driven wiring for one MCP server process: Database, core, extension, Polling Server.
 
 Reads three environment variables:
 
@@ -84,8 +84,39 @@ def build_extension(source_prefix: str) -> RemoteExtension:
 
 def build_core_from_env() -> MessagingCore:
     """Build a `MessagingCore` wired entirely from environment configuration."""
+    core, _polling = build_stack_from_env()
+    return core
+
+
+def build_stack_from_env() -> tuple[MessagingCore, "PollingServer"]:
+    """Build the whole running stack: a core AND the Polling Server behind it.
+
+    Both halves, together, because neither is any use alone. The core admits a
+    message and hands it to a remote; the Polling Server is what waits for the
+    remote to finish and pushes the answer back into the Caller's queue. A
+    process holding only the core delivers messages that are never followed up:
+    a `[QUERY]` is handed over and abandoned, a `[RESEARCH]` never reaches its
+    summary, and nothing errors, because from the core's point of view the
+    message was delivered exactly as asked.
+
+    The two share ONE `WorkingSlots`. That is the whole reason this function
+    exists rather than two independent constructors: the working slot is the
+    single fact both halves reason about, and two objects each holding their own
+    copy of it is not a slot -- the core would admit against one view and the
+    drain thread would advance against another.
+
+    The Polling Server is given the extension under this process's own
+    `source_prefix`. One process speaks for one remote family, so its drain
+    threads only ever serve Partners of that family; a Partner of another source
+    is another process's business, reached through the same database.
+    """
+    from polling.server import PollingServer
+
     source_prefix = source_prefix_from_env()
     db_path = os.environ.get(ENV_DB_PATH)
     db = Database(path=db_path) if db_path else Database()
     extension = build_extension(source_prefix)
-    return MessagingCore(db, extension)
+
+    core = MessagingCore(db, extension)
+    polling = PollingServer(db, extensions={source_prefix: extension}, core=core)
+    return core, polling

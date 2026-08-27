@@ -746,14 +746,33 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
 
 
 def main() -> None:
-    """Build a server from environment configuration and run it over stdio."""
-    from mcp_server.config import build_core_from_env, source_prefix_from_env
+    """Build a server from environment configuration and run it over stdio.
+
+    Both halves of the stack are built, and the Polling Server is started before
+    the transport opens. Starting it is what resumes drain threads for Partners
+    that still had work in flight when this process last stopped -- their
+    `drain_threads` rows survive precisely so a restart can pick them up.
+
+    Passing `polling` to `build_server` is also what registers
+    `notify_partner_push`. Without it a remote's push notification has nothing
+    to call, and the queue is drained only as a side effect of somebody else
+    sending a message.
+    """
+    from mcp_server.config import build_stack_from_env, source_prefix_from_env
 
     source_prefix = source_prefix_from_env()
-    core = build_core_from_env()
+    core, polling = build_stack_from_env()
+    polling.start()
     name = f"messaging-{source_prefix.rstrip('_')}"
-    server = build_server(name=name, core=core)
-    server.run(transport="stdio")
+    server = build_server(name=name, core=core, polling=polling)
+    try:
+        server.run(transport="stdio")
+    finally:
+        # Signal and join the drain threads. This deliberately leaves their
+        # `drain_threads` rows in place: a row is what tells the next start()
+        # that this Partner had work in flight, and deleting it here would
+        # strand exactly the work it exists to protect.
+        polling.stop()
 
 
 if __name__ == "__main__":

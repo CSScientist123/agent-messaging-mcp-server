@@ -384,27 +384,26 @@ def test_cap_holds_across_an_in_flight_swap(world: World):
         db.close()
 
 
-def test_report_back_refuses_every_non_reply_label(world: World):
-    """Claim 1 angle on the same fix noted under Claim 3: `report_back`'s
-    `not_a_reply_behavior` gate runs BEFORE admission ever sees the
-    behavior, for every label that is not some other label's
-    `reply_behavior` -- [RESEARCH], [QUERY], [ERROR], [IDLE]. Held: refused
-    `not_a_reply_behavior` for each, and nothing lands in the target's
-    queue for any of them.
+def test_report_back_gate_runs_before_admission(world: World):
+    """The gate runs BEFORE admission ever sees the behavior.
+
+    A refusal that half-applied -- a `messages` row written, or a queue row
+    inserted and then rejected -- is the failure an exception-only assertion
+    cannot see, so the target's queue depth is checked on both sides.
     """
     depth_before = world.db.read_one(
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.worker["id"],)
     )["n"]
-    for non_reply in ("[RESEARCH]", "[QUERY]", "[ERROR]", "[IDLE]"):
+    for blocked in ("[RESEARCH]", "[IDLE]"):
         with pytest.raises(Rejected) as exc:
             world.sci.report_back(
-                to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior=non_reply, body="x"
+                to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior=blocked, body="x"
             )
-        assert exc.value.code == "not_a_reply_behavior", non_reply
+        assert exc.value.code == "not_reportable", blocked
     depth_after = world.db.read_one(
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.worker["id"],)
     )["n"]
-    assert depth_after == depth_before
+    assert depth_after == depth_before, "a refused report_back still enqueued something"
 
 
 def test_report_back_still_runs_real_admission_for_a_reply_label(world: World):
@@ -831,11 +830,16 @@ def test_report_back_refuses_a_non_reply_behavior_no_research_upward(world: Worl
             behavior="[RESEARCH]",
             body="evil upward research",
         )
-        # -> Rejected("not_a_reply_behavior"); nothing lands in the queue.
+        # -> Rejected("not_reportable"); nothing lands in the queue.
 
-    Swept across every non-reply label, not just [RESEARCH]: [QUERY],
-    [ERROR], and [IDLE] must all be refused the same way, since none of them
-    is any label's `reply_behavior` either.
+    The rule report_back enforces is narrower than "only answers": it refuses
+    what a Partner cannot REPORT. [RESEARCH] is delegation, and admitting it
+    here would be a second door into a superior's queue that skips the layer
+    check send makes. [IDLE] is a hold and means nothing in a queue.
+
+    [QUERY] and [ERROR] must NOT be refused, and that matters as much: they are
+    how a Partner that cannot speak for itself gets heard -- an agent stopped on
+    a permission prompt is not running, and nothing else is watching it.
     """
     orch_row = world.db.read_one("SELECT * FROM partners WHERE id=?", (world.orch["id"],))
     bridge_row = world.db.read_one("SELECT * FROM partners WHERE id=?", (world.bridge["id"],))
@@ -851,21 +855,20 @@ def test_report_back_refuses_a_non_reply_behavior_no_research_upward(world: Worl
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.orch["id"],)
     )["n"]
 
-    for non_reply in ("[RESEARCH]", "[QUERY]", "[ERROR]", "[IDLE]"):
+    for blocked in ("[RESEARCH]", "[IDLE]"):
         with pytest.raises(Rejected) as exc2:
             world.sci.report_back(
-                to_partner_id=world.orch["id"], from_partner_id=world.bridge["id"], behavior=non_reply, body="evil upward research"
+                to_partner_id=world.orch["id"], from_partner_id=world.bridge["id"], behavior=blocked, body="evil upward research"
             )
-        assert exc2.value.code == "not_a_reply_behavior", non_reply
+        assert exc2.value.code == "not_reportable", blocked
 
     depth_after = world.db.read_one(
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.orch["id"],)
     )["n"]
     assert depth_after == depth_before, "a refused report_back call still enqueued something"
 
-    # The two labels that ARE real replies must still be admitted -- the fix
-    # narrows report_back to answers, it does not disable it.
-    for real_reply in ("[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]"):
+    # Everything a Partner can genuinely report must still be admitted.
+    for real_reply in ("[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]", "[QUERY]", "[ERROR]"):
         result = world.sci.report_back(
             to_partner_id=world.orch["id"], from_partner_id=world.bridge["id"], behavior=real_reply, body="a real answer"
         )

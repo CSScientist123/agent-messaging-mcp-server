@@ -770,3 +770,92 @@ def test_a_push_during_the_retirement_window_is_not_stranded(db, stub, core, ser
         "Retirement must re-check for work under the same lock notify_partner_push uses."
     )
     assert deliver_calls(stub), "nothing was ever delivered to the remote"
+
+
+# ---------------------------------------------------------------------------
+# 18. a Partner stopped on a permission prompt reaches its Caller
+# ---------------------------------------------------------------------------
+
+
+def test_an_approval_prompt_is_reported_to_the_caller_not_polled_forever(db, core, server):
+    """A Partner blocked on an approval is neither busy nor finished.
+
+    It is waiting for something no amount of polling will produce. Nobody else
+    can report it either: the Partner cannot, because an agent stopped on a
+    prompt is not running, and the Caller has no reason to look. So the Polling
+    Server reports it on the Partner's behalf.
+
+    Left unreported the failure is total and silent — the slot is held, the
+    drain thread never retires because `drain_once` never returns True, and the
+    only trace is an entry appended to `last_errors` once per poll interval.
+    """
+    caller, worker = make_pair(core)
+
+    class Blocked(StubExtension):
+        def poll_completion(self, *, partner_id_in_remote):
+            raise Rejected(
+                "approval_is_an_error",
+                "conversation is blocked on an approval/permission prompt: "
+                "wants write access to /mnt/c/Data/out.md",
+            )
+
+    blocked = Blocked(source_prefix="science_")
+    server.extensions["science_"] = blocked
+    core.extension = blocked
+
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="do the work", behavior="[RESEARCH]")
+    assert core.working_task(partner_id=worker["id"]) is not None, "the task never started"
+
+    idle = server.drain_once(partner_id=worker["id"])
+
+    assert idle is False, "an approval must not be reported as an idle partner"
+    assert core.working_task(partner_id=worker["id"]) is None, (
+        "the working slot is still held; the drain thread would spin on it forever"
+    )
+
+    landed = db.read(
+        "SELECT behavior, body FROM message_queue WHERE partner_id = ?", (caller["id"],)
+    )
+    assert [r["behavior"] for r in landed] == ["[ERROR]"], (
+        f"the Caller should have been sent exactly one [ERROR]; got "
+        f"{[r['behavior'] for r in landed]}"
+    )
+    body = landed[0]["body"]
+    for expected in ("get_permissions", "add_permissions", "/mnt/c/Data/out.md",
+                     worker["remote_id"]):
+        assert expected in body, (
+            f"the [ERROR] must name {expected!r} so the Caller can act on it; body was:\n{body}"
+        )
+    assert "answers one" in body, "the message must say an approval is not a question to answer"
+
+
+def test_a_stopped_partner_is_not_left_running_on_the_prompt(db, core, server):
+    """The remote is stopped as well as reported — and a remote that cannot be
+    stopped does not turn the report into a failure.
+
+    The report is the point; stopping is hygiene. A remote like Claude Science
+    refuses cancellation outright, and that refusal must not cost the Caller its
+    error message.
+    """
+    caller, worker = make_pair(core)
+
+    class BlockedUncancellable(StubExtension):
+        def poll_completion(self, *, partner_id_in_remote):
+            raise Rejected("approval_is_an_error", "blocked: needs read on /etc")
+
+        def stop_remote_execution(self, *, partner_id_in_remote, reason):
+            raise Rejected("no_remote_cancel", "this remote cannot be cancelled")
+
+    ext = BlockedUncancellable(source_prefix="science_")
+    server.extensions["science_"] = ext
+    core.extension = ext
+
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="work", behavior="[RESEARCH]")
+    server.drain_once(partner_id=worker["id"])
+
+    landed = db.read("SELECT behavior FROM message_queue WHERE partner_id = ?", (caller["id"],))
+    assert [r["behavior"] for r in landed] == ["[ERROR]"], (
+        "a remote that cannot be cancelled must still get its error reported"
+    )

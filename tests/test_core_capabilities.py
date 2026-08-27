@@ -1623,27 +1623,39 @@ def test_report_back_has_no_handshake_requirement(core, pair):
     assert result["behavior"] == "[MESSAGE-RESPONSE]", f"report_back must succeed with no handshake, got {result!r}"
 
 
-def test_report_back_rejects_a_non_reply_behavior(core, pair):
-    """report_back only ever delivers an ANSWER: `behavior` must be something
-    some other label's `reply_behavior` points at (label_caps). [RESEARCH]
-    and [QUERY] originate work -- they are not answers -- so pushing either
-    through report_back must be refused, and nothing must be queued."""
-    tid = pair["caller1"]["id"]
-    from_id = pair["target"]["id"]
-    for behavior in ("[RESEARCH]", "[QUERY]"):
-        before = queue_count(core.db, tid)
+def test_report_back_refuses_delegation_and_holds_but_carries_every_report(core, world):
+    """`report_back` carries reports; it never carries delegation or a hold.
+
+    `[RESEARCH]` is delegated work, and admitting it here would bypass the
+    hierarchy rule `send` enforces -- anything holding a `MessagingCore` could
+    land research in a superior's queue through the back door. `[IDLE]` is a
+    hold, which has no meaning in a Caller's queue.
+
+    The other four are all reachable in practice, and two of them are cases the
+    Partner cannot report itself: an `[ERROR]` when it stops on a permission it
+    does not hold, and a `[QUERY]` when it needs context only the Caller has.
+    An agent stopped on a prompt is not running.
+    """
+    worker, caller = world["worker"], world["orch"]
+
+    for behavior in ("[RESEARCH]", "[IDLE]"):
         with pytest.raises(Rejected) as exc:
-            core.report_back(to_partner_id=tid, from_partner_id=from_id, behavior=behavior, body="x")
-        assert exc.value.code == "not_a_reply_behavior", (
-            f"expected not_a_reply_behavior for {behavior!r}, got {exc.value.code!r}"
+            core.report_back(to_partner_id=caller["id"], from_partner_id=worker["id"],
+                             behavior=behavior, body="x")
+        assert exc.value.code == "not_reportable", (
+            f"{behavior} must not be reportable, got {exc.value.code!r}"
         )
-        after = queue_count(core.db, tid)
-        assert after == before, f"a refused report_back must not queue anything: before={before}, after={after}"
+        depth = core.db.read_one(
+            "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id = ?", (caller["id"],)
+        )["n"]
+        assert depth == 0, f"{behavior} was refused but still queued ({depth} rows)"
 
-
-# ---------------------------------------------------------------------------
-# get_permissions / add_permissions / delete_permissions
-# ---------------------------------------------------------------------------
+    for behavior in ("[QUERY]", "[ERROR]", "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]"):
+        result = core.report_back(to_partner_id=caller["id"], from_partner_id=worker["id"],
+                                  behavior=behavior, body=f"a {behavior}")
+        assert result["behavior"] == behavior, (
+            f"{behavior} should be reportable; got {result!r}"
+        )
 
 
 def test_permissions_reject_non_gemini_partner(core, world):

@@ -586,7 +586,7 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `no_handshake` | `send` | Call `handshake` first (unless the target's source needs none). |
 | `no_handshake_between_gemini` | `handshake` | Never succeeds. **Unreachable through the tools** — a `gemini_` partner can hold no role, so it is refused at `requester_not_orchestrator` first. Kept as defence in depth against a role written straight into the database. |
 | `no_paths` | `add_permissions`, `delete_permissions` | Give at least one path. |
-| `not_a_reply_behavior` | `report_back` (queue machinery, §8 — not a client tool) | `report_back` delivers answers. Originating work is what `send` is for, and `send` is where the hierarchy rules live. |
+| `not_reportable` | `report_back` (queue machinery, §8 — not a client tool) | `[RESEARCH]` is delegation and `[IDLE]` is a hold; neither is something a Partner reports. Delegating is what `send` is for, and `send` is where the hierarchy rules live. |
 | `no_such_partner` | `delete_partner`, `handshake`, `send`, `read`, `interrupt_partner`, `get_permissions`, `add_permissions`, `delete_permissions` | Call `search_partner` to find the exact title. |
 | `no_such_project` | `create_partner`, `delete_project`, `extend_project` | Call `search_project` to find or confirm the project. |
 | `not_authorized` | `delete_partner`, `delete_project`, `grant_gemini_budget` | Only the relevant `project-orchestrator` may perform this action. |
@@ -1019,12 +1019,16 @@ requester holding a UUID here, and the handshake that made the exchange possible
 established in the other direction. It does keep the cap and the storage rule, because those
 are about the Caller's queue rather than about who may talk to whom.
 
-`behavior` must be a label that some other label's `reply_behavior` points at — today
-`[MESSAGE-RESPONSE]` or `[TRUTHFUL-REPORT]`. Anything else raises `not_a_reply_behavior`.
-Without that gate this method is a hole in the delegation hierarchy: `send` refuses
-`[RESEARCH]` travelling upward, and anything holding a `MessagingCore` could route the
-identical message through here instead and land it in a superior's queue. It is not reachable
-from the tool surface today, but "not currently reachable" is not a rule.
+`behavior` must be something a Partner can **report**. `[RESEARCH]` and `[IDLE]` are refused
+with `not_reportable`: the first is delegation, and admitting it here would be a second door
+into a superior's queue that skips the layer check `send` makes; the second is a hold and means
+nothing in a queue. It is not reachable from the tool surface, but "not currently reachable" is
+not a rule.
+
+The other four all occur. `[MESSAGE-RESPONSE]` and `[TRUTHFUL-REPORT]` answer a finished task.
+`[ERROR]` and `[QUERY]` are raised on a Partner's behalf by the Polling Server — those are the
+cases a Partner cannot report itself, because an agent stopped on a permission prompt is not
+running and nothing else is watching it.
 
 ### The prompt templates
 

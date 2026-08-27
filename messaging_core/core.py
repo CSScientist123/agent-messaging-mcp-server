@@ -73,6 +73,12 @@ from messaging_core.slots import WorkingSlots
 # `create_project` against `source_caps`.
 _PREFIXES: tuple[str, ...] = ("nlm_", "code_", "science_", "gemini_")
 
+#: Labels that may never travel through `report_back`. `[RESEARCH]` is
+#: delegation -- letting it through would bypass the hierarchy rule `send`
+#: enforces. `[IDLE]` is a hold rather than a message and has no meaning in a
+#: Caller's queue.
+_NOT_REPORTABLE: tuple[str, ...] = ("[RESEARCH]", INTERRUPT_BEHAVIOR)
+
 _ORCHESTRATOR_TYPES: tuple[str, ...] = (
     "project-orchestrator",
     "gemini-orchestrator",
@@ -1873,27 +1879,37 @@ class MessagingCore:
         rule, because those are about the Caller's queue rather than about
         who is allowed to talk to whom.
 
-        What it also keeps -- and must -- is that `behavior` names an ANSWER.
-        Only a label that some other label's `reply_behavior` points at may be
-        pushed here. Without that, this method is a hole in the delegation
-        hierarchy: `send` refuses `[RESEARCH]` travelling upward, and anything
-        holding a `MessagingCore` could route the identical message through
-        here instead and land it in a superior's queue. It is not reachable
-        from the tool surface today, but "not currently reachable" is not a
-        rule, and the check costs one query.
+        What it also keeps -- and must -- is that `behavior` is something a
+        Partner can REPORT rather than something it can delegate. `[RESEARCH]`
+        is delegation and `[IDLE]` is a hold; neither is a report, and admitting
+        either here would make this method a hole in rules that `send` enforces.
+        `send` refuses `[RESEARCH]` travelling upward, and anything holding a
+        `MessagingCore` could otherwise route the identical message through here
+        and land it in a superior's queue. It is not reachable from the tool
+        surface, but "not currently reachable" is not a rule.
+
+        Everything else is reportable, and all four are reached in practice: a
+        `[MESSAGE-RESPONSE]` or `[TRUTHFUL-REPORT]` answering a finished task, an
+        `[ERROR]` raised on a Partner's behalf when it stops on a permission it
+        does not hold, and a `[QUERY]` when it needs context only the Caller has.
+        The last two are the cases a Partner cannot report itself -- an agent
+        stopped on a prompt is not running, and nothing else is watching.
 
         Raises:
-            Rejected: `not_a_reply_behavior` if `behavior` is not something a
-                finished task replies with.
+            Rejected: `not_reportable` if `behavior` is `[RESEARCH]` or `[IDLE]`.
         """
-        answerable = self.db.read_one(
-            "SELECT 1 AS ok FROM label_caps WHERE reply_behavior = ?", (behavior,)
-        )
-        if answerable is None:
+        if behavior in _NOT_REPORTABLE:
             raise Rejected(
-                "not_a_reply_behavior",
-                f"{behavior!r} is not a label any finished task replies with; report_back "
-                "delivers answers, and originating work is what send is for.",
+                "not_reportable",
+                f"{behavior!r} cannot be reported back: it is "
+                + ("delegated work, and delegation is what send is for."
+                   if behavior == "[RESEARCH]"
+                   else "a hold, not a message."),
+            )
+        if behavior not in BEHAVIORS:
+            raise Rejected(
+                "unknown_behavior",
+                f"{behavior!r} is not a recognized behavior label; expected one of {BEHAVIORS}.",
             )
         store = self._stored(behavior)
         with self.slots.lock_for(to_partner_id):
