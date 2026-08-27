@@ -1567,3 +1567,118 @@ def test_antigravity_read_remote_result_keeps_the_pane_with_no_recorded_delivery
     ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
 
     assert ext.read_remote_result(partner_id_in_remote="never-delivered") == "some answer text"
+
+
+# ---------------------------------------------------------------------------
+# A turn that was never seen running is not a turn that finished
+# ---------------------------------------------------------------------------
+#
+# Also found live, one step past the readiness gate. The prompt WAS delivered
+# -- the pane showed it -- but `_await_busy`'s six-second budget expired before
+# the model produced its first token, `poll_completion` read the absent busy
+# footer as FINISHED, and the Caller got a [MESSAGE-RESPONSE] with an empty
+# body while the agent was still about to answer. From one pane read, "not
+# started yet" and "already finished" look identical.
+
+
+def _agy_seq(panes, *, record=None):
+    """A fake tmux serving `panes` in order, then repeating the last."""
+    state = {"i": 0}
+
+    def fake_run(cmd, capture_output=True, text=True):
+        if record is not None:
+            record.append(cmd)
+        if "capture-pane" in cmd:
+            i = min(state["i"], len(panes) - 1)
+            state["i"] += 1
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=panes[i], stderr="")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    return fake_run
+
+
+_READY = "? for shortcuts\n"
+_BUSY = "esc to cancel\n"
+
+
+def _deliver(ext, monkeypatch, panes_after):
+    """Drive a delivery to completion, then serve `panes_after` to the poller."""
+    panes = [_READY] + list(panes_after)
+    monkeypatch.setattr(subprocess, "run", _agy_seq(panes))
+    return ext.deliver_message(
+        partner_id_in_remote="conv-1", behavior="[QUERY]", body="Reply with PROVEN"
+    )
+
+
+def test_antigravity_does_not_call_an_unstarted_turn_finished(monkeypatch):
+    """The observed failure: an empty answer, and the slot released early."""
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+    # Never busy: _await_busy exhausts its budget and the pane stays idle,
+    # exactly as it did live while the model was still thinking.
+    _deliver(ext, monkeypatch, [_READY])
+
+    assert ext.poll_completion(partner_id_in_remote="conv-1") is False, (
+        "a turn that was never seen running must not be reported finished -- doing so "
+        "releases the working slot and hands the Caller an empty body"
+    )
+
+
+def test_antigravity_calls_it_finished_once_the_turn_was_seen_running(monkeypatch):
+    """The busy footer is the evidence, and seeing it once is enough."""
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+    _deliver(ext, monkeypatch, [_BUSY, _BUSY])
+
+    # Still working while the footer is up.
+    assert ext.poll_completion(partner_id_in_remote="conv-1") is False
+    # Footer gone, and the turn was seen running -- that is a real completion.
+    monkeypatch.setattr(subprocess, "run", _agy_seq([_READY]))
+    assert ext.poll_completion(partner_id_in_remote="conv-1") is True
+
+
+def test_antigravity_gives_up_waiting_once_the_settle_window_passes(monkeypatch):
+    """The hold is bounded. A turn that never starts must not poll forever."""
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux", settle_seconds=0.0)
+    _deliver(ext, monkeypatch, [_READY])
+
+    assert ext.poll_completion(partner_id_in_remote="conv-1") is True, (
+        "with the settle window elapsed, an idle pane is a finished turn again"
+    )
+
+
+def test_antigravity_session_with_no_recorded_delivery_is_unchanged(monkeypatch):
+    """A process that restarted mid-turn has no record, and must not poll forever."""
+    monkeypatch.setattr(subprocess, "run", _agy_seq([_READY]))
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+
+    assert ext.poll_completion(partner_id_in_remote="never-delivered") is True
+
+
+def test_antigravity_an_approval_still_fires_before_the_settle_window(monkeypatch):
+    """A blocked Partner must be reported immediately, never held.
+
+    Waiting out the settle window on an approval prompt would delay by exactly
+    as long the one message that says the Partner cannot continue at all.
+    """
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+    _deliver(ext, monkeypatch, [_READY])
+    monkeypatch.setattr(subprocess, "run", _agy_seq(["Do you want to proceed?\n> 1. Yes\n"]))
+
+    with pytest.raises(Rejected) as exc_info:
+        ext.poll_completion(partner_id_in_remote="conv-1")
+
+    assert exc_info.value.code == "approval_is_an_error"
+
+
+def test_antigravity_a_cancelled_turn_does_not_leave_a_stale_started_flag(monkeypatch):
+    """Otherwise the NEXT turn inherits 'already seen running' and closes early."""
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+    _deliver(ext, monkeypatch, [_BUSY, _BUSY])
+    assert ext.poll_completion(partner_id_in_remote="conv-1") is False
+
+    monkeypatch.setattr(subprocess, "run", _agy_seq([_READY]))
+    ext.stop_remote_execution(partner_id_in_remote="conv-1", reason="displaced")
+
+    # A fresh delivery that never goes busy must be held again, not waved
+    # through on the previous turn's evidence.
+    _deliver(ext, monkeypatch, [_READY])
+    assert ext.poll_completion(partner_id_in_remote="conv-1") is False

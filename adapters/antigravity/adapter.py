@@ -190,7 +190,13 @@ class TmuxBinaryMissing(RemoteFailure):
 class AntigravityExtension(RemoteExtension):
     source_prefix = "gemini_"
 
-    def __init__(self, *, tmux_path: str | None = None, session_prefix: str = "agy-") -> None:
+    def __init__(
+        self,
+        *,
+        tmux_path: str | None = None,
+        session_prefix: str = "agy-",
+        settle_seconds: float = 20.0,
+    ) -> None:
         """
         Args:
             tmux_path: Explicit path to the ``tmux`` binary. If omitted,
@@ -199,9 +205,17 @@ class AntigravityExtension(RemoteExtension):
             session_prefix: Prefix applied to a conversation id's first 8
                 characters to form its tmux session name (see module
                 docstring -- real `sessionFor` in `index.js` truncates to 8).
+            settle_seconds: How long after a delivery `poll_completion` will
+                refuse to call an unstarted turn finished. This is a
+                LIVE-MEASURED allowance for this model's time-to-first-token,
+                not a guess (see `poll_completion`) -- and it costs nothing on
+                a turn that does start: the busy footer clears the check
+                immediately, so this only ever delays the FINISHED verdict for
+                a turn that has shown no sign of having started at all.
         """
         self._tmux_path_override = tmux_path
         self.session_prefix = session_prefix
+        self.settle_seconds = settle_seconds
         self._delivery_count = 0
         # Failures to close the permissions editor that were swallowed to avoid
         # masking a more useful exception. Not part of the contract; kept so a
@@ -212,6 +226,19 @@ class AntigravityExtension(RemoteExtension):
         # turn's answer starts -- the pane itself has no structure to key off
         # of, only the echo of what was sent.
         self._last_delivered: dict[str, str] = {}
+        # session name -> time.monotonic() when deliver_message last sent a
+        # turn into it. Set alongside `_last_delivered`; poll_completion reads
+        # this to know how long a turn has had a chance to even begin (see
+        # settle_seconds above).
+        self._delivered_at: dict[str, float] = {}
+        # session name -> whether `_await_busy` ever saw the busy footer for
+        # the turn currently in flight. `_await_busy`'s return value used to be
+        # discarded entirely; captured here because it is the only evidence
+        # poll_completion has that a turn actually STARTED, as distinct from
+        # one that never showed a busy footer because it has not begun yet --
+        # see poll_completion for why those two are otherwise indistinguishable
+        # from a single pane read.
+        self._saw_busy: dict[str, bool] = {}
 
     # -- binary + tmux plumbing --------------------------------------------
 
@@ -314,11 +341,17 @@ class AntigravityExtension(RemoteExtension):
         # Bounded, and a timeout is NOT an error: a turn short enough to finish
         # inside the window never shows a busy footer at all, and for that case
         # returning is exactly right -- the answer is already on the pane.
-        self._await_busy(session)
-        # Recorded on success only: a session read_remote_result later keys
-        # off of should match what actually reached the pane, not a body that
-        # never made it there.
+        saw_busy = self._await_busy(session)
+        # Recorded on success only: a session read_remote_result and
+        # poll_completion later key off of should match what actually reached
+        # the pane, not a body that never made it there.
         self._last_delivered[session] = body
+        self._delivered_at[session] = time.monotonic()
+        # `_await_busy`'s bool used to be discarded here -- now kept, since it
+        # is the only signal poll_completion has for telling "finished" apart
+        # from "has not started yet" once the busy footer is gone (see
+        # poll_completion).
+        self._saw_busy[session] = saw_busy
         self._delivery_count += 1
         return f"agy-turn-{partner_id_in_remote}-{self._delivery_count}"
 
@@ -387,6 +420,15 @@ class AntigravityExtension(RemoteExtension):
         documented cancel call being passed over here.
         """
         session = self._session_name(partner_id_in_remote)
+        # Cleared here, not left for the next deliver_message to overwrite: a
+        # turn stopped before settle_seconds has elapsed would otherwise still
+        # read, to the very next poll_completion, as "delivered a moment ago,
+        # never seen busy" -- exactly the signal poll_completion uses to wait
+        # out an unstarted turn -- and holding a FINISHED verdict on a turn
+        # that was just told to stop is the stale-flag version of the bug this
+        # whole mechanism exists to prevent.
+        self._delivered_at.pop(session, None)
+        self._saw_busy.pop(session, None)
         result = self._tmux("send-keys", "-t", session, "Escape")
         if result.returncode != 0:
             raise Rejected(
@@ -811,6 +853,30 @@ class AntigravityExtension(RemoteExtension):
             )
 
         if _FOOTER_BUSY_MARKER in pane:
+            self._saw_busy[session] = True
+            return False
+
+        # No busy footer is ambiguous on its own: it is what a FINISHED turn's
+        # pane looks like, and it is equally what a turn that has not STARTED
+        # yet looks like -- the same defect class the cold-start gate in
+        # deliver_message fixed, one step later (see module docstring). Live:
+        # `_await_busy` polled its full budget without seeing a footer,
+        # returned False by contract (not an error -- a fast turn never shows
+        # one), and this method read the absence as FINISHED while the agent
+        # had not answered yet -- closing the turn before it began.
+        #
+        # So absence of the footer is only trusted as FINISHED once there is
+        # evidence the turn actually ran: either the footer WAS seen earlier
+        # this turn (`_saw_busy`), or enough time has passed since delivery
+        # that a turn which was going to start already would have (settle_
+        # seconds, a measured time-to-first-token allowance, not a guess). A
+        # session with no recorded delivery at all falls through to FINISHED
+        # unchanged, exactly as before this fix -- `_delivered_at.get` default
+        # of 0.0 makes the elapsed time huge, so the settle condition below is
+        # never true for it.
+        if not self._saw_busy.get(session) and (
+            time.monotonic() - self._delivered_at.get(session, 0.0) < self.settle_seconds
+        ):
             return False
         return True
 
