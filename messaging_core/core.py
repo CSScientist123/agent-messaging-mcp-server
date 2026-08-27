@@ -79,6 +79,11 @@ _PREFIXES: tuple[str, ...] = ("nlm_", "code_", "science_", "gemini_")
 #: Caller's queue.
 _NOT_REPORTABLE: tuple[str, ...] = ("[RESEARCH]", INTERRUPT_BEHAVIOR)
 
+#: Rejection codes meaning "this remote has no cancel", as opposed to "the
+#: cancel failed". The first is a fact about the remote and must not stop a
+#: displacement; the second is an error and must.
+_UNCANCELLABLE: frozenset[str] = frozenset({"no_remote_cancel", "not_executable"})
+
 _ORCHESTRATOR_TYPES: tuple[str, ...] = (
     "project-orchestrator",
     "gemini-orchestrator",
@@ -207,6 +212,11 @@ class MessagingCore:
         self.db = db
         self.extension = extension
         self.slots = slots if slots is not None else WorkingSlots()
+        # Displacements where the previous turn could not be stopped because the
+        # remote has no cancel, as `(partner_id, displaced_label, new_label)`.
+        # Not part of the contract; the record exists so an operator can see
+        # where two turns were live against one remote at once.
+        self.uncancelled_displacements: list[tuple[int, str, str]] = []
 
     # -- shared resolution helpers -----------------------------------------
 
@@ -1678,10 +1688,32 @@ class MessagingCore:
                 # later read to tell which is real. And it must happen before
                 # delivery either way: an agent handed a second instruction
                 # while still executing the first interleaves them.
-                ext.stop_remote_execution(
-                    partner_id_in_remote=partner["partner_id_in_remote"],
-                    reason=f"displaced by a higher-priority {head['behavior']}",
-                )
+                #
+                # A remote that CANNOT be cancelled is a different matter from
+                # one whose cancellation failed. Claude Science has no usable
+                # interrupt at all -- its only route needs an execution id no
+                # other call returns -- so `stop_remote_execution` refuses by
+                # design, every time. Treating that refusal as an error would
+                # mean no science_ Partner could ever be displaced, and the
+                # refusal would propagate to whoever called `send` after their
+                # message was already committed.
+                #
+                # So a designed refusal is recorded and the swap proceeds. The
+                # consequence is real and worth naming: the old turn keeps
+                # running on the remote while the new one is delivered, and the
+                # agent sees both. That is the honest behaviour for a remote
+                # with no cancel; pretending otherwise would be worse.
+                try:
+                    ext.stop_remote_execution(
+                        partner_id_in_remote=partner["partner_id_in_remote"],
+                        reason=f"displaced by a higher-priority {head['behavior']}",
+                    )
+                except Rejected as exc:
+                    if exc.code not in _UNCANCELLABLE:
+                        raise
+                    self.uncancelled_displacements.append(
+                        (partner_id, working["behavior"], head["behavior"])
+                    )
 
             def _swap(conn: sqlite3.Connection) -> None:
                 conn.execute("DELETE FROM message_queue WHERE id = ?", (head["id"],))

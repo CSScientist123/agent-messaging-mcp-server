@@ -30,6 +30,7 @@ transaction.
 
 from __future__ import annotations
 
+import collections
 import threading
 import time
 from typing import Any
@@ -48,6 +49,9 @@ __all__ = ["PollingServer"]
 # and reports by acting through its own tools. The placeholder keeps the
 # bookkeeping deterministic instead of leaving a queue push half-made.
 NO_READABLE_RESULT = "[result reported by the remote through its own channel]"
+
+#: How many swallowed exceptions a server keeps. See `PollingServer.last_errors`.
+MAX_RECORDED_ERRORS = 200
 
 #: What a Caller is told when its Partner stops on a permission it does not hold.
 #:
@@ -107,7 +111,17 @@ class PollingServer:
         # Exceptions swallowed by a drain loop so they don't kill the daemon
         # thread silently. Not part of the public contract; useful for tests
         # and diagnostics.
-        self.last_errors: list[BaseException] = []
+        #
+        # BOUNDED. A repeating failure appends once per poll interval, and an
+        # unbounded list is a slow memory leak that only shows up in exactly the
+        # situation where something is already wrong. The newest entries are the
+        # ones worth keeping, so the oldest are dropped.
+        self.last_errors: collections.deque[BaseException] = collections.deque(
+            maxlen=MAX_RECORDED_ERRORS
+        )
+        #: Longest a drain thread will wait between retries after repeated
+        #: failures.
+        self.max_backoff = max(poll_interval, 30.0)
 
     # -- the core, bound to one partner's remote ------------------------------
 
@@ -234,14 +248,24 @@ class PollingServer:
 
     def _drain_loop(self, partner_id: int, stop_event: threading.Event) -> None:
         retire = True
+        consecutive_failures = 0
         try:
             while not stop_event.is_set():
                 try:
                     idle = self.drain_once(partner_id=partner_id)
                 except BaseException as exc:  # noqa: BLE001 - keep the daemon alive
-                    self.last_errors.append(exc)
-                    stop_event.wait(self.poll_interval)
+                    self._record_error(exc)
+                    consecutive_failures += 1
+                    # Back off. A failure that repeats is usually one that will
+                    # keep repeating -- an unreachable session, a refusing
+                    # remote -- and polling it at full rate buys nothing while
+                    # costing a request per interval. Capped so a transient
+                    # failure still recovers promptly.
+                    delay = min(self.poll_interval * (2 ** min(consecutive_failures, 6)),
+                                self.max_backoff)
+                    stop_event.wait(delay)
                     continue
+                consecutive_failures = 0
                 if idle:
                     # Nothing queued and nothing working, so this thread should
                     # retire -- but the decision has to be made under the SAME
@@ -289,7 +313,7 @@ class PollingServer:
             # The queue is untouched -- advance resolves the extension before
             # it writes anything -- so this is worth recording and retrying
             # rather than treating as a lost message.
-            self.last_errors.append(exc)
+            self._record_error(exc)
 
         task = core.working_task(partner_id=partner_id)
         if task is None:
@@ -328,6 +352,10 @@ class PollingServer:
         self._complete(core, partner_id, task, extension, remote_id)
         return False
 
+    def _record_error(self, exc: BaseException) -> None:
+        """Keep a bounded record of what a drain loop swallowed."""
+        self.last_errors.append(exc)
+
     def _stop_quietly(self, extension: RemoteExtension, remote_id: str, reason: str) -> None:
         """Stop the remote, tolerating a remote that cannot be stopped.
 
@@ -337,7 +365,7 @@ class PollingServer:
         try:
             extension.stop_remote_execution(partner_id_in_remote=remote_id, reason=reason)
         except (Rejected, NeedsRemote) as exc:
-            self.last_errors.append(exc)
+            self._record_error(exc)
 
     def _is_complete(self, extension: RemoteExtension, remote_id: str) -> bool:
         """Whether the remote has finished its turn.
@@ -419,9 +447,38 @@ class PollingServer:
         if task["behavior"] == "[RESEARCH]":
             prompt = core.begin_summary_phase(partner_id=partner_id)
             if prompt is not None:
-                extension.deliver_message(
-                    partner_id_in_remote=remote_id, behavior="[TRUTHFUL-REPORT]", body=prompt
-                )
+                try:
+                    extension.deliver_message(
+                        partner_id_in_remote=remote_id,
+                        behavior="[TRUTHFUL-REPORT]",
+                        body=prompt,
+                    )
+                except BaseException:
+                    # The summary request never reached the remote, and the slot
+                    # is already relabelled [TRUTHFUL-REPORT] by
+                    # begin_summary_phase. Left alone the Partner holds a task
+                    # nobody asked it to do, forever: it is not working, so
+                    # poll_completion says finished, and the next pass reports a
+                    # summary that was never requested.
+                    #
+                    # So the slot is released and the work is handed back to the
+                    # Caller as an [ERROR] naming what failed. The research
+                    # itself is done -- only the summary is lost -- and that is
+                    # what the Caller needs to know.
+                    released = core.release(partner_id=partner_id)
+                    if released is not None:
+                        core.report_back(
+                            to_partner_id=released["caller_id"],
+                            from_partner_id=partner_id,
+                            behavior="[ERROR]",
+                            body=(
+                                "The work finished but its summary could not be requested; "
+                                "the remote did not accept the request. The result is in the "
+                                "partner's own transcript. Send it a [TRUTHFUL-REPORT] to ask "
+                                "again."
+                            ),
+                        )
+                    raise
                 # The next pass polls for the summary. The slot now reads
                 # [TRUTHFUL-REPORT], so only a forced interruption can take it.
                 return
@@ -440,14 +497,19 @@ class PollingServer:
             # exists to prevent, reintroduced by a special case.
             reply = "[TRUTHFUL-REPORT]"
 
+        # Read BEFORE releasing. The slot is what stops another task being
+        # promoted and delivered to this same remote, so releasing first opens a
+        # window where the next turn can start against a remote whose previous
+        # output has not been fetched -- and what comes back then belongs to
+        # neither turn.
+        body = self._read_result(extension, remote_id) if reply is not None else None
+
         released = core.release(partner_id=partner_id)
         if reply is None or released is None:
             # [ERROR], [MESSAGE-RESPONSE] and [TRUTHFUL-REPORT] arriving as
             # deliveries are answers already. Replying to an answer is how two
             # agents talk to each other until one of them is archived.
             return
-
-        body = self._read_result(extension, remote_id)
         core.report_back(
             to_partner_id=released["caller_id"],
             from_partner_id=partner_id,

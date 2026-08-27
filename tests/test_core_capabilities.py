@@ -1792,3 +1792,88 @@ def test_get_permissions_reports_drift(core, world):
     assert result["allowed"] == ["write_file(/unrecorded)"], (
         f"expected allowed to reflect exactly what the stub currently holds, got {result['allowed']!r}"
     )
+
+
+def test_a_partner_on_an_uncancellable_remote_can_still_be_displaced(core, db, monkeypatch):
+    """A remote with no cancel must not be undisplaceable.
+
+    Claude Science has no usable interrupt — its only route needs an execution
+    id no other call returns — so `stop_remote_execution` refuses by design,
+    every single time. If that refusal were treated as an error, no `science_`
+    Partner could ever be displaced by higher-priority work, and the refusal
+    would surface to whoever called `send` *after* their message had already
+    been committed to the queue.
+
+    A designed refusal is therefore recorded and the swap proceeds. The
+    consequence is real and is asserted here rather than hidden: the displaced
+    turn is still running on the remote while the new one is delivered.
+    """
+    pid = mk_project(core, title="NoCancel", source_prefix="science_", system_id="nc1")
+    project = {"id": pid, "source_prefix": "science_"}
+    caller = mk_partner(core, project, title="nc-caller", remote_id="r-ncc")
+    worker = mk_partner(core, project, title="nc-worker", remote_id="r-ncw")
+    core.claim_orchestrator(requester_uuid=caller["uuid"], project_id=pid,
+                            orchestrator_type="project-orchestrator")
+    core.handshake(requester_uuid=caller["uuid"], partner_title="nc-worker")
+
+    def refuse(*, partner_id_in_remote, reason):
+        raise Rejected("no_remote_cancel", "this remote has no usable interrupt")
+
+    monkeypatch.setattr(core.extension, "stop_remote_execution", refuse)
+
+    core.send(requester_uuid=caller["uuid"], queried_partner_title="nc-worker",
+              message="the long job", behavior="[RESEARCH]")
+    assert core.working_task(partner_id=worker["id"])["behavior"] == "[RESEARCH]"
+
+    # A [QUERY] outranks [RESEARCH] and must take the slot despite the refusal.
+    core.send(requester_uuid=caller["uuid"], queried_partner_title="nc-worker",
+              message="urgent question", behavior="[QUERY]")
+
+    slot = core.working_task(partner_id=worker["id"])
+    assert slot is not None and slot["behavior"] == "[QUERY]", (
+        f"a partner on an uncancellable remote was never displaced; slot holds {slot!r}"
+    )
+    paused = db.read(
+        "SELECT behavior, in_process FROM message_queue WHERE partner_id = ?", (worker["id"],)
+    )
+    assert [(r["behavior"], r["in_process"]) for r in paused] == [("[RESEARCH]", 1)], (
+        "the displaced task must be queued and marked paused"
+    )
+    assert core.uncancelled_displacements == [(worker["id"], "[RESEARCH]", "[QUERY]")], (
+        "a displacement that could not stop the previous turn must be recorded, because "
+        "two turns are now live against one remote"
+    )
+
+
+def test_a_cancel_that_genuinely_fails_still_stops_the_displacement(core, db, monkeypatch):
+    """"This remote has no cancel" and "the cancel failed" are different facts.
+
+    The first must not block a displacement; the second must, because the
+    previous turn may still be running for a reason nobody predicted and
+    swapping regardless would interleave two instructions with no record.
+    """
+    pid = mk_project(core, title="CancelFails", source_prefix="science_", system_id="cf1")
+    project = {"id": pid, "source_prefix": "science_"}
+    caller = mk_partner(core, project, title="cf-caller", remote_id="r-cfc")
+    worker = mk_partner(core, project, title="cf-worker", remote_id="r-cfw")
+    core.claim_orchestrator(requester_uuid=caller["uuid"], project_id=pid,
+                            orchestrator_type="project-orchestrator")
+    core.handshake(requester_uuid=caller["uuid"], partner_title="cf-worker")
+
+    core.send(requester_uuid=caller["uuid"], queried_partner_title="cf-worker",
+              message="the long job", behavior="[RESEARCH]")
+
+    def broke(*, partner_id_in_remote, reason):
+        raise Rejected("antigravity_session_unreachable", "the session is gone")
+
+    monkeypatch.setattr(core.extension, "stop_remote_execution", broke)
+
+    with pytest.raises(Rejected) as exc:
+        core.send(requester_uuid=caller["uuid"], queried_partner_title="cf-worker",
+                  message="urgent question", behavior="[QUERY]")
+    assert exc.value.code == "antigravity_session_unreachable"
+
+    slot = core.working_task(partner_id=worker["id"])
+    assert slot["behavior"] == "[RESEARCH]", (
+        "a failed cancel must leave the working task where it was"
+    )
