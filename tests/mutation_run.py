@@ -359,9 +359,8 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "deliver-does-not-wait-for-the-turn", "adapters/antigravity/adapter.py",
-        "        self._await_busy(session)\n"
-        "        # Recorded on success only:",
-        "        # Recorded on success only:",
+        "        saw_busy = self._await_busy(session)",
+        "        saw_busy = True",
         "deliver_message returns before the remote has visibly started, so the "
         "next poll_completion reads a stale idle pane and the drain thread "
         "closes a task the agent has not begun",
