@@ -1,0 +1,44 @@
+%% 05-working-slot.mmd
+%% What replaced the five-state machine: a task is queued, or it holds the working
+%% slot, or it is neither. There is no third place for it to be, and so no state
+%% column that can disagree with where the task actually is.
+stateDiagram-v2
+    direction LR
+
+    state "Queued<br/>(a message_queue row)" as Queued
+    state "Paused<br/>(in_process = 1)" as Paused
+    state "Working<br/>(the in-memory slot)" as Working
+    state "Summary phase<br/>(same slot, priority raised<br/>to [TRUTHFUL-REPORT])" as Summary
+
+    [*] --> Queued : send() / interrupt_partner()<br/>admits it
+
+    Queued --> Working : advance() -- slot empty,<br/>or this head STRICTLY beats<br/>the working task
+
+    Working --> Paused : displaced by a higher-priority<br/>arrival. stop_remote_execution first,<br/>THEN the swap -- a stop that fails<br/>leaves everything as it was
+
+    Paused --> Working : advance() picks it before other tasks<br/>OF ITS OWN LABEL, and never before a<br/>different one -- [QUERY] and [ERROR] share<br/>a priority, so a global tie-break would have<br/>a paused [QUERY] beat a fresh [ERROR] and the<br/>Caller\'s correction would never arrive.<br/>Prompt is one line:<br/>"Resume your previous [RESEARCH]."
+
+    Working --> Summary : the work finished and the label<br/>was [RESEARCH] -- it owes a summary,<br/>and the summary is a SECOND exchange<br/>in the SAME slot, not a queued message
+
+    Summary --> [*] : summary pushed to the Caller<br/>as [TRUTHFUL-REPORT]
+
+    Working --> [*] : label_caps.reply_behavior:<br/>[QUERY] -> [MESSAGE-RESPONSE] to the Caller,<br/>everything else -> NOTHING
+
+    note right of Working
+        An [IDLE] here is a HOLD, not a task.
+        Highest priority for ENTERING the slot --
+        that is how a forced interruption works --
+        and no claim on staying: the next arrival
+        displaces it, and it is NOT requeued.
+        Comparing priorities would make the
+        interruption permanent, since nothing
+        outranks [IDLE].
+    end note
+
+    note left of Summary
+        The reply for four of the six labels is
+        NOTHING. Without a terminating label,
+        every completed task would produce a
+        message that produced a task, and two
+        agents would talk until one was archived.
+    end note

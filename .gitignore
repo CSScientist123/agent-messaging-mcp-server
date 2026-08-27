@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Written by tests/mutation_run.py while it has the tree mutated. Both are
+# transient: the lock stops a second pass from clobbering the first one's
+# restores, and the backup is what lets a killed run self-heal on the next
+# invocation. Neither should ever be committed.
+.mutation_backup/
+.mutation_running

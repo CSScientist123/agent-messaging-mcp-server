@@ -1,0 +1,39 @@
+%% 04-priority-queue.mmd
+%% One queue per Partner, ordered by priority. Every message is a push; there is no
+%% reply channel and so no routing decision to get wrong.
+flowchart LR
+
+    SENDER["Caller calls send(...)\nwith a behavior label\n(no direction, no role)"]
+
+    subgraph ADMIT["Admission -- ONE statement, so a race cannot pass it twice"]
+        direction TB
+        CAP{{"label_caps.max_outstanding\nfor (caller_id, behavior)\nIS NULL?"}}
+        COUNT["COUNT(queued for this\ncaller + this label)\n+ 1 if the WORKING SLOT\nholds one more of the same"]
+        REJECT["Rejected('over_queue')\nnothing queued, nothing stored"]
+        CAP -->|"NULL -- uncapped"| OK["admitted"]
+        CAP -->|"3 for [QUERY]\n2 for [RESEARCH]"| COUNT
+        COUNT -->|"under cap"| OK
+        COUNT -->|"at cap"| REJECT
+    end
+
+    SENDER --> CAP
+
+    Q[("message_queue -- ONE per Partner\n\nreading the head is TWO questions:\n1. which LABEL -- priority, then a label with\n   unpaused work over one entirely paused,\n   then arrival\n2. which ROW of it -- paused first, then arrival")]
+    OK --> Q
+
+    PRIO["label_caps.priority -- lower wins\n\n0  [IDLE]                carries a forced interruption\n1  [TRUTHFUL-REPORT]    summarize without contamination\n2  [QUERY] = [ERROR]    both stop work; neither is more urgent\n3  [MESSAGE-RESPONSE]   the answer that unblocks\n4  [RESEARCH]           delegated work, the patient kind"]
+
+    Q -.->|"ordered by"| PRIO
+
+    SLOT["WORKING SLOT\nin memory, never in SQLite\n(messaging_core/slots.py)"]
+    Q -->|"advance(): head promoted\nonly if it STRICTLY beats\nthe working task"| SLOT
+    SLOT -->|"displaced: marked in_process=1\nand pushed back"| Q
+
+    TIE["in_process is a tie-break WITHIN one label,\nnot a global override -- which is why the head\nneeds two statements, not one ORDER BY.\n\n[QUERY] and [ERROR] SHARE a priority. While the\ntie-break was global, a paused [QUERY] beat a fresh\n[ERROR], and the Caller's correction was never\ndelivered to the Partner it was correcting."]
+    Q -.-> TIE
+
+    EQ["EQUAL priority does NOT displace.\nAn arriving [QUERY] never interrupts\na [QUERY] being answered, or two callers\nping-pong a partner and neither is answered."]
+    SLOT -.-> EQ
+
+    STORE[("messages\nonly labels with\nlabel_caps.stored = 1:\n[QUERY] [TRUTHFUL-REPORT]\n[MESSAGE-RESPONSE]")]
+    OK -.->|"[RESEARCH] [ERROR] [IDLE]\nare transport -- never written"| STORE

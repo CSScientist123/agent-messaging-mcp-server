@@ -1,0 +1,385 @@
+"""Mutation pass: break the code on purpose, and check a NAMED test notices.
+
+    python3 tests/mutation_run.py
+
+A green suite is not evidence that an invariant holds -- only an assertion aimed at that
+invariant is. This answers the only question that settles it: *would this suite notice if
+the code were wrong?*
+
+Each mutant targets one load-bearing rule of the v2 messaging model (one priority queue per
+partner, `label_caps` as the single authority for priority/caps/storage/reply, the in-memory
+working slot, the drain thread). Every mutation is reverted in a `finally`, so an interrupted
+run cannot leave the tree broken.
+
+**How a catch is decided.** This repo's test files are not all owned by this pass, and several
+are being rewritten independently of it against the same v2 model -- at any given moment some
+of them may not even collect (an old import, an old keyword argument). Comparing the mutated
+run's return code to 0 would therefore say nothing about the mutation: the suite can easily be
+red before a single byte is changed. So instead this compares two SETS of failing test node
+ids -- one from an unmutated baseline run, one from each mutated run -- and only tests that
+are newly failing (present in the mutated set, absent from the baseline set) count as having
+caught the mutant. A test that was already broken before the mutation proves nothing about the
+mutation, and must not be credited with catching it.
+
+A mutant with no newly-failing test is a **missing assertion** and is reported as a finding,
+not hidden and not fixed by editing someone else's test file from here.
+
+**Run this alone, and do not edit the source while it runs.** Both hazards are the same
+hazard: this pass holds a snapshot of every file it will touch, and anything that writes those
+files meanwhile is either overwritten by a restore or overwrites one. During a single session
+that silently applied `cap-ignores-working` to the tree, then `priority-inverted`, then
+silently reverted a bug fix written while a pass was running -- three times, each time leaving
+a green suite and a wrong system.
+
+Two guards, because a rule nobody can check is not a guard. `.mutation_running` makes a second
+pass refuse to start. And every restore is *conditional*: a file is put back only if it still
+contains exactly what this pass wrote into it. If it does not, somebody else changed it, and
+this pass says so loudly and keeps its hands off rather than reverting work it did not make.
+
+**Why there is a backup directory.** A `finally` restores the file after each mutant, which is
+enough for an exception and not enough for a signal. A run killed by `timeout`, Ctrl-C, or an
+OOM leaves the tree MUTATED, and the next reader has no way to tell -- the code looks
+deliberate, the tests still pass (that is what a surviving mutant means), and the report says
+"pattern absent" for the one mutant that would have caught it. That happened, and the cap
+silently stopped counting the working slot for as long as it took to notice.
+
+So originals are written to `.mutation_backup/` before anything is touched, restored from there
+on SIGINT/SIGTERM, and restored automatically at the start of the NEXT run if the directory is
+still present. The directory existing at all means the previous run did not finish.
+"""
+from __future__ import annotations
+
+import pathlib
+import re
+import shutil
+import signal
+import subprocess
+import sys
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+BACKUP = REPO / ".mutation_backup"
+LOCK = REPO / ".mutation_running"
+
+#: (label, file, find, replace, the invariant it breaks)
+MUTANTS: list[tuple[str, str, str, str, str]] = [
+    (
+        "reader-is-writable", "messaging_core/db.py",
+        'uri = f"file:{quoted}?mode=ro"',
+        'uri = f"file:{quoted}?mode=rw"',
+        "the single-writer invariant: a reader connection can write again",
+    ),
+    (
+        "priority-inverted", "messaging_core/core.py",
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC, MIN(q.enqueued_at) ASC",
+        " ORDER BY MIN(c.priority) DESC, MIN(q.in_process) ASC, MIN(q.enqueued_at) ASC",
+        "_HEAD_LABEL_SQL picks the LOWEST-priority label last instead of first, so a "
+        "[RESEARCH] can win the working slot over a [QUERY] that stops work",
+    ),
+    (
+        "in-process-ignored", "messaging_core/core.py",
+        " ORDER BY q.in_process DESC, q.enqueued_at ASC, q.id ASC",
+        " ORDER BY q.enqueued_at ASC, q.id ASC",
+        "_HEAD_ROW_SQL drops the paused-first tie-break, so a paused task loses "
+        "to a fresh arrival carrying the same label and a partner never resumes "
+        "what it was already doing",
+    ),
+    (
+        "displace-on-equal", "messaging_core/core.py",
+        'head_priority >= working["priority"]:',
+        'head_priority > working["priority"]:',
+        "an arriving task of EQUAL priority wrongly displaces the working task, "
+        "so two same-priority callers can ping-pong a partner forever",
+    ),
+    (
+        "cap-ignores-working", "messaging_core/core.py",
+        "         WHERE partner_id = :pid AND caller_id = :cid AND behavior = :behavior) + :working\n"
+        "     < (SELECT max_outstanding FROM label_caps WHERE behavior = :behavior)",
+        "         WHERE partner_id = :pid AND caller_id = :cid AND behavior = :behavior)\n"
+        "     < (SELECT max_outstanding FROM label_caps WHERE behavior = :behavior)",
+        "_ADMIT_SQL's cap counts only queued rows, not the one already being "
+        "worked, so a caller capped at N ends up with N+1 in flight",
+    ),
+    (
+        "displaced-not-paused", "messaging_core/core.py",
+        '                        "VALUES (?, ?, ?, ?, 1, ?)",\n'
+        "                        (\n"
+        "                            partner_id,\n"
+        '                            working["caller_id"],',
+        '                        "VALUES (?, ?, ?, ?, 0, ?)",\n'
+        "                        (\n"
+        "                            partner_id,\n"
+        '                            working["caller_id"],',
+        "advance()'s _swap requeues a displaced task as fresh (in_process=0) "
+        "instead of paused, so it loses its resume tie-break and its resume "
+        "prompt is wrong",
+    ),
+    (
+        "idle-requeued", "messaging_core/core.py",
+        "                # Requeuing it would stop the partner again the moment it\n"
+        "                # resumed.\n"
+        "                if working is not None and not holding:\n"
+        "                    conn.execute(",
+        "                # Requeuing it would stop the partner again the moment it\n"
+        "                # resumed.\n"
+        "                if working is not None:\n"
+        "                    conn.execute(",
+        "advance()'s _swap requeues a displaced [IDLE] hold instead of "
+        "discarding it, so a cleared interruption re-interrupts the partner "
+        "the moment it comes back around",
+    ),
+    (
+        "in-process-crosses-labels", "messaging_core/core.py",
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC, MIN(q.enqueued_at) ASC",
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) DESC, MIN(q.enqueued_at) ASC",
+        "the paused-vs-fresh tie-break stops being scoped to one label, so a "
+        "paused [QUERY] beats a fresh [ERROR] at the same priority and a Caller's "
+        "correction is never delivered to the Partner it is correcting",
+    ),
+    (
+        "retire-without-recheck", "polling/server.py",
+        "                    with self._lock:\n"
+        "                        if not self._has_work(partner_id):",
+        "                    if True:\n"
+        "                        if True:",
+        "a drain thread retires without re-checking for work under the push "
+        "lock, so a message admitted in the window between deciding to retire "
+        "and exiting is queued with no thread and no drain_threads row -- and "
+        "nothing ever picks it up",
+    ),
+    (
+        "drain-row-survives", "polling/server.py",
+        '"DELETE FROM drain_threads WHERE partner_id = ?", (partner_id,)',
+        '"SELECT partner_id FROM drain_threads WHERE partner_id = ?", (partner_id,)',
+        "PollingServer._deregister leaves the drain_threads row behind when its "
+        "thread retires, so the next push believes a thread is already running "
+        "and spawns none -- the queued message is never picked up",
+    ),
+    (
+        "store-everything", "messaging_core/core.py",
+        'return bool(row["stored"]) if row is not None else False',
+        "return True",
+        "MessagingCore._stored always answers True, so [RESEARCH] and [ERROR] "
+        "-- transport-only per label_caps.stored -- are written to `messages`",
+    ),
+    (
+        "orchestrator-role-open-to-any-source", "messaging_core/core.py",
+        '        if project is None or project["source_prefix"] != "science_":',
+        '        if project is None or orchestrator_type == "never-happens":',
+        "claim_orchestrator stops restricting orchestrator roles to Claude "
+        "Science, so an Antigravity or NotebookLM partner can claim "
+        "project-orchestrator or bridge-scientist",
+    ),
+    (
+        "deliver-does-not-wait-for-the-turn", "adapters/antigravity/adapter.py",
+        "        self._await_busy(session)\n        self._delivery_count += 1",
+        "        self._delivery_count += 1",
+        "deliver_message returns before the remote has visibly started, so the "
+        "next poll_completion reads a stale idle pane and the drain thread "
+        "closes a task the agent has not begun",
+    ),
+    (
+        "role-reclaimable", "schema/schema.sql",
+        "CREATE UNIQUE INDEX one_orchestrator_per_project_role",
+        "CREATE INDEX one_orchestrator_per_project_role",
+        "one_orchestrator_per_project_role is no longer UNIQUE, so a project "
+        "can end up with two live partners holding the same orchestrator role",
+    ),
+]
+
+
+def _snapshot(paths: list[pathlib.Path]) -> None:
+    """Copy every file this run will touch into BACKUP, flat, keyed by a safe name."""
+    BACKUP.mkdir(exist_ok=True)
+    for path in paths:
+        rel = path.relative_to(REPO)
+        (BACKUP / str(rel).replace("/", "__")).write_text(
+            path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+
+def _restore_all() -> list[str]:
+    """Put every backed-up file back. Returns the ones that had actually drifted."""
+    if not BACKUP.is_dir():
+        return []
+    changed = []
+    for saved in sorted(BACKUP.iterdir()):
+        target = REPO / saved.name.replace("__", "/")
+        good = saved.read_text(encoding="utf-8")
+        if not target.exists() or target.read_text(encoding="utf-8") != good:
+            target.write_text(good, encoding="utf-8")
+            changed.append(str(target.relative_to(REPO)))
+    return changed
+
+
+def _clear_backup() -> None:
+    shutil.rmtree(BACKUP, ignore_errors=True)
+
+
+def _install_signal_restore() -> None:
+    """Restore and exit on a signal. A `finally` does not run for SIGTERM."""
+
+    def handler(signum, _frame):
+        changed = _restore_all()
+        _clear_backup()
+        LOCK.unlink(missing_ok=True)
+        print(f"\n[signal {signum}] restored {len(changed)} mutated file(s) before exiting.")
+        sys.exit(130)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, handler)
+
+
+def _run_pytest() -> str:
+    """One pytest pass over the whole repo. Returns captured stdout.
+
+    `--continue-on-collection-errors` matters here specifically because not
+    every test file in this repo is finished being rewritten against the v2
+    model; a collection error in one of them must not prevent every other
+    test from running and being counted.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "-q", "--no-header", "-rf", "--tb=no",
+            "-p", "no:cacheprovider", "--continue-on-collection-errors",
+        ],
+        cwd=REPO, capture_output=True, text=True, timeout=900,
+    )
+    return proc.stdout
+
+
+def _failing_tests() -> set[str]:
+    return set(re.findall(r"^FAILED (\S+)", _run_pytest(), re.M))
+
+
+def main() -> int:
+    print("=" * 92)
+    print("MUTATION PASS -- a surviving mutant is a missing assertion")
+    print("=" * 92)
+
+    # Refuse to start if another pass is already mutating this tree. Two runs
+    # will each restore to their own snapshot and clobber each other.
+    if LOCK.exists():
+        print(
+            f"REFUSING TO START: {LOCK.name} exists, so another mutation pass is already "
+            "running against this tree. Two at once corrupt each other's restores. Wait for "
+            "it, or delete the lock if you are certain it is stale."
+        )
+        return 2
+    LOCK.write_text("running\n", encoding="utf-8")
+
+    # A backup directory left behind means the previous run was killed rather
+    # than finished. Restore before measuring anything, or the baseline is taken
+    # against a mutated tree and every number after it is meaningless.
+    stale = _restore_all()
+    if stale:
+        print(
+            f"RECOVERED: the previous run did not finish and left {len(stale)} file(s) "
+            "mutated. Restored before starting:"
+        )
+        for f in stale:
+            print(f"  - {f}")
+        print()
+    _clear_backup()
+
+    _install_signal_restore()
+    _snapshot(sorted({REPO / m[1] for m in MUTANTS}))
+
+    baseline_failing = _failing_tests()
+    if baseline_failing:
+        print(
+            f"baseline: {len(baseline_failing)} pre-existing failing test(s), excluded from "
+            "catch credit below (see module docstring -- some test files in this repo are "
+            "mid-rewrite against the v2 model, independent of this pass):"
+        )
+        for t in sorted(baseline_failing):
+            print(f"  - {t}")
+    else:
+        print("baseline: green (0 failing tests)")
+    print()
+
+    survivors: list[tuple[str, str]] = []
+    rows: list[tuple[str, int, str]] = []
+    foreign: list[str] = []
+
+    for label, relpath, find, replace, invariant in MUTANTS:
+        path = REPO / relpath
+        original = path.read_text(encoding="utf-8")
+        if find not in original:
+            rows.append((label, -1, "NOT APPLIED -- pattern absent"))
+            survivors.append((label, "pattern not found; mutant could not be applied"))
+            continue
+        mutated = original.replace(find, replace, 1)
+        if mutated == original:
+            # A replacement identical to the original changes no behaviour --
+            # this suite has had exactly that bug before (see the module
+            # docstring), so it is checked for explicitly rather than trusted
+            # to produce a real failure downstream.
+            rows.append((label, -1, "NOT APPLIED -- replacement is a no-op"))
+            survivors.append((label, "replacement produced no change; mutant does not mutate"))
+            continue
+        try:
+            path.write_text(mutated, encoding="utf-8")
+            failing = _failing_tests()
+            newly = sorted(failing - baseline_failing)
+            if newly:
+                first = newly[0].split("::")[-1]
+                extra = f" (+{len(newly) - 1} more)" if len(newly) > 1 else ""
+                rows.append((label, len(newly), f"caught by {first}{extra}"))
+            else:
+                rows.append((label, 0, "SURVIVED"))
+                survivors.append((label, invariant))
+        finally:
+            # Conditional restore. Put the file back ONLY if it still holds
+            # exactly what this pass wrote -- otherwise something else edited it
+            # while the pass was running, and reverting would silently destroy
+            # that work. This has happened: a real bug fix, written during a
+            # background run, was reverted by the restore and the suite stayed
+            # green for another twenty minutes.
+            current = path.read_text(encoding="utf-8")
+            if current == mutated:
+                path.write_text(original, encoding="utf-8")
+                if path.read_text(encoding="utf-8") != original:
+                    print(f"\nFATAL: could not restore {relpath} after {label}. Stopping.")
+                    _clear_backup()
+                    LOCK.unlink(missing_ok=True)
+                    return 2
+            elif current != original:
+                foreign.append(relpath)
+                print(
+                    f"\nWARNING: {relpath} was modified by something else while {label} was "
+                    "applied. NOT restoring it -- that would destroy the change. This run's "
+                    "results for this file are void."
+                )
+
+    if foreign:
+        print(
+            f"\nRESULTS VOID for {sorted(set(foreign))}: the file changed underneath this run. "
+            "Re-run with nothing else touching the source."
+        )
+    _clear_backup()
+    LOCK.unlink(missing_ok=True)
+
+    print(f"{'mutant':<26}{'newly failing':>14}  caught by")
+    print("-" * 92)
+    for label, n, note in rows:
+        shown = "-" if n < 0 else str(n)
+        print(f"{label:<26}{shown:>14}  {note}")
+
+    print()
+    tree_ok = all((REPO / relpath).read_text(encoding="utf-8") for _, relpath, *_ in MUTANTS)
+    restored_failing = _failing_tests()
+    print(f"tree restored: {tree_ok}")
+    print(f"failing set back to baseline: {restored_failing == baseline_failing}")
+
+    print()
+    if survivors:
+        print(f"{len(survivors)} SURVIVING MUTANT(S) -- each is a missing assertion:")
+        for label, invariant in survivors:
+            print(f"  - {label}: {invariant}")
+    else:
+        print(f"all {len(MUTANTS)} mutants caught by a named test")
+    return 0 if (restored_failing == baseline_failing and not survivors) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

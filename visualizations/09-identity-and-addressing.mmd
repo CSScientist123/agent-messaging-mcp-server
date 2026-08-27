@@ -1,0 +1,29 @@
+%% 09-identity-and-addressing.mmd
+%% A Project has exactly one source_prefix; Partners inherit it. Titles address
+%% at the boundary only and resolve to a UUID; everything stored inside the
+%% system references identity (uuid / partner id), never a title.
+flowchart TB
+
+    PROJ["Project\n(projects.source_prefix,\nexactly ONE per project,\nUNIQUE(source_prefix, project_system_id))"]
+
+    PART_A["Partner A\n(inherits Project's source_prefix --\n_partner_type joins partners -> projects)"]
+    PART_B["Partner B\n(same Project, same source_prefix)"]
+
+    PROJ -->|"hosts (project_id FK)"| PART_A
+    PROJ -->|"hosts (project_id FK)"| PART_B
+
+    CALLERTITLE["Caller supplies a TITLE\n(human-readable, free-form,\ncarries no type information)"]
+    RESOLVE{{"_resolve_live_partner_by_title(title)\n-- the ONLY place a title is looked up"}}
+    UUID["Partner.uuid\n(the identity minted at create_partner,\nreturned exactly once)"]
+
+    CALLERTITLE -->|"boundary lookup"| RESOLVE
+    RESOLVE -->|"resolves to"| UUID
+    UUID -->|"identifies everywhere\ninternally (requester_uuid,\nforeign keys use partners.id)"| STORED[("Everything stored --\nmessages, message_queue,\nhandshakes, partner_paths,\ndrain_threads -- references\npartners.id, never a title")]
+
+    CROSSSRC{{"Cross-source handshake?\n(e.g. science_ -> gemini_)"}}
+    PROJ -->|"one source_prefix per Project\nis the single authority"| CROSSSRC
+    CROSSSRC -->|"different source_prefix\nimplies different Project,\nBY CONSTRUCTION"| CROSSPROJ["Necessarily a\nCROSS-PROJECT handshake\n(never same Project)"]
+
+    SAMESRC{{"Same-source pair?\n(e.g. science_ -> science_)"}}
+    PROJ --> SAMESRC
+    SAMESRC -->|"same source_prefix CAN mean\nsame OR different Project --\nso this is where 'same Project'\nis actually enforced"| SAMEPROJRULE["'Both partners must belong\nto the same Project' rule\napplies ONLY within a source --\nand is lifted only by a\nproject_extension row, and then\nonly between identical roles"]

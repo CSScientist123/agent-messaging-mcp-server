@@ -1,0 +1,46 @@
+%% 06-research-round-trip.mmd
+%% The two-phase [RESEARCH] round trip. Both phases run against the SAME remote in the
+%% SAME working slot; only the second changes the slot's effective priority.
+sequenceDiagram
+    autonumber
+    participant A as Partner A (Caller)
+    participant Q as message_queue (B's)
+    participant CORE as MessagingCore
+    participant PS as Polling Server
+    participant B as Partner B (remote)
+
+    A->>CORE: send([RESEARCH], body)
+    CORE->>Q: admitted -- capped at 2 per (caller, label),<br/>counting the working slot
+    CORE->>CORE: advance(): queue head vs working slot
+    Note over CORE: slot empty, so [RESEARCH] is promoted<br/>and its row LEAVES the queue
+
+    CORE->>B: deliver_message(research_dispatch prompt)<br/>request + references + CONFIGURED PATHS
+    Note over CORE,B: the path list comes from partner_paths.<br/>A conversation not told what it may touch reaches<br/>outside its grant and raises a prompt -- and a<br/>prompt is an error here, not a question
+
+    loop drain thread
+        PS->>B: poll_completion()?
+        B-->>PS: not yet
+    end
+    B-->>PS: finished
+
+    Note over PS,CORE: PHASE 2 -- the summary, and it is NOT a queued message
+    PS->>CORE: begin_summary_phase(partner_id)
+    CORE->>CORE: SAME slot: behavior becomes [TRUTHFUL-REPORT],<br/>effective priority raised 4 -> 1,<br/>body stays the ORIGINAL request
+    Note over CORE: raised to 1, which BLOCKS the queue: every arriving<br/>message waits, because advance displaces only on a strictly<br/>lower number and only [IDLE] has one.<br/><br/>The counterfactual is why: a summary written while traffic<br/>WAS reaching the same context would summarize the traffic.
+    PS->>B: deliver_message(truthful_report_request prompt)<br/>original request quoted back verbatim
+
+    loop drain thread
+        PS->>B: poll_completion()?
+        B-->>PS: not yet
+    end
+    B-->>PS: finished
+    PS->>B: read_remote_result()
+    B-->>PS: summary text
+
+    PS->>CORE: release(partner_id) -- slot emptied
+    PS->>CORE: report_back(to=A, [TRUTHFUL-REPORT], summary)<br/>label_caps.reply_behavior said so
+    CORE->>A: pushed into A's OWN queue
+    PS->>PS: ensure A has a drain thread
+    Note over A: A reads it with read() -- [TRUTHFUL-REPORT] is<br/>one of the three stored labels
+
+    Note over PS,CORE: A [TRUTHFUL-REPORT] arriving as a DELIVERY replies with NOTHING<br/>(reply_behavior IS NULL). That NULL is what stops this round<br/>trip from starting another one.

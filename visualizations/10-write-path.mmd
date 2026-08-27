@@ -1,0 +1,33 @@
+%% 10-write-path.mmd
+%% messaging_core/db.py: one writer thread, many per-thread read-only
+%% connections, and the single-shared-connection exception for :memory:.
+flowchart TB
+
+    subgraph CALLERS["Any calling thread (MCP tool handler, drain thread, ...)"]
+        WCALL["Database.write(fn)"]
+        RCALL["Database.read(sql) / read_one(sql)"]
+    end
+
+    QUEUE[["job queue\n(thread-safe, one item per write)"]]
+    WCALL -->|"enqueues fn,\nblocks on a Future"| QUEUE
+
+    WRITER["the ONE writer thread\n(messaging-db-writer)"]
+    QUEUE -->|"dequeued in order"| WRITER
+    WRITER -->|"BEGIN IMMEDIATE"| TX["run fn(conn)"]
+    TX -->|"success"| COMMIT["COMMIT"]
+    TX -->|"exception"| ROLLBACK["ROLLBACK\n(exception re-raised to caller)"]
+
+    DECISION{{"is the DB path :memory: ?"}}
+    RCALL --> DECISION
+
+    DECISION -->|"NO -- on-disk file"| READERCONN["this thread's own reader connection\n(threading.local, opened once)\nfile:...?mode=ro\nOS-level read-only file descriptor"]
+    READERCONN -->|"runs SQL directly,\nno queueing, never blocks writer"| DISKDB[("on-disk SQLite file,\nWAL mode\n(readers + writer concurrent)")]
+
+    DECISION -->|"YES -- :memory:"| MEMROUTE["routed through the SAME\njob queue as writes\n(is_write=False)"]
+    MEMROUTE -->|"dequeued by"| WRITER
+
+    COMMIT --> DISKDB
+    WRITER -->|":memory: case only --\nthe ONE shared connection\n(no second connection possible)"| MEMDB[("in-memory SQLite database\n(single connection, owned\nby the writer thread)")]
+
+    ROLLBACK -.-> DISKDB
+    ROLLBACK -.-> MEMDB

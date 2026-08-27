@@ -1,0 +1,65 @@
+%% 02-module-map.mmd
+%% Package dependency direction. An arrow means "imports" / "depends on".
+%% messaging_core is the dependency floor; nothing it contains imports upward.
+flowchart BT
+
+    subgraph CORE["messaging_core package"]
+        CFG["config.py\n(env, db path)"]
+        ERR["errors.py\n(Rejected, NeedsRemote)"]
+        LBL["labels.py\n(the six labels; every other\nper-label fact is in label_caps)"]
+        RESP["responses.py\n(ok / rejected / nothing_new)"]
+        DB["db.py\n(Database: writer thread + readers)"]
+        CORELOGIC["core.py\n(MessagingCore: the 15 capabilities)"]
+    end
+
+    EXT["extension/base.py\n(RemoteExtension ABC,\nNonExecutingExtension,\nStubExtension)"]
+
+    subgraph ADAPTERS["adapters package (one per remote)"]
+        NLMAD["adapters/notebooklm/adapter.py\n(NotebookLMExtension)"]
+        SCIAD["adapters/claude_science/adapter.py\n(ClaudeScienceExtension)"]
+        GEMAD["adapters/antigravity/adapter.py\n(AntigravityExtension)"]
+        REG["adapters/registry.py\n(build_extension:\nsource_prefix -> concrete adapter)"]
+    end
+
+    POLLING["polling/server.py\n(PollingServer: state machine\n+ drain threads)"]
+    MCPSRV["mcp_server/server.py\n(build_server: FastMCP tool surface)"]
+    MCPCFG["mcp_server/config.py\n(env wiring; delegates to\nadapters/registry.py by default,\nStubExtension only if\nMESSAGING_MCP_STUB is set)"]
+
+    LBL -->|imports| ERR
+    DB -->|imports| CFG
+    CORELOGIC -->|imports| DB
+    CORELOGIC -->|imports| ERR
+    CORELOGIC -->|imports| LBL
+    CORELOGIC -->|"imports (type only)"| EXT
+
+    EXT -->|imports| ERR
+
+    NLMAD -->|subclasses| EXT
+    SCIAD -->|subclasses| EXT
+    GEMAD -->|subclasses| EXT
+    NLMAD -->|imports| ERR
+    SCIAD -->|imports| ERR
+    GEMAD -->|imports| ERR
+
+    REG -->|imports| NLMAD
+    REG -->|imports| SCIAD
+    REG -->|imports| GEMAD
+    REG -->|imports| EXT
+
+    POLLING -->|imports| DB
+    POLLING -->|imports| ERR
+    POLLING -->|imports| LBL
+    POLLING -->|imports| RESP
+    POLLING -->|"imports (type only)"| EXT
+
+    MCPSRV -->|imports| CORELOGIC
+    MCPSRV -->|imports| RESP
+    MCPSRV -->|imports| ERR
+    MCPSRV -->|imports| POLLING
+
+    MCPCFG -->|imports| CORELOGIC
+    MCPCFG -->|imports| DB
+    MCPCFG -->|"imports (StubExtension,\nescape hatch only)"| EXT
+    MCPCFG -->|"imports (default path)"| REG
+
+    %% Dependency direction key: lower boxes are depended upon by higher ones.

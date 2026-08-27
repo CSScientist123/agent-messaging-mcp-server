@@ -1,0 +1,125 @@
+---
+title: "schema.sql -- 12 tables, 5 triggers (partners_live_limit, partners_no_rename_archived, messages_stored_labels_only, budget_grants_roles_insert, partner_paths_gemini_only)"
+---
+erDiagram
+    SOURCE_CAPS {
+        string source_prefix PK "nlm_ / code_ / science_ / gemini_"
+        int max_live_partners "default 10"
+        int can_execute "0 for nlm_"
+        int needs_handshake "0 for nlm_"
+        int can_send "0 for nlm_ -- no agent behind it"
+        int accepts_research "0 for nlm_ -- answers, never acts"
+    }
+
+    LABEL_CAPS {
+        string behavior PK "the six labels"
+        int priority "0 IDLE .. 4 RESEARCH, lower wins"
+        int max_outstanding "3 QUERY, 2 RESEARCH, else NULL"
+        int stored "1 for QUERY/TRUTHFUL-REPORT/MESSAGE-RESPONSE"
+        string reply_behavior FK "NULL is what ends an exchange"
+    }
+
+    AGENT_LAYERS {
+        string source_prefix PK,FK
+        string orchestrator_type PK "a role, or '*' for the source default"
+        int layer "0 nlm_/code_ .. 4 gemini_; RESEARCH never travels up"
+    }
+
+    PROJECTS {
+        int id PK
+        string source_prefix FK
+        string project_system_id UK "with source_prefix"
+        string title UK
+        string created_at
+    }
+
+    PROJECT_EXTENSION {
+        int project_a PK,FK "CHECK project_a < project_b"
+        int project_b PK,FK "so the pair has ONE row"
+        string created_at
+    }
+
+    PARTNERS {
+        int id PK
+        string uuid UK "identity everywhere internal"
+        int project_id FK
+        string title UK "server-wide and permanent, addressing only"
+        string partner_id_in_remote "UNIQUE within a project"
+        string descr "<= 1200 chars, what this partner is for"
+        string orchestrator_type "project-orchestrator / gemini-orchestrator / bridge-scientist"
+        string archived_at "NULL = live"
+        string created_at
+    }
+
+    HANDSHAKES {
+        int id PK
+        int from_partner FK
+        int to_partner FK "UNIQUE(from_partner,to_partner)"
+        string created_at
+    }
+
+    PARTNER_PATHS {
+        int partner_id PK,FK "gemini_ only, by trigger"
+        string kind PK "read / write"
+        string path PK
+    }
+
+    BUDGET_GRANTS {
+        int grantee_partner PK,FK "must hold gemini-orchestrator"
+        int granted_by FK "must hold project-orchestrator"
+        int budget_count "0..3"
+        string granted_at
+    }
+
+    MESSAGES {
+        int id PK
+        int from_partner FK
+        int to_partner FK
+        string behavior FK "only labels with label_caps.stored = 1"
+        string body
+        string created_at
+    }
+
+    MESSAGE_QUEUE {
+        int id PK
+        int partner_id FK "one queue per Partner"
+        int caller_id FK "CHECK caller_id <> partner_id"
+        string behavior FK
+        string body
+        int in_process "1 = paused; tie-break WITHIN a label"
+        int message_id FK "set only for stored labels"
+        string enqueued_at "start time is on the in-memory slot, not here"
+    }
+
+    DRAIN_THREADS {
+        int partner_id PK,FK
+        string thread_id
+        string started_at
+    }
+
+    SOURCE_CAPS ||--o{ PROJECTS : "constrains (source_prefix)"
+    SOURCE_CAPS ||--o{ AGENT_LAYERS : "placed by (source_prefix)"
+    LABEL_CAPS ||--o| LABEL_CAPS : "answered by (reply_behavior)"
+
+    PROJECTS ||--o{ PARTNERS : "hosts (project_id);<br/>capped by partners_live_limit"
+    PROJECTS ||--o{ PROJECT_EXTENSION : "extends (project_a)"
+    PROJECTS ||--o{ PROJECT_EXTENSION : "extended by (project_b)"
+
+    PARTNERS ||--o{ HANDSHAKES : "opens (from_partner)"
+    PARTNERS ||--o{ HANDSHAKES : "receives (to_partner)"
+
+    PARTNERS ||--o{ PARTNER_PATHS : "intends to grant (partner_id);<br/>add_ and delete_permissions only"
+
+    PARTNERS ||--o| BUDGET_GRANTS : "is granted budget (grantee_partner)"
+    PARTNERS ||--o{ BUDGET_GRANTS : "grants budget (granted_by)"
+
+    PARTNERS ||--o{ MESSAGES : "sends (from_partner)"
+    PARTNERS ||--o{ MESSAGES : "receives (to_partner)"
+
+    PARTNERS ||--o{ MESSAGE_QUEUE : "waits for (partner_id)"
+    PARTNERS ||--o{ MESSAGE_QUEUE : "pushed by (caller_id)"
+    LABEL_CAPS ||--o{ MESSAGE_QUEUE : "prioritises and caps (behavior)"
+    LABEL_CAPS ||--o{ MESSAGES : "decides storage (behavior)"
+    MESSAGES |o--o{ MESSAGE_QUEUE : "persisted copy (message_id)"
+
+    PARTNERS ||--o| DRAIN_THREADS : "drained by (partner_id);<br/>row DELETED when the thread retires"

@@ -1,0 +1,45 @@
+%% 01-system-context.mmd
+%% Three MCP servers, one shared SQLite DB, the Polling Server, and the three remotes.
+%% Claude Code is a "code_" partner with exactly one legal counterpart: a
+%% bridge-scientist Claude Science session, and at most one of them.
+flowchart TB
+
+    subgraph AGENTS["Calling agents (MCP clients)"]
+        NLMAGENT["Agent talking to\nNotebookLM notebooks"]
+        SCIAGENT["Agent talking to\nClaude Science partners"]
+        GEMAGENT["Agent talking to\nAntigravity partners"]
+        CODE["Claude Code\n(a 'code_' partner, local,\nhandshakes ONE bridge-scientist)"]
+    end
+
+    subgraph SERVERS["MCP servers -- one FastMCP process per adapter"]
+        MCPNLM["messaging-notebooklm\nMCP server\n(embeds MessagingCore)"]
+        MCPSCI["messaging-science\nMCP server\n(embeds MessagingCore)"]
+        MCPGEM["messaging-antigravity\nMCP server\n(embeds MessagingCore)"]
+    end
+
+    DB[("shared SQLite database\n(schema/schema.sql, WAL mode)")]
+
+    POLL["Polling Server\n(one drain thread per Partner;\nadvances the queue, waits on\nthe remote, reports back)"]
+
+    NLMREMOTE{{"NotebookLM\n(nlm_ CLI)"}}
+    SCIREMOTE{{"Claude Science\n(science_ HTTP API)"}}
+    GEMREMOTE{{"Antigravity\n(gemini_ tmux)"}}
+
+    NLMAGENT -->|"MCP tool calls\n(create_partner, send, read, ...)"| MCPNLM
+    SCIAGENT -->|"MCP tool calls\n(create_partner, send, read, ...)"| MCPSCI
+    GEMAGENT -->|"MCP tool calls\n(create_partner, send, read, ...)"| MCPGEM
+    CODE -->|"handshakes a bridge-scientist,\nthen sends"| MCPSCI
+
+    MCPNLM -->|"reads/writes via\nMessagingCore"| DB
+    MCPSCI -->|"reads/writes via\nMessagingCore"| DB
+    MCPGEM -->|"reads/writes via\nMessagingCore"| DB
+
+    POLL -->|"advances message_queue,\nreports back into the Caller's,\nregisters drain_threads"| DB
+
+    POLL -->|"deliver_message /\npoll_completion /\nread_remote_result"| NLMREMOTE
+    POLL -->|"deliver_message /\nstop_remote_execution /\npoll_completion"| SCIREMOTE
+    POLL -->|"deliver_message / stop /\npoll_completion /\nget+add+delete_permissions"| GEMREMOTE
+
+    MCPNLM -.->|"notify_partner_push\n(arms a drain thread)"| POLL
+    MCPSCI -.->|"notify_partner_push\n(arms a drain thread)"| POLL
+    MCPGEM -.->|"notify_partner_push\n(arms a drain thread)"| POLL

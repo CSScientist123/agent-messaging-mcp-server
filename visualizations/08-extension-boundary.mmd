@@ -1,0 +1,84 @@
+%% 08-extension-boundary.mmd
+%% Which capabilities need a remote and which never touch one; the four abstract
+%% extension methods plus the refusing defaults; and what each adapter really
+%% implements. Nothing here answers a permission prompt -- that is the point.
+flowchart TB
+
+    subgraph LOCAL["Capabilities that are LOCAL-ONLY (never touch a RemoteExtension)"]
+        direction LR
+        L1["search_partner"]
+        L2["search_project"]
+        L3["delete_partner"]
+        L4["delete_project"]
+        L5["claim_orchestrator"]
+        L6["grant_gemini_budget"]
+        L7["archive_sessions"]
+        L8["status"]
+        L9["handshake"]
+        L10["read"]
+        L11["extend_project"]
+    end
+
+    subgraph REMOTE["Capabilities that NEED a remote (call self._extension_for(...))"]
+        direction LR
+        CP["create_project\n-> verify_project_system_id"]
+        CPART["create_partner\n-> verify_partner_id_in_remote"]
+        SEND["send / interrupt_partner\n-> advance -> deliver_message"]
+        ADV["advance\n-> stop_remote_execution\n(only when displacing)"]
+        GETP["get_permissions"]
+        ADDP["add_permissions"]
+        DELP["delete_permissions"]
+    end
+
+    subgraph EXTBASE["extension/base.py :: RemoteExtension"]
+        direction LR
+        M1["verify_project_system_id (abstract)"]
+        M2["verify_partner_id_in_remote (abstract)"]
+        M3["deliver_message (abstract)"]
+        M4["stop_remote_execution (abstract in\nRemoteExtension; refused in\nNonExecutingExtension)"]
+        M6["poll_completion (concrete default:\nraises NeedsRemote)"]
+        M7["read_remote_result (concrete default:\nraises NeedsRemote)"]
+        M8["get_permissions / add_permissions /\ndelete_permissions\n(concrete defaults: Rejected\n'not_path_configurable')"]
+    end
+
+    subgraph ADAPTERS["Concrete adapters"]
+        direction LR
+        NLM["NotebookLMExtension (nlm_)\nsubclasses NonExecutingExtension"]
+        SCI["ClaudeScienceExtension (science_)\nsubclasses RemoteExtension"]
+        GEM["AntigravityExtension (gemini_)\nsubclasses RemoteExtension"]
+    end
+
+    CP -.-> M1
+    CPART -.-> M2
+    SEND -.-> M3
+    ADV -.-> M4
+    GETP -.-> M8
+    ADDP -.-> M8
+    DELP -.-> M8
+
+    NLM -->|implements| M1
+    NLM -->|implements| M2
+    NLM -->|implements| M3
+    NLM -->|"overrides (always True --\na query is synchronous)"| M6
+    NLM -->|"implements for real\n(only remote that needs it)"| M7
+    NLM -.->|"inherits clean refusal\n(never executes)"| M4
+    NLM -.->|"inherits refusal --\nno filesystem grant exists"| M8
+
+    SCI -->|implements| M1
+    SCI -->|implements| M2
+    SCI -->|implements| M3
+    SCI -->|implements| M4
+    SCI -->|implements| M6
+    SCI -.->|"NeedsRemote default\n(reports via its own actions)"| M7
+    SCI -.->|"inherits refusal -- a frame has\nNO per-frame path concept, and a\nfabricated 'granted' here would send\nwork that stops on a prompt"| M8
+
+    GEM -->|implements| M1
+    GEM -->|implements| M2
+    GEM -->|implements| M3
+    GEM -->|implements| M4
+    GEM -->|implements| M6
+    GEM -.->|"NeedsRemote default\n(reports via its own actions)"| M7
+    GEM -->|"THE ONLY REAL IMPLEMENTATION, verified live.\nReads ~/.gemini/config/projects/<id>.json at\npermissionGrants.permissionGrants.allow -- NOT\nprojectResources, which stays empty.\nWrites through the /permissions TUI over tmux\n(three screens, two Enters), then the caller\nverifies against that same file."| M8
+
+    ABSENT["There is NO method anywhere above that\nanswers a permission prompt, in any adapter.\nEnforcement by absence: a rule with no method\ncannot be circumvented by an agent that finds\ncircumventing easier.\n\nThere is also no resume. Correcting the grant\nand sending again IS the resumption."]
+    EXTBASE -.-> ABSENT
