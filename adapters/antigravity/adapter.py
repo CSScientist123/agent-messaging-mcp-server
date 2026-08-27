@@ -125,6 +125,11 @@ __all__ = ["AntigravityExtension", "TmuxBinaryMissing"]
 _FOOTER_BUSY_MARKER = "esc to cancel"
 _FOOTER_IDLE_MARKER = "for shortcuts"  # real regex: /\?\s+for shortcuts/i
 
+# The pane border/prompt-arrow characters agy draws around the chat box. A
+# trailing line made of nothing else is frame, not content -- read_remote_result
+# strips it for the same reason it strips the footer: neither side ever typed it.
+_CHROME_ONLY_CHARS = set("│╰╯─╮╭> ")
+
 # Real permission/trust prompt headers (lib/control.js: PROMPT_HEADERS).
 # Checked case-insensitively, as substrings of the captured pane. The real
 # classifier also requires the pane to look like a numbered-options menu
@@ -202,6 +207,11 @@ class AntigravityExtension(RemoteExtension):
         # masking a more useful exception. Not part of the contract; kept so a
         # session stuck in the editor is at least discoverable afterwards.
         self.close_errors: list[Exception] = []
+        # session name -> last body typed into it by deliver_message. There is
+        # no other way for read_remote_result to know where in the pane THIS
+        # turn's answer starts -- the pane itself has no structure to key off
+        # of, only the echo of what was sent.
+        self._last_delivered: dict[str, str] = {}
 
     # -- binary + tmux plumbing --------------------------------------------
 
@@ -282,6 +292,10 @@ class AntigravityExtension(RemoteExtension):
         # inside the window never shows a busy footer at all, and for that case
         # returning is exactly right -- the answer is already on the pane.
         self._await_busy(session)
+        # Recorded on success only: a session read_remote_result later keys
+        # off of should match what actually reached the pane, not a body that
+        # never made it there.
+        self._last_delivered[session] = body
         self._delivery_count += 1
         return f"agy-turn-{partner_id_in_remote}-{self._delivery_count}"
 
@@ -420,9 +434,18 @@ class AntigravityExtension(RemoteExtension):
         """
         return self._read_project_rules()
 
-    def _capture(self, session: str) -> str:
-        """One pane read, raising if the session is gone."""
-        result = self._tmux("capture-pane", "-t", session, "-p")
+    def _capture(self, session: str, history: int | None = None) -> str:
+        """One pane read, raising if the session is gone.
+
+        `history`, when given, adds `-S -<history>` to pull that much
+        scrollback along with the visible screen -- without it, capture-pane
+        returns only what currently fits on screen, and an answer long enough
+        to have scrolled past that would be silently missing from the read.
+        """
+        args = ["capture-pane", "-t", session, "-p"]
+        if history is not None:
+            args += ["-S", f"-{history}"]
+        result = self._tmux(*args)
         if result.returncode != 0:
             raise Rejected(
                 "antigravity_session_unreachable",
@@ -719,3 +742,66 @@ class AntigravityExtension(RemoteExtension):
         if _FOOTER_BUSY_MARKER in pane:
             return False
         return True
+
+    def read_remote_result(self, *, partner_id_in_remote: str) -> str:
+        """Screen-scrape the pane for whatever agy printed after the last prompt.
+
+        There is no API for this: the only readable surface Antigravity
+        offers at all is the tmux pane, so this is a best-effort read of a
+        TUI transcript, not a structured result, and it degrades to
+        "the whole pane" rather than failing outright when it can't do
+        better (see below). Captured with `history=500` scrollback (see
+        `_capture`) so an answer long enough to have scrolled off the
+        currently visible screen is not lost.
+
+        The pane has no structure to key off of -- no delimiter marks where
+        an answer begins -- except that agy echoes back whatever was typed
+        into it when the screen repaints. So the last body this adapter typed
+        into the session (`_last_delivered`, set by `deliver_message`) is
+        used as a start marker: its first non-empty line is searched for, and
+        the LAST pane line containing it is taken, since the same text can
+        already appear earlier in the transcript (e.g. quoted back by agy
+        itself) and only the most recent echo actually marks where THIS
+        turn's reply starts. If no body was ever recorded for this session,
+        or its echo cannot be found (scrolled past even the extended history,
+        or agy reformatted it beyond recognition), the whole captured pane is
+        kept instead -- a whole pane is a poor answer but a real one, and
+        guessing a narrower slice with nothing to anchor it would be worse.
+
+        What's kept still has agy's own UI chrome trailing it -- blank lines,
+        the idle/busy footer, a bare pane border -- which is stripped before
+        returning, looped rather than checked once, since removing one layer
+        (say a blank line) can expose another (the footer beneath it). An
+        empty result is a real answer, not a failure.
+        """
+        session = self._session_name(partner_id_in_remote)
+        lines = self._capture(session, history=500).splitlines()
+
+        start_index = 0
+        last_body = self._last_delivered.get(session)
+        if last_body is not None:
+            first_line = next((line for line in last_body.splitlines() if line.strip()), "")
+            if first_line:
+                echo_index = None
+                for index, line in enumerate(lines):
+                    if first_line in line:
+                        echo_index = index
+                if echo_index is not None:
+                    start_index = echo_index + 1
+
+        kept = lines[start_index:]
+        while kept:
+            candidate = kept[-1]
+            lowered = candidate.lower()
+            if not candidate.strip():
+                kept.pop()
+                continue
+            if _FOOTER_IDLE_MARKER in lowered or _FOOTER_BUSY_MARKER in lowered:
+                kept.pop()
+                continue
+            if all(ch in _CHROME_ONLY_CHARS for ch in candidate):
+                kept.pop()
+                continue
+            break
+
+        return "\n".join(kept).strip()

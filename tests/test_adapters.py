@@ -1243,3 +1243,152 @@ def test_antigravity_deliver_message_returns_when_the_turn_is_too_fast_to_observ
     rid = ext.deliver_message(partner_id_in_remote="conv1234-dead-beef",
                               behavior="[QUERY]", body="quick")
     assert rid, "deliver_message must still return a remote call id"
+
+
+# ---------------------------------------------------------------------------
+# read_remote_result: what a Caller actually ends up reading
+# ---------------------------------------------------------------------------
+#
+# Before these were implemented, `PollingServer._read_result` fell back to the
+# literal placeholder "[result reported by the remote through its own channel]"
+# for every science_ and gemini_ turn -- and because [TRUTHFUL-REPORT] and
+# [MESSAGE-RESPONSE] are stored, that placeholder was what `read` returned. The
+# answer existed on the remote and never reached the agent that asked for it.
+
+
+def test_claude_science_read_remote_result_returns_the_trailing_assistant_run(monkeypatch):
+    """A reply can span several assistant messages before the frame yields.
+
+    Stopping at the last one would return only the closing sentence of an
+    answer whose substance was in the message before it.
+    """
+    captured: dict = {}
+
+    def fake_urlopen(request):
+        captured["request"] = request
+        return _FakeHTTPResponse(200, {"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "an older question"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "an older answer"}]},
+            {"role": "user", "content": [{"type": "text", "text": "summarize the work"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "I measured 41.2ms."}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Evidence: bench.json."}]},
+        ]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    ext = ClaudeScienceExtension()
+
+    result = ext.read_remote_result(partner_id_in_remote="frame-1")
+
+    assert result == "I measured 41.2ms.\n\nEvidence: bench.json.", (
+        f"expected the whole trailing assistant run in order, got: {result!r}"
+    )
+    assert "an older answer" not in result, (
+        "anything at or before the last user message belongs to a previous exchange"
+    )
+    assert "/api/frames/frame-1/messages" in captured["request"].full_url
+
+
+def test_claude_science_read_remote_result_drops_harness_injected_messages(monkeypatch):
+    """`_harness_notice` marks Claude Science's own runtime context injection.
+
+    A skill-discovery dump or a [Memory] recall block is not the agent
+    speaking, and returning one as the result hands the Caller the app's
+    bookkeeping in place of its answer.
+    """
+    def fake_urlopen(request):
+        return _FakeHTTPResponse(200, [
+            {"role": "user", "content": [{"type": "text", "text": "do the work"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "the real answer"}]},
+            {"role": "assistant", "_harness_notice": True,
+             "content": [{"type": "text", "text": "[Memory] recalled 4 items"}]},
+        ])
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    ext = ClaudeScienceExtension()
+
+    result = ext.read_remote_result(partner_id_in_remote="frame-1")
+
+    assert result == "the real answer", f"got: {result!r}"
+
+
+def test_claude_science_read_remote_result_is_empty_not_an_error_when_nothing_was_said(monkeypatch):
+    """A turn that ended in a tool call said nothing, and that is a real answer."""
+    def fake_urlopen(request):
+        return _FakeHTTPResponse(200, {"messages": []})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    ext = ClaudeScienceExtension()
+    assert ext.read_remote_result(partner_id_in_remote="frame-1") == ""
+
+
+def test_antigravity_read_remote_result_slices_after_the_echoed_prompt(monkeypatch):
+    """The pane holds the whole transcript; only this turn's part is the result.
+
+    agy echoes what was typed into it, and that echo is the only marker
+    available -- there is no API and no delimiter. The LAST echo is the one
+    that matters: the same text can appear earlier, quoted back by agy itself.
+    """
+    pane = "\n".join([
+        "Reply with PROVEN",
+        "PROVEN",
+        "Reply with PROVEN",
+        "PROVEN, and here is why: the benchmark ran clean.",
+        "",
+        "╰──────────────╯",
+        "? for shortcuts",
+    ])
+
+    def fake_run(cmd, capture_output=True, text=True):
+        if "capture-pane" in cmd:
+            # deliver_message's _await_busy needs a busy footer to return
+            # promptly; read_remote_result then reads the settled pane.
+            stdout = pane if "-S" in cmd else "esc to cancel"
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+    ext.deliver_message(partner_id_in_remote="conv-1", behavior="[QUERY]", body="Reply with PROVEN")
+
+    result = ext.read_remote_result(partner_id_in_remote="conv-1")
+
+    assert result == "PROVEN, and here is why: the benchmark ran clean.", (
+        f"expected only what followed the LAST prompt echo, with chrome stripped; got: {result!r}"
+    )
+
+
+def test_antigravity_read_remote_result_keeps_the_whole_pane_when_it_cannot_anchor(monkeypatch):
+    """Degrading to the whole pane is deliberate.
+
+    With no recorded delivery there is nothing to anchor a narrower slice to,
+    and a guessed slice would silently drop the answer. A whole pane is a poor
+    result but a real one.
+    """
+    def fake_run(cmd, capture_output=True, text=True):
+        if "capture-pane" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, returncode=0, stdout="some answer text\n? for shortcuts", stderr=""
+            )
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+
+    assert ext.read_remote_result(partner_id_in_remote="conv-1") == "some answer text"
+
+
+def test_antigravity_read_remote_result_asks_for_scrollback(monkeypatch):
+    """An answer longer than the visible pane must not be silently truncated."""
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="answer", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+    ext.read_remote_result(partner_id_in_remote="conv-1")
+
+    assert any("-S" in cmd for cmd in seen), (
+        f"read_remote_result must capture scrollback, not just the visible screen; ran: {seen}"
+    )

@@ -396,3 +396,79 @@ class ClaudeScienceExtension(RemoteExtension):
         status, payload = self._request("GET", path)
         payload = self._require_ok("GET", path, status, payload, ok=(200,))
         return payload.get("status") not in _BUSY_STATUSES
+
+    def read_remote_result(self, *, partner_id_in_remote: str) -> str:
+        """`frames.getMessages` -- `GET /frames/{id}/messages?from=&limit=`,
+        per the real route table (queried here as `?limit=200` with no
+        `from`, the same "most recent window" shape `poll_completion` already
+        uses for `trace-shallow`). The payload is either a bare list of
+        messages or a dict wrapping one under `"messages"` -- both are
+        accepted since nothing in the ground truth pins the shape down to one
+        of them.
+
+        Messages carrying `"_harness_notice": true` are dropped first,
+        before the trailing run below is even computed: that flag marks
+        Claude Science's own runtime context injection (skill-discovery
+        keyword dumps, compute-spec snapshots, `[Memory]` recall blocks) into
+        the transcript, not either side of the conversation actually
+        speaking. Leaving one in place could stop the trailing run one
+        message short, or worse, return the harness's own bookkeeping as if
+        it were Claude Science's reply.
+
+        The **trailing run of `role == "assistant"` messages** -- walking the
+        filtered list backwards and stopping at the first non-assistant
+        message -- is exactly the answer to the last thing this system sent:
+        a single reply can span several assistant messages in a row (tool
+        calls interleaved with prose) before the frame yields back, and every
+        one of them belongs to that same reply. Anything at or before the
+        last non-assistant message belongs to a prior exchange, not this one.
+
+        Text is collected from that run in original order. `content` is
+        normally a list of blocks (a text block being `{"type": "text",
+        "text": ...}`), but may also be a plain string, and both are
+        handled. Each piece is stripped, empty pieces are dropped, and what
+        remains is joined with a blank line between messages. Nothing found
+        is a real answer -- e.g. a reply that ended in only a tool call --
+        so this returns `""` rather than inventing a placeholder or raising.
+        """
+        path = f"/api/frames/{partner_id_in_remote}/messages?limit=200"
+        status, payload = self._request("GET", path)
+        payload = self._require_ok("GET", path, status, payload, ok=(200,))
+
+        if isinstance(payload, dict):
+            messages = payload.get("messages") or []
+        elif isinstance(payload, list):
+            messages = payload
+        else:
+            messages = []
+
+        speaking = [
+            message
+            for message in messages
+            if isinstance(message, dict) and not message.get("_harness_notice")
+        ]
+
+        # Walk backwards from the end: everything from here to the end is
+        # this reply, everything before it is the message that provoked it.
+        run_start = len(speaking)
+        while run_start > 0 and speaking[run_start - 1].get("role") == "assistant":
+            run_start -= 1
+        trailing_run = speaking[run_start:]
+
+        pieces: list[str] = []
+        for message in trailing_run:
+            content = message.get("content")
+            if isinstance(content, str):
+                text = content.strip()
+                if text:
+                    pieces.append(text)
+                continue
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = str(block.get("text", "")).strip()
+                    if text:
+                        pieces.append(text)
+
+        return "\n\n".join(pieces)
