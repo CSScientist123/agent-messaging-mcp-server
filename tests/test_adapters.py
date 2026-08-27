@@ -1192,7 +1192,9 @@ def test_antigravity_listed_rules_ignores_the_chat_prompt_line():
     pane = rule_list_pane(["read_file(/a)", "write_file(/b)"], selected=1)
     ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
     assert ext._listed_rules(pane) == ["read_file(/a)", "write_file(/b)"]
-    assert ext._selected_index(pane, ext._listed_rules(pane)) == 1
+    # One argument, not two: the walk derives the list from the same pane it
+    # scans, so a separately-computed `rules` could only ever disagree with it.
+    assert ext._selected_index(pane) == 1
 
 
 def test_antigravity_listed_rules_is_empty_when_there_are_none():

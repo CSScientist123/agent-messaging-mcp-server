@@ -940,7 +940,7 @@ One real limit remains. Antigravity permissions are **project-scoped, not conver
 | Variable | Read by | Required | Effect |
 |---|---|---|---|
 | `MESSAGING_MCP_HOME` | `messaging_core/config.py: data_dir()` | No | Overrides the data directory (default `~/.messaging-mcp`). Only consulted when `MESSAGING_MCP_DB` is unset and no explicit `Database(path=...)` is given. |
-| `MESSAGING_MCP_DB` | `mcp_server/config.py: build_core_from_env()` | No | A filesystem path, or the literal `":memory:"`, passed straight to `Database(path=...)`. When set, `MESSAGING_MCP_HOME`/`data_dir()` are never consulted for the database's location. |
+| `MESSAGING_MCP_DB` | `mcp_server/config.py: build_stack_from_env()` | No | A filesystem path, or the literal `":memory:"`, passed straight to `Database(path=...)`. When set, `MESSAGING_MCP_HOME`/`data_dir()` are never consulted for the database's location. |
 | `MESSAGING_MCP_SOURCE` | `mcp_server/config.py: source_prefix_from_env()` | Yes, for `mcp_server.server.main()` | Which of the four `source_prefix` values this one MCP server process speaks for; also names the built server (`f"messaging-{source_prefix.rstrip('_')}"`). Raises `ValueError` (not `Rejected`) if unset or not one of the four. |
 
 ### Database location, and why it must be on a native filesystem

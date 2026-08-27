@@ -544,8 +544,16 @@ class AntigravityExtension(RemoteExtension):
         return rules
 
     @staticmethod
-    def _selected_index(pane: str, rules: list[str]) -> int:
-        """Which listed rule currently carries the `>` cursor. 0 if none does."""
+    def _selected_index(pane: str) -> int:
+        """Which rule row currently carries the `>` cursor. 0 if none does.
+
+        Walks `pane` with the exact same rule-recognizing logic as
+        `_listed_rules`, so the row count it counts against is always the one
+        implied by `pane` itself -- there is no separate `rules` list to pass
+        in, because any list a caller could hand over is either this same
+        walk repeated or a stale one from a different pane, and a stale list
+        is precisely what must not bound this answer.
+        """
         inside = False
         index = 0
         for line in pane.splitlines():
@@ -686,7 +694,7 @@ class AntigravityExtension(RemoteExtension):
                 if rule not in listed:
                     continue
                 target = listed.index(rule)
-                current = self._selected_index(pane, listed)
+                current = self._selected_index(pane)
                 key = "Down" if target > current else "Up"
                 for _ in range(abs(target - current)):
                     self._tmux("send-keys", "-t", session, key)
@@ -697,7 +705,7 @@ class AntigravityExtension(RemoteExtension):
                 # the wrong permission is worse than deleting none.
                 moved = self._capture(session)
                 moved_rules = self._listed_rules(moved)
-                selected = self._selected_index(moved, moved_rules)
+                selected = self._selected_index(moved)
                 if not moved_rules or moved_rules[selected] != rule:
                     raise Rejected(
                         "permissions_view_did_not_open",

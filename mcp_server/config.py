@@ -126,12 +126,6 @@ def build_extension(source_prefix: str, db: Database | None = None) -> RemoteExt
     return _build_real_extension(source_prefix)
 
 
-def build_core_from_env() -> MessagingCore:
-    """Build a `MessagingCore` wired entirely from environment configuration."""
-    core, _polling = build_stack_from_env()
-    return core
-
-
 def build_stack_from_env() -> tuple[MessagingCore, "PollingServer"]:
     """Build the whole running stack: a core AND the Polling Server behind it.
 
