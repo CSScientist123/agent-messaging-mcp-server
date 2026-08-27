@@ -266,8 +266,31 @@ class AntigravityExtension(RemoteExtension):
         agy's own input redraw; not replicated here since this adapter's
         calls are synchronous or fake within a single test process, so
         there's no equivalent race to guard against.
+
+        Before any of that, waits for the pane to actually be ready to accept
+        the keystrokes. A fresh session in a folder agy has not seen before
+        does not go straight to an input prompt -- it paints a startup banner
+        and then a modal trust prompt, and `verify_partner_id_in_remote` only
+        checks `tmux has-session`, which succeeds the instant the session
+        exists, long before either of those clears. Observed live end to end:
+        a conversation got created against a session still on that prompt,
+        this method typed the Caller's message straight into the menu (where
+        it did nothing), `_await_busy` below timed out the way it harmlessly
+        does for a short turn, `poll_completion` then read no busy footer and
+        called the turn FINISHED, and `read_remote_result` -- finding no echo
+        of what it had typed, because nothing had reached the chat -- fell
+        back to the whole pane and handed the Caller agy's own startup
+        banner as its answer. Nothing errored anywhere.
         """
         session = self._session_name(partner_id_in_remote)
+        if not self._await_idle(session):
+            raise Rejected(
+                "antigravity_session_not_ready",
+                f"tmux session {session!r} for conversation {partner_id_in_remote!r} never "
+                "reached an input prompt -- the idle footer "
+                f"({_FOOTER_IDLE_MARKER!r}) never appeared within the cold-start budget. "
+                "Nothing was typed.",
+            )
         result = self._tmux("send-keys", "-t", session, "-l", body)
         if result.returncode == 0:
             result = self._tmux("send-keys", "-t", session, "Enter")
@@ -304,6 +327,46 @@ class AntigravityExtension(RemoteExtension):
         for _ in range(attempts):
             pane = self._capture(session).lower()
             if _FOOTER_BUSY_MARKER in pane:
+                return True
+            time.sleep(delay)
+        return False
+
+    def _await_idle(self, session: str, attempts: int = 60, delay: float = 0.5) -> bool:
+        """Poll the pane until it shows the idle footer. True if it was seen.
+
+        Mirrors `_await_busy` above, with two differences. First, this is
+        called BEFORE the first keystroke of a turn, not after, so that
+        nothing is ever typed into a session that cannot accept it (see
+        `deliver_message`). Second, the default budget here is a COLD-START
+        ALLOWANCE, not a guess: `_await_busy`'s budget only has to outlast a
+        repaint, but a session that has never seen its folder before has to
+        clear a startup banner AND a modal trust prompt first, which measured
+        over 90 seconds live. A budget sized like `_await_busy`'s would time
+        out on every cold start, not just a genuinely stuck one.
+
+        Raises `Rejected("approval_is_an_error", ...)` the moment a
+        trust/permission prompt is seen on the pane, instead of continuing to
+        wait for it to clear -- it will not clear on its own, and this
+        extension has no method anywhere that types a response into one (see
+        the module docstring and `poll_completion`'s identical check). The
+        difference from `poll_completion`'s raise is only where in the turn
+        it fires: that one catches a prompt that appeared mid-turn, after
+        something was already sent; this one catches a prompt that was
+        already there, so that nothing is sent into it at all.
+        """
+        for _ in range(attempts):
+            pane = self._capture(session).lower()
+            if any(marker in pane for marker in _APPROVAL_PROMPT_MARKERS):
+                raise Rejected(
+                    "approval_is_an_error",
+                    f"tmux session {session!r} is showing an approval/trust prompt before "
+                    "delivery could even begin, so nothing has been typed into it. This is "
+                    "always an error, never a question this extension answers -- most likely "
+                    "the folder was never trusted (or a permission never granted) before this "
+                    "conversation's first message was sent. Trust the folder (or correct the "
+                    "grant with add_permissions) and send the work again.",
+                )
+            if _FOOTER_IDLE_MARKER in pane:
                 return True
             time.sleep(delay)
         return False
@@ -756,11 +819,9 @@ class AntigravityExtension(RemoteExtension):
 
         There is no API for this: the only readable surface Antigravity
         offers at all is the tmux pane, so this is a best-effort read of a
-        TUI transcript, not a structured result, and it degrades to
-        "the whole pane" rather than failing outright when it can't do
-        better (see below). Captured with `history=500` scrollback (see
-        `_capture`) so an answer long enough to have scrolled off the
-        currently visible screen is not lost.
+        TUI transcript, not a structured result. Captured with `history=500`
+        scrollback (see `_capture`) so an answer long enough to have
+        scrolled off the currently visible screen is not lost.
 
         The pane has no structure to key off of -- no delimiter marks where
         an answer begins -- except that agy echoes back whatever was typed
@@ -770,34 +831,55 @@ class AntigravityExtension(RemoteExtension):
         the LAST pane line containing it is taken, since the same text can
         already appear earlier in the transcript (e.g. quoted back by agy
         itself) and only the most recent echo actually marks where THIS
-        turn's reply starts. If no body was ever recorded for this session,
-        or its echo cannot be found (scrolled past even the extended history,
-        or agy reformatted it beyond recognition), the whole captured pane is
-        kept instead -- a whole pane is a poor answer but a real one, and
-        guessing a narrower slice with nothing to anchor it would be worse.
+        turn's reply starts.
+
+        There are two distinct ways that search can come up empty, and they
+        used to be conflated into one fallback -- "return the whole pane" --
+        which is exactly how a real failure went unnoticed: a message typed
+        into a session still stuck on a trust prompt never reached the chat,
+        `_last_delivered` recorded it anyway (delivery has no way to know the
+        keystrokes landed on a menu instead), its echo was therefore never on
+        the pane, and the old fallback handed agy's own startup banner back
+        to the Caller as the turn's answer. They are handled separately now:
+
+        - No body was ever recorded for this session at all (`_last_delivered`
+          has no entry -- e.g. this process restarted mid-turn and lost it).
+          There is genuinely nothing to anchor a start index on here, so the
+          whole captured pane is kept -- a poor answer, but a real one.
+        - A body WAS recorded, but its echo is not on the pane. That is
+          POSITIVE EVIDENCE the pane does not hold the turn being read (the
+          message never landed in the chat, or scrolled past even the
+          extended history) -- not an absence of evidence, and returning the
+          pane anyway is precisely the startup-banner failure above. `""` is
+          returned instead: this module must never fabricate a remote's
+          answer by guessing a slice of pane with nothing real to anchor it.
 
         What's kept still has agy's own UI chrome trailing it -- blank lines,
         the idle/busy footer, a bare pane border -- which is stripped before
         returning, looped rather than checked once, since removing one layer
         (say a blank line) can expose another (the footer beneath it). An
-        empty result is a real answer, not a failure.
+        empty result from that stripping is a real answer too, not a failure.
         """
         session = self._session_name(partner_id_in_remote)
         lines = self._capture(session, history=500).splitlines()
 
-        start_index = 0
         last_body = self._last_delivered.get(session)
-        if last_body is not None:
+        if last_body is None:
+            # Nothing to anchor on -- keep the whole pane (see docstring).
+            kept = lines[:]
+        else:
             first_line = next((line for line in last_body.splitlines() if line.strip()), "")
+            echo_index = None
             if first_line:
-                echo_index = None
                 for index, line in enumerate(lines):
                     if first_line in line:
                         echo_index = index
-                if echo_index is not None:
-                    start_index = echo_index + 1
-
-        kept = lines[start_index:]
+            if echo_index is None:
+                # A body was recorded but its echo is nowhere on the pane --
+                # positive evidence this pane is not the turn being read, so
+                # returning the pane would fabricate an answer. See docstring.
+                return ""
+            kept = lines[echo_index + 1 :]
         while kept:
             candidate = kept[-1]
             lowered = candidate.lower()

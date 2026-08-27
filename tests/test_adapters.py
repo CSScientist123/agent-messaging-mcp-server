@@ -505,6 +505,17 @@ def test_antigravity_deliver_message_sends_literal_text_then_enter(monkeypatch):
 
     def fake_run(cmd, capture_output=True, text=True):
         seen.append(cmd)
+        if "capture-pane" in cmd:
+            # A session that is ready before the keystrokes and busy after
+            # them. Both halves are required now: delivery refuses a pane that
+            # has not reached an input prompt, because typing into agy's trust
+            # dialog put the message nowhere and every check afterwards read
+            # as success.
+            typed = any("send-keys" in c for c in seen)
+            return subprocess.CompletedProcess(
+                cmd, returncode=0,
+                stdout="esc to cancel" if typed else "? for shortcuts", stderr="",
+            )
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1340,12 +1351,21 @@ def test_antigravity_read_remote_result_slices_after_the_echoed_prompt(monkeypat
         "? for shortcuts",
     ])
 
+    seen: list[list[str]] = []
+
     def fake_run(cmd, capture_output=True, text=True):
+        seen.append(cmd)
         if "capture-pane" in cmd:
-            # deliver_message's _await_busy needs a busy footer to return
-            # promptly; read_remote_result then reads the settled pane.
-            stdout = pane if "-S" in cmd else "esc to cancel"
-            return subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
+            if "-S" in cmd:
+                # The scrollback read read_remote_result makes.
+                return subprocess.CompletedProcess(cmd, returncode=0, stdout=pane, stderr="")
+            # Ready before the keystrokes, busy after: delivery now refuses a
+            # session that has not reached an input prompt.
+            typed = any("send-keys" in c for c in seen)
+            return subprocess.CompletedProcess(
+                cmd, returncode=0,
+                stdout="esc to cancel" if typed else "? for shortcuts", stderr="",
+            )
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1394,3 +1414,156 @@ def test_antigravity_read_remote_result_asks_for_scrollback(monkeypatch):
     assert any("-S" in cmd for cmd in seen), (
         f"read_remote_result must capture scrollback, not just the visible screen; ran: {seen}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Delivering into a TUI that is not ready
+# ---------------------------------------------------------------------------
+#
+# Found live. A fresh agy session in a folder agy has not seen before paints a
+# banner and then a modal trust prompt; `tmux has-session` succeeds the instant
+# the session exists, so `create_partner` registers a conversation that cannot
+# receive anything. The first delivery typed the Caller's message into that
+# menu, `_await_busy` timed out and returned (a timeout there is deliberately
+# not an error), `poll_completion` saw no busy footer and reported the turn
+# finished, and `read_remote_result` fell back to the whole pane -- so the
+# Caller received agy's startup banner stored as its answer. Nothing errored.
+
+
+def _agy_pane_runner(panes):
+    """A fake tmux whose capture-pane returns each pane in turn, then the last."""
+    state = {"i": 0}
+
+    def fake_run(cmd, capture_output=True, text=True):
+        if "capture-pane" in cmd:
+            i = min(state["i"], len(panes) - 1)
+            state["i"] += 1
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=panes[i], stderr="")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    return fake_run, state
+
+
+def test_antigravity_refuses_to_type_into_a_trust_prompt(monkeypatch):
+    """A trust prompt is an approval, and this extension never answers one.
+
+    Raising `approval_is_an_error` routes it into the path that already
+    exists: the Polling Server reports it to the Caller as an [ERROR] naming
+    the remedy. Typing into the menu instead loses the message silently.
+    """
+    trust_pane = (
+        "Do you trust the contents of this project?\n"
+        "Antigravity CLI requires permission to read, edit, and execute files here.\n"
+        "> Yes, I trust this folder\n  No, exit\n"
+    )
+    fake_run, _ = _agy_pane_runner([trust_pane])
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+
+    with pytest.raises(Rejected) as exc_info:
+        ext.deliver_message(partner_id_in_remote="conv-1", behavior="[QUERY]", body="hello")
+
+    assert exc_info.value.code == "approval_is_an_error", (
+        f"a trust prompt must be reported as an approval, got {exc_info.value.code!r}"
+    )
+
+
+def test_antigravity_sends_nothing_when_it_refuses(monkeypatch):
+    """The whole point: the keystrokes must not happen."""
+    trust_pane = "Do you trust the contents of this project?\n> Yes, I trust this folder\n"
+    sent: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True):
+        if "send-keys" in cmd:
+            sent.append(cmd)
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout=trust_pane, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+
+    with pytest.raises(Rejected):
+        ext.deliver_message(partner_id_in_remote="conv-1", behavior="[QUERY]", body="hello")
+
+    assert sent == [], f"the message was typed into the prompt anyway: {sent}"
+
+
+def test_antigravity_refuses_a_session_that_never_reaches_a_prompt(monkeypatch):
+    """A pane that is neither ready nor prompting is a session still booting.
+
+    Typing into it puts the message nowhere, and every check afterwards reads
+    as success.
+    """
+    fake_run, _ = _agy_pane_runner(["Antigravity CLI 1.1.22\nloading...\n"])
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+
+    with pytest.raises(Rejected) as exc_info:
+        ext.deliver_message(
+            partner_id_in_remote="conv-1", behavior="[QUERY]", body="hello",
+        )
+
+    assert exc_info.value.code in ("antigravity_session_not_ready", "approval_is_an_error")
+
+
+def test_antigravity_delivers_once_the_prompt_is_ready(monkeypatch):
+    """The wait must not become a new way for a healthy delivery to fail."""
+    ready = "? for shortcuts\n"
+    busy = "esc to cancel\n"
+    panes = [ready, busy, busy]
+    fake_run, _ = _agy_pane_runner(panes)
+    sent: list[list[str]] = []
+
+    def wrapper(cmd, capture_output=True, text=True):
+        if "send-keys" in cmd:
+            sent.append(cmd)
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        return fake_run(cmd, capture_output=capture_output, text=text)
+
+    monkeypatch.setattr(subprocess, "run", wrapper)
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+
+    call_id = ext.deliver_message(
+        partner_id_in_remote="conv-1", behavior="[QUERY]", body="hello"
+    )
+
+    assert call_id.startswith("agy-turn-")
+    assert any("-l" in cmd for cmd in sent), f"the body was never typed: {sent}"
+
+
+def test_antigravity_read_remote_result_returns_nothing_when_it_cannot_find_its_own_echo(
+    monkeypatch,
+):
+    """The observed failure: a startup banner stored as an agent's answer.
+
+    A recorded delivery whose echo is absent from the pane is positive
+    evidence the pane does not hold that turn. Returning it anyway is
+    fabricating a remote's answer, which this module must never do -- distinct
+    from the no-recorded-body case, where a whole pane really is the best
+    available and is kept.
+    """
+    ready = "? for shortcuts\n"
+    busy = "esc to cancel\n"
+    banner = "Antigravity CLI 1.1.22\nsome@user\n? for shortcuts\n"
+    seq = [ready, busy, banner, banner, banner]
+    fake_run, _ = _agy_pane_runner(seq)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+    ext.deliver_message(
+        partner_id_in_remote="conv-1", behavior="[QUERY]", body="a prompt never echoed",
+    )
+
+    result = ext.read_remote_result(partner_id_in_remote="conv-1")
+
+    assert result == "", (
+        f"a pane not containing this turn must not be returned as its answer: {result!r}"
+    )
+
+
+def test_antigravity_read_remote_result_keeps_the_pane_with_no_recorded_delivery(monkeypatch):
+    """Unchanged, and deliberately different: nothing to anchor on."""
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **k: subprocess.CompletedProcess(
+        cmd, returncode=0, stdout="some answer text\n? for shortcuts", stderr=""))
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+
+    assert ext.read_remote_result(partner_id_in_remote="never-delivered") == "some answer text"
