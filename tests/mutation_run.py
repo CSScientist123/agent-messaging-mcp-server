@@ -128,10 +128,11 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "resolver-crosses-sources", "mcp_server/config.py",
-        '_RESOLVABLE_SOURCES = frozenset({"nlm_", "science_"})',
-        '_RESOLVABLE_SOURCES = frozenset({"nlm_", "science_", "gemini_"})',
-        "an adapter is handed a resolver for a source it does not speak for, so a "
-        "partner_id_in_remote shared across projects resolves to the wrong container",
+        "     WHERE p.partner_id_in_remote = ? AND pr.source_prefix = ?",
+        "     WHERE p.partner_id_in_remote = ? AND ? IS NOT NULL",
+        "the id resolver stops filtering by source, so a partner_id_in_remote that "
+        "collides across two projects resolves to the wrong container -- and a "
+        "NotebookLM adapter addresses a query at a Claude Science project id",
     ),
     (
         "label-order-ignores-fresh-arrival", "messaging_core/core.py",
@@ -158,7 +159,7 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     (
         "no-column-reconciliation", "messaging_core/db.py",
         "_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (",
-        "_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = () or (",
+        "_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = () and (",
         "a database created before a column was added never gains it, so every read "
         "of that column fails with `no such column` against an existing deployment",
     ),
@@ -232,8 +233,8 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "priority-inverted", "messaging_core/core.py",
-        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC, MIN(q.enqueued_at) ASC",
-        " ORDER BY MIN(c.priority) DESC, MIN(q.in_process) ASC, MIN(q.enqueued_at) ASC",
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC,",
+        " ORDER BY MIN(c.priority) DESC, MIN(q.in_process) ASC,",
         "_HEAD_LABEL_SQL picks the LOWEST-priority label last instead of first, so a "
         "[RESEARCH] can win the working slot over a [QUERY] that stops work",
     ),
@@ -291,8 +292,10 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "in-process-crosses-labels", "messaging_core/core.py",
-        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC, MIN(q.enqueued_at) ASC",
-        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) DESC, MIN(q.enqueued_at) ASC",
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC,\n"
+        "          MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) ASC,",
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) DESC,\n"
+        "          MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) DESC,",
         "the paused-vs-fresh tie-break stops being scoped to one label, so a "
         "paused [QUERY] beats a fresh [ERROR] at the same priority and a Caller's "
         "correction is never delivered to the Partner it is correcting",

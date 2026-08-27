@@ -301,7 +301,7 @@ Pages through a Partner's received `[QUERY]`/`[TRUTHFUL-REPORT]` message history
 
 ### search_partner
 
-Fuzzy-searches live Partners by title using `difflib.SequenceMatcher` ratio (case-insensitive), best matches first.
+Searches live Partners by title, best matches first. A candidate is returned only if it clears the relevance test below; an empty list is a normal answer, not an error.
 
 **Parameters**
 
@@ -313,6 +313,15 @@ Fuzzy-searches live Partners by title using `difflib.SequenceMatcher` ratio (cas
 | `limit` | `int` | optional | `3` | any non-negative int | Maximum matches returned. |
 
 **Returns** `list[dict]`, best-first, each: `{"id": int, "title": str, "project_id": int, "orchestrator_type": str | None, "descr_preview": str, "score": float}`. `descr_preview` is `descr` truncated to 160 characters with a trailing `…` if cut. `score` is the raw `difflib` ratio (`0.0`–`1.0`); ties are broken by SQLite's row order, which is unspecified since neither query carries an `ORDER BY`.
+
+**Relevance.** A candidate qualifies on **either** rule:
+
+1. `query_title`, lowercased, is at least 3 characters and appears literally inside the candidate's lowercased title.
+2. Its `difflib` ratio is at least `0.6`.
+
+Two rules rather than one threshold, because one threshold cannot do it. `difflib` penalises length difference, so a short deliberate query against a long title scores low however exact it is — `worker` against `research-worker` is `0.571`, `res` is `0.333`. Lowering the floor to keep them does not work either: `xylophone`, which shares nothing with any of those titles, scores `0.345` — above `res` and level with `orch`. The two are not separable by ratio at all. What separates them is that a real query is a substring of its target and a nonsense one is a substring of nothing. The `0.6` floor then does the job it is actually good at, which is tolerating a typo (`reserch` → `research-worker` is `0.636`).
+
+Sorting is unaffected: candidates are still ranked by `score` descending, so an exact match still outranks a substring match. Only the inclusion test changed. Without it, a query matching nothing returned the top `limit` rows anyway, with scores attached — and an agent, handed titles it asked for, addressed one of them.
 
 **Rejections**
 

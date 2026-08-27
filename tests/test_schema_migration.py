@@ -65,6 +65,29 @@ def stale_db(tmp_path):
     return path
 
 
+def test_the_declared_column_list_names_the_columns_it_should():
+    """A list derived from itself proves nothing.
+
+    Every other test in this file iterates `_ADDITIVE_COLUMNS` -- the fixture
+    strips exactly those columns out, and the assertions loop over exactly
+    those columns. Empty the constant and all of them pass while reconciling
+    nothing: the fixture strips nothing, the loops run zero times, and a
+    database that predates the change is silently left broken.
+
+    Found by the mutation pass, which is the only thing that would have.
+    """
+    declared = {(table, ddl.split()[0]) for table, ddl in _ADDITIVE_COLUMNS}
+
+    assert ("message_queue", "summary_phase") in declared, (
+        "summary_phase is read and written by the summary-phase code; a database "
+        "created before it existed must gain it on open"
+    )
+    assert ("message_queue", "origin_behavior") in declared, (
+        "origin_behavior is read by the [RESEARCH] cap on both the queue and the "
+        "slot side; a database without it fails every admission"
+    )
+
+
 def test_a_database_that_predates_a_column_gains_it_on_open(stale_db):
     Database(path=stale_db).close()
 
