@@ -63,6 +63,68 @@ LOCK = REPO / ".mutation_running"
 #: (label, file, find, replace, the invariant it breaks)
 MUTANTS: list[tuple[str, str, str, str, str]] = [
     (
+        "drains-any-source", "polling/server.py",
+        "        if source_prefix not in self.extensions:",
+        "        if False and source_prefix not in self.extensions:",
+        "a process spawns a drain thread for a Partner whose source it holds no "
+        "extension for -- the thread raises no_extension on every pass, never retires, "
+        "and its drain_threads row re-arms it after every restart",
+    ),
+    (
+        "start-resumes-every-source", "polling/server.py",
+        'f"WHERE pr.source_prefix IN ({placeholders})",',
+        'f"WHERE 1=1 OR pr.source_prefix IN ({placeholders})",',
+        "start() resumes drain threads for Partners this process cannot serve, "
+        "recreating the doomed threads on every restart",
+    ),
+    (
+        "supervisor-ignores-the-working-slot", "polling/server.py",
+        "        for partner_id in self.core.slots.occupied():",
+        "        for partner_id in []:",
+        "the supervisor scans only the queue, so a task promoted into the working slot "
+        "(which DELETES its queue row) is left with a remote mid-turn and no thread "
+        "watching it",
+    ),
+    (
+        "send-does-not-arm", "mcp_server/server.py",
+        '                polling.ensure_partner_thread(partner_id=result["partner_id"])',
+        "                pass",
+        "send delivers work to a remote and arms nothing, so poll_completion is never "
+        "called and the answer never reaches the Caller",
+    ),
+    (
+        "summary-phase-not-carried", "messaging_core/core.py",
+        '                            int(bool(working.get("summary_phase"))),',
+        "                            0,",
+        "a displaced summary phase is requeued without its marker, so on resume it is "
+        "an ordinary [TRUTHFUL-REPORT] that owes nothing back and the research result "
+        "is silently dropped",
+    ),
+    (
+        "summary-resumed-as-a-plain-pause", "messaging_core/core.py",
+        '        if task.get("summary_phase"):\n'
+        "            return templates.truthful_report_request(",
+        '        if False and task.get("summary_phase"):\n'
+        "            return templates.truthful_report_request(",
+        "a resumed summary phase falls through to the one-line resume prompt, which "
+        "names nothing the agent is holding, instead of re-asking for the summary",
+    ),
+    (
+        "cap-ignores-the-origin-label", "messaging_core/slots.py",
+        '            if task["behavior"] == behavior or task.get("origin_behavior") == behavior:',
+        '            if task["behavior"] == behavior:',
+        "the working slot stops counting against the [RESEARCH] cap the moment "
+        "begin_summary_phase relabels it, so a caller gets one more [RESEARCH] in flight "
+        "than the cap allows for as long as the summary takes",
+    ),
+    (
+        "admit-ignores-the-origin-label", "messaging_core/core.py",
+        "           AND COALESCE(origin_behavior, behavior) = :behavior) + :working",
+        "           AND behavior = :behavior) + :working",
+        "_ADMIT_SQL stops counting a displaced summary row against the [RESEARCH] cap it "
+        "was admitted under, so the cap leaks through the queue instead of the slot",
+    ),
+    (
         "reader-is-writable", "messaging_core/db.py",
         'uri = f"file:{quoted}?mode=ro"',
         'uri = f"file:{quoted}?mode=rw"',
@@ -92,20 +154,20 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "cap-ignores-working", "messaging_core/core.py",
-        "         WHERE partner_id = :pid AND caller_id = :cid AND behavior = :behavior) + :working\n"
+        "           AND COALESCE(origin_behavior, behavior) = :behavior) + :working\n"
         "     < (SELECT max_outstanding FROM label_caps WHERE behavior = :behavior)",
-        "         WHERE partner_id = :pid AND caller_id = :cid AND behavior = :behavior)\n"
+        "           AND COALESCE(origin_behavior, behavior) = :behavior)\n"
         "     < (SELECT max_outstanding FROM label_caps WHERE behavior = :behavior)",
         "_ADMIT_SQL's cap counts only queued rows, not the one already being "
         "worked, so a caller capped at N ends up with N+1 in flight",
     ),
     (
         "displaced-not-paused", "messaging_core/core.py",
-        '                        "VALUES (?, ?, ?, ?, 1, ?)",\n'
+        '                        "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",\n'
         "                        (\n"
         "                            partner_id,\n"
         '                            working["caller_id"],',
-        '                        "VALUES (?, ?, ?, ?, 0, ?)",\n'
+        '                        "VALUES (?, ?, ?, ?, 0, ?, ?, ?)",\n'
         "                        (\n"
         "                            partner_id,\n"
         '                            working["caller_id"],',
@@ -171,8 +233,9 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "deliver-does-not-wait-for-the-turn", "adapters/antigravity/adapter.py",
-        "        self._await_busy(session)\n        self._delivery_count += 1",
-        "        self._delivery_count += 1",
+        "        self._await_busy(session)\n"
+        "        # Recorded on success only:",
+        "        # Recorded on success only:",
         "deliver_message returns before the remote has visibly started, so the "
         "next poll_completion reads a stale idle pane and the drain thread "
         "closes a task the agent has not begun",

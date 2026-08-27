@@ -510,6 +510,15 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        if polling is not None:
+            try:
+                polling.ensure_partner_thread(partner_id=result["partner_id"])
+            except Exception:
+                # Arming is an optimisation, not the guarantee -- the supervisor
+                # picks the row up within one interval either way. A receipt already
+                # earned must never be turned into a failure by the thing that only
+                # makes the answer arrive sooner.
+                pass
         delivered = result.get("delivered")
         tail = (
             f"It went straight to work (remote_call_id={result['remote_call_id']!r})."

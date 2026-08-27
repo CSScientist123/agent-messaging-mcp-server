@@ -97,10 +97,12 @@ class PollingServer:
         extensions: dict[str, RemoteExtension],
         poll_interval: float = 0.25,
         core: MessagingCore | None = None,
+        supervisor_interval: float = 1.0,
     ) -> None:
         self.db = db
         self.extensions = extensions
         self.poll_interval = poll_interval
+        self.supervisor_interval = supervisor_interval
         # One core, holding the slots every per-source view shares.
         self.core = core if core is not None else MessagingCore(db)
 
@@ -108,6 +110,11 @@ class PollingServer:
         self._drain_threads: dict[int, threading.Thread] = {}
         self._stop_flags: dict[int, threading.Event] = {}
         self._started = False
+        # The supervisor is a single extra daemon thread, started by start()
+        # and stopped by stop() alongside every drain thread; None until the
+        # first start().
+        self._supervisor_thread: threading.Thread | None = None
+        self._supervisor_stop_event: threading.Event | None = None
         # Exceptions swallowed by a drain loop so they don't kill the daemon
         # thread silently. Not part of the public contract; useful for tests
         # and diagnostics.
@@ -125,6 +132,22 @@ class PollingServer:
 
     # -- the core, bound to one partner's remote ------------------------------
 
+    def _source_prefix_for(self, partner_id: int) -> str | None:
+        """This Partner's `source_prefix`, or `None` if the Partner is unknown.
+
+        A caller that only wants to test membership in `self.extensions` --
+        `_ensure_thread` is the one that matters -- has no reason to go through
+        `_core_for`: that also builds a whole `MessagingCore` and raises on an
+        unregistered source, which is wasted work (and the wrong control flow)
+        for something that only needs to look at a dict key.
+        """
+        row = self.db.read_one(
+            "SELECT pr.source_prefix AS source_prefix "
+            "FROM partners p JOIN projects pr ON pr.id = p.project_id WHERE p.id = ?",
+            (partner_id,),
+        )
+        return row["source_prefix"] if row is not None else None
+
     def _core_for(self, partner_id: int) -> MessagingCore:
         """A core view whose extension speaks for this Partner's source.
 
@@ -132,14 +155,9 @@ class PollingServer:
         per source. The view shares this server's `db` and -- critically --
         its `slots`, so every view sees the same working slots.
         """
-        row = self.db.read_one(
-            "SELECT pr.source_prefix AS source_prefix "
-            "FROM partners p JOIN projects pr ON pr.id = p.project_id WHERE p.id = ?",
-            (partner_id,),
-        )
-        if row is None:
+        prefix = self._source_prefix_for(partner_id)
+        if prefix is None:
             raise Rejected("unknown_partner", f"no partner with id {partner_id}.")
-        prefix = row["source_prefix"]
         extension = self.extensions.get(prefix)
         if extension is None:
             raise Rejected("no_extension", f"no RemoteExtension registered for {prefix!r}.")
@@ -162,16 +180,51 @@ class PollingServer:
         """Ensure a drain thread is running for the Partner named by `partner_uuid`.
 
         Takes a UUID, never a title -- titles only ever appear at the client
-        boundary. If a drain thread already serves this Partner, this is a
-        no-op that returns a `[nothing new]` response; otherwise a thread is
-        spawned and an `[ok]` response is returned.
+        boundary. Resolves the uuid to an id and delegates to
+        `ensure_partner_thread`, so there is exactly one implementation of
+        "arm a drain thread for this partner".
         """
         partner = self.db.read_one("SELECT id FROM partners WHERE uuid = ?", (partner_uuid,))
         if partner is None:
             raise Rejected("unknown_partner", f"no partner with uuid {partner_uuid!r}.")
-        return self._ensure_thread(partner["id"], partner_uuid)
+        return self.ensure_partner_thread(partner_id=partner["id"])
+
+    def ensure_partner_thread(self, *, partner_id: int) -> str:
+        """Arm a drain thread for `partner_id`, if this process can serve its source.
+
+        Looks up the Partner's uuid itself rather than asking the caller for
+        one: `send`'s receipt carries a `partner_id`, not a uuid, and
+        `_ensure_thread` needs a label regardless of which caller reached it.
+        An unknown `partner_id` is not raised here -- `_ensure_thread`'s own
+        guard already turns that into a `[nothing new]` rather than an error,
+        and arming is an optimisation nothing downstream depends on
+        succeeding.
+        """
+        partner = self.db.read_one("SELECT uuid FROM partners WHERE id = ?", (partner_id,))
+        label = partner["uuid"] if partner is not None else str(partner_id)
+        return self._ensure_thread(partner_id, label)
 
     def _ensure_thread(self, partner_id: int, label: str) -> str:
+        # Resolved and checked BEFORE anything is spawned or written. Two live
+        # bugs this closes:
+        #
+        # - `_complete` calls this for the Caller after reporting back. When
+        #   the Caller belongs to a source this process holds no extension
+        #   for, spawning here would start a thread that raises
+        #   `no_extension` on every single pass, forever -- it never retires,
+        #   and the `drain_threads` row it writes survives a restart and
+        #   re-arms the same doomed thread on every `start()`.
+        # - `code_` Partners deliberately have no adapter in ANY process: a
+        #   Claude Code session receives work through its own built-in
+        #   channel, not through this system, so nothing may ever spawn a
+        #   drain thread for one.
+        source_prefix = self._source_prefix_for(partner_id)
+        if source_prefix not in self.extensions:
+            named_source = source_prefix if source_prefix is not None else "unknown"
+            return responses.nothing_new(
+                f"partner {label}'s source is {named_source!r}; this process holds no "
+                "extension for it."
+            )
         with self._lock:
             existing = self._drain_threads.get(partner_id)
             if existing is not None and existing.is_alive():
@@ -526,36 +579,142 @@ class PollingServer:
             # Caller happens to be pushed to for some other reason.
             self._ensure_thread(released["caller_id"], caller["uuid"])
 
+    # -- supervisor -------------------------------------------------------------
+
+    def scan_once(self) -> int:
+        """Arm a drain thread for every Partner of this process's own sources that has queued work.
+
+        This is the mechanism that lets a message sent by ANY process end up
+        drained by the process that actually owns the target's remote:
+        `send`'s own best-effort arm only fires in the sender's process, and a
+        push notification only fires when the remote itself calls back.
+        Neither covers a target this process didn't just interact with --
+        without this scan, a message queued from elsewhere would sit forever
+        with no thread and nothing to arm one.
+
+        Returns:
+            How many threads were newly armed.
+        """
+        if not self.extensions:
+            # `IN ()` is invalid SQL, not a query that matches zero rows, and
+            # a process holding no extension at all can serve nothing anyway.
+            return 0
+        placeholders = ", ".join("?" for _ in self.extensions)
+        rows = self.db.read(
+            "SELECT DISTINCT p.id AS id, p.uuid AS uuid "
+            "FROM partners p "
+            "JOIN projects pr ON pr.id = p.project_id "
+            "JOIN message_queue q ON q.partner_id = p.id "
+            f"WHERE p.archived_at IS NULL AND pr.source_prefix IN ({placeholders})",
+            tuple(self.extensions),
+        )
+        candidates = {row["id"]: row["uuid"] for row in rows}
+
+        # A queued row is not the only way a Partner can be left unattended.
+        # A same-process `send` DELETES the row as it promotes the task into
+        # the working slot, so a Partner whose remote is mid-turn has an EMPTY
+        # queue and an occupied slot -- and if the arm that should have
+        # followed that send did not happen (it is deliberately best-effort,
+        # and a thread can also die), a queue-only scan would look straight
+        # past a remote that is working with nobody watching it.
+        for partner_id in self.core.slots.occupied():
+            candidates.setdefault(partner_id, str(partner_id))
+
+        armed = 0
+        for partner_id, label in candidates.items():
+            with self._lock:
+                existing = self._drain_threads.get(partner_id)
+                if existing is not None and existing.is_alive():
+                    continue
+            self._ensure_thread(partner_id, label)
+            # Whether a thread was actually spawned is read off the registry,
+            # never off the response text -- and it genuinely has to be asked:
+            # `_ensure_thread` declines outright for a source this process
+            # holds no extension for, and counting that as an arm would report
+            # coverage this process does not have.
+            with self._lock:
+                spawned = self._drain_threads.get(partner_id)
+            if spawned is not None and spawned is not existing:
+                armed += 1
+        return armed
+
+    def _supervisor_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                self.scan_once()
+            except BaseException as exc:  # noqa: BLE001 - keep the daemon alive
+                # One failed scan must not be the last scan: every Partner
+                # this process could have picked up on the next pass would be
+                # left stranded right alongside the one that actually failed.
+                self._record_error(exc)
+            stop_event.wait(self.supervisor_interval)
+
     # -- lifecycle --------------------------------------------------------------
 
     def start(self) -> None:
-        """Resume a drain thread for every Partner still registered in `drain_threads`.
+        """Resume this process's own drain threads and start the supervisor.
 
         Safe to call once at process start-up to pick back up after a restart.
-        A row surviving a restart means that Partner had work in flight;
-        `notify_partner_push` remains the way new Partners get a thread during
-        normal operation.
+        A `drain_threads` row surviving a restart means that Partner had work
+        in flight; `notify_partner_push` remains the way new Partners get a
+        thread during normal operation, and the supervisor thread started
+        here is what picks up work this process was never pushed to at all.
+
+        Only rows for Partners of this process's own sources are resumed. A
+        row for another source is left in place, untouched -- that Partner's
+        OWN process is what owns it, and its own `start()` is what needs to
+        find the row still there; deleting it here would strand exactly the
+        work it exists to protect.
         """
         with self._lock:
             if self._started:
                 return
             self._started = True
-            rows = self.db.read("SELECT partner_id FROM drain_threads", ())
-            for row in rows:
-                partner_id = row["partner_id"]
-                existing = self._drain_threads.get(partner_id)
-                if existing is None or not existing.is_alive():
-                    self._spawn_drain_thread(partner_id)
+            if self.extensions:
+                placeholders = ", ".join("?" for _ in self.extensions)
+                rows = self.db.read(
+                    "SELECT dt.partner_id AS partner_id "
+                    "FROM drain_threads dt "
+                    "JOIN partners p ON p.id = dt.partner_id "
+                    "JOIN projects pr ON pr.id = p.project_id "
+                    f"WHERE pr.source_prefix IN ({placeholders})",
+                    tuple(self.extensions),
+                )
+                for row in rows:
+                    partner_id = row["partner_id"]
+                    existing = self._drain_threads.get(partner_id)
+                    if existing is None or not existing.is_alive():
+                        self._spawn_drain_thread(partner_id)
+
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self._supervisor_loop,
+                args=(stop_event,),
+                name="drain-supervisor",
+                daemon=True,
+            )
+            self._supervisor_stop_event = stop_event
+            self._supervisor_thread = thread
+            thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Signal every drain thread to stop and join them all. Safe to call twice."""
+        """Signal every drain thread and the supervisor to stop, and join them all.
+
+        Safe to call twice, and safe when `start()` was never called.
+        """
         with self._lock:
             events = list(self._stop_flags.values())
             threads = list(self._drain_threads.values())
+            supervisor_stop_event = self._supervisor_stop_event
+            supervisor_thread = self._supervisor_thread
             self._started = False
+            self._supervisor_stop_event = None
+            self._supervisor_thread = None
 
         for event in events:
             event.set()
+        if supervisor_stop_event is not None:
+            supervisor_stop_event.set()
         for thread in threads:
             # `ident` is None until a thread has actually been started, and
             # join() on one raises. _spawn_drain_thread registers the thread
@@ -564,6 +723,12 @@ class PollingServer:
             # safe to call, would then be the thing that crashed.
             if thread.ident is not None:
                 thread.join(timeout=timeout)
+        if supervisor_thread is not None and supervisor_thread.ident is not None:
+            # Same reasoning as the drain threads above: start() creates the
+            # Thread object before calling thread.start() on it, so a start()
+            # that raised partway through would otherwise make this the thing
+            # that crashed instead.
+            supervisor_thread.join(timeout=timeout)
         with self._lock:
             self._drain_threads.clear()
             self._stop_flags.clear()
