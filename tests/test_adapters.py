@@ -1542,18 +1542,9 @@ def test_antigravity_read_remote_result_returns_nothing_when_it_cannot_find_its_
     from the no-recorded-body case, where a whole pane really is the best
     available and is kept.
     """
-    ready = "? for shortcuts\n"
-    busy = "esc to cancel\n"
     banner = "Antigravity CLI 1.1.22\nsome@user\n? for shortcuts\n"
-    seq = [ready, busy, banner, banner, banner]
-    fake_run, _ = _agy_pane_runner(seq)
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
-    ext.deliver_message(
-        partner_id_in_remote="conv-1", behavior="[QUERY]", body="a prompt never echoed",
-    )
 
-    result = ext.read_remote_result(partner_id_in_remote="conv-1")
+    result = _harvest(monkeypatch, banner, "a prompt never echoed")
 
     assert result == "", (
         f"a pane not containing this turn must not be returned as its answer: {result!r}"
@@ -1682,3 +1673,163 @@ def test_antigravity_a_cancelled_turn_does_not_leave_a_stale_started_flag(monkey
     # through on the previous turn's evidence.
     _deliver(ext, monkeypatch, [_READY])
     assert ext.poll_completion(partner_id_in_remote="conv-1") is False
+
+
+# ---------------------------------------------------------------------------
+# The answer begins after the WHOLE echoed prompt
+# ---------------------------------------------------------------------------
+#
+# Live: the Caller received its own prompt read back, with the agent's real
+# answer buried on the last line. `read_remote_result` anchored on the
+# delivered body's FIRST line, so the slice started one line into a prompt that
+# is many lines long. For a [QUERY] that is noise; for a [TRUTHFUL-REPORT]
+# summary it would bury the report in the instructions that asked for it.
+
+
+_LIVE_PROMPT = "\n".join([
+    "[Polling Server]",
+    "",
+    "caller-x sends you a [QUERY]:",
+    "",
+    "Reply with exactly the word PROVEN and nothing else. Do not use tools.",
+    "",
+    "You are worker-y. Your own requester_uuid, for any `send` call you make, is:",
+    "",
+    "  4f9b058a-ee97-47fe-8f03-7c4fec1c96a0",
+    "",
+    "Answering is automatic: whatever you produce in this session is read back "
+    "and delivered to caller-x when this turn finishes.",
+    "",
+    "The call, with your real identity already filled in:",
+    "",
+    '  send(requester_uuid="4f9b058a-ee97-47fe-8f03-7c4fec1c96a0", '
+    'queried_partner_title="caller-x", behavior="[QUERY]", message="...")',
+])
+
+
+def _agy_transcript(transcript: str):
+    """A fake tmux that serves `transcript` to the scrollback read only.
+
+    Keyed on the `-S` flag rather than call order: `deliver_message` makes its
+    own captures (ready, then busy) before `read_remote_result` ever runs, and
+    counting them is how a test ends up asserting against the wrong pane.
+    """
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True):
+        seen.append(cmd)
+        if "capture-pane" in cmd:
+            if "-S" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, returncode=0, stdout=transcript, stderr=""
+                )
+            typed = any("send-keys" in c for c in seen)
+            return subprocess.CompletedProcess(
+                cmd, returncode=0,
+                stdout="esc to cancel" if typed else "? for shortcuts", stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    return fake_run
+
+
+def _harvest(monkeypatch, transcript: str, body: str) -> str:
+    """Deliver `body`, then read the result off `transcript`."""
+    monkeypatch.setattr(subprocess, "run", _agy_transcript(transcript))
+    ext = AntigravityExtension(tmux_path="/usr/bin/tmux")
+    ext.deliver_message(partner_id_in_remote="conv-1", behavior="[QUERY]", body=body)
+    return ext.read_remote_result(partner_id_in_remote="conv-1")
+
+
+def _pane_echoing(prompt: str, answer_lines: list[str], *, wrap_at: int = 78) -> str:
+    """A pane that echoes `prompt` the way agy does -- re-wrapped -- then answers."""
+    out = ["Antigravity CLI 1.1.22", ""]
+    for line in prompt.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            out.append("")
+            continue
+        while len(stripped) > wrap_at:
+            cut = stripped.rfind(" ", 0, wrap_at)
+            cut = cut if cut > 0 else wrap_at
+            out.append("  " + stripped[:cut])
+            stripped = stripped[cut:].lstrip()
+        out.append("  " + stripped)
+    out += [""] + answer_lines + ["", "╰──────────╯", "? for shortcuts"]
+    return "\n".join(out)
+
+
+def test_antigravity_read_remote_result_skips_the_whole_echoed_prompt(monkeypatch):
+    """Only what the agent said, not the instructions it was given."""
+    pane = _pane_echoing(_LIVE_PROMPT, ["PROVEN"], wrap_at=78)
+
+    result = _harvest(monkeypatch, pane, _LIVE_PROMPT)
+
+    assert result == "PROVEN", (
+        f"the caller must receive the answer alone, not its own prompt back: {result!r}"
+    )
+
+
+def test_antigravity_read_remote_result_survives_a_rewrapped_echo(monkeypatch):
+    """agy re-wraps long lines, so a prompt line can appear as several pane lines.
+
+    Matching whole lines exactly would leave the wrapped fragments behind and
+    put them in the answer.
+    """
+    pane = _pane_echoing(_LIVE_PROMPT, ["PROVEN"], wrap_at=40)
+
+    result = _harvest(monkeypatch, pane, _LIVE_PROMPT)
+
+    assert "requester_uuid" not in result, (
+        f"a re-wrapped fragment of the prompt survived into the answer: {result!r}"
+    )
+    assert result == "PROVEN", f"got: {result!r}"
+
+
+def test_antigravity_read_remote_result_keeps_a_multi_line_answer(monkeypatch):
+    """Skipping the echo must not eat the answer's own later lines."""
+    pane = _pane_echoing(_LIVE_PROMPT, ["I measured 41.2ms.", "", "Evidence: bench.json."], wrap_at=78)
+
+    result = _harvest(monkeypatch, pane, _LIVE_PROMPT)
+
+    assert "41.2ms" in result and "bench.json" in result, f"got: {result!r}"
+
+
+def test_antigravity_read_remote_result_keeps_an_answer_that_quotes_the_prompt(monkeypatch):
+    """The skip is bounded to the contiguous echo, not a global filter.
+
+    An agent that legitimately quotes a phrase from its instructions later in
+    its answer must keep it -- otherwise a report discussing what it was asked
+    would have those sentences silently removed.
+    """
+    pane = _pane_echoing(_LIVE_PROMPT, ["PROVEN", "", "For the record, you asked me to use no tools."], wrap_at=78)
+
+    result = _harvest(monkeypatch, pane, _LIVE_PROMPT)
+
+    assert "no tools" in result, (
+        f"an answer quoting its own prompt had that sentence eaten: {result!r}"
+    )
+
+
+def test_antigravity_read_remote_result_handles_a_decorated_echo_header(monkeypatch):
+    """agy decorates the line it echoes, so it contains the header without equalling it.
+
+    Live, the anchor line came back with agy's own prefix around
+    `[Polling Server]`. Matching the anchor as a PREFIX of the body's first
+    line then failed, the walk stopped on the next line, and the Caller
+    received the whole prompt back with the answer buried at the end -- the
+    failure this skipping exists to prevent, reintroduced one line above it.
+    """
+    pane = _pane_echoing(_LIVE_PROMPT, ["PROVEN"])
+    decorated = []
+    for line in pane.splitlines():
+        if "[Polling Server]" in line:
+            decorated.append("> " + line.strip() + "   (relayed)")
+        else:
+            decorated.append(line)
+
+    result = _harvest(monkeypatch, "\n".join(decorated), _LIVE_PROMPT)
+
+    assert result == "PROVEN", (
+        f"a decorated echo header must not stop the skip: {result!r}"
+    )

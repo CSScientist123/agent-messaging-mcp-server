@@ -110,6 +110,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -124,6 +125,16 @@ __all__ = ["AntigravityExtension", "TmuxBinaryMissing"]
 # pane.
 _FOOTER_BUSY_MARKER = "esc to cancel"
 _FOOTER_IDLE_MARKER = "for shortcuts"  # real regex: /\?\s+for shortcuts/i
+
+def _collapse(text: str) -> str:
+    """One-line form of a pane or prompt line, for comparing the two.
+
+    agy re-indents and re-wraps what it echoes, so the same content reaches the
+    pane with different leading spaces and different internal runs of them.
+    Comparing raw lines would find no match at all.
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
 
 # The pane border/prompt-arrow characters agy draws around the chat box. A
 # trailing line made of nothing else is frame, not content -- read_remote_result
@@ -880,6 +891,71 @@ class AntigravityExtension(RemoteExtension):
             return False
         return True
 
+    @staticmethod
+    def _past_echo(lines: list[str], body: str, echo_index: int) -> int:
+        """Index of the first pane line AFTER the whole echoed prompt.
+
+        Finding where the echo *starts* is not enough. A rendered prompt is
+        many lines long, so slicing at `echo_index + 1` returned the rest of
+        our own instructions with the agent's answer buried at the end of them
+        -- observed live, where a Caller received its entire [QUERY] template
+        back with a lone "PROVEN" on the final line. For a [TRUTHFUL-REPORT]
+        the same slice would bury the report inside the request that asked
+        for it.
+
+        The echo is consumed SEQUENTIALLY rather than by membership, and that
+        distinction is the whole reason this is not two lines. agy re-wraps
+        long lines, so a single line of the prompt can arrive as several pane
+        lines and matches no line of the body exactly -- but each fragment is
+        a prefix of what remains of the line being consumed. Testing instead
+        whether a pane line appears *somewhere* in the body would eat the
+        answer whenever the prompt happens to contain it: the live prompt said
+        'Reply with exactly the word PROVEN', and PROVEN was the answer.
+
+        Two ways to stop, and both are load-bearing. Running out of body lines
+        is the ordinary end of a fully-echoed prompt. A line that does not
+        continue the echo stops it too, which bounds the skipping to the
+        contiguous run right after the anchor -- so an answer that legitimately
+        quotes its own instructions later on keeps them, and an echo truncated
+        or reflowed beyond recognition returns slightly too much rather than
+        eating into what the agent said.
+        """
+        body_lines = [_collapse(line) for line in body.splitlines() if line.strip()]
+        if not body_lines:
+            return echo_index + 1
+
+        index = 0
+        remainder = body_lines[0]
+        # The anchor line was FOUND by searching for the body's first line, so
+        # by construction it contains that whole line -- consume it outright.
+        #
+        # Matching it as a prefix instead was wrong, and wrong in a way only a
+        # live pane showed: agy renders the echoed header with its own
+        # decoration around it, so the pane line contains the body's first line
+        # without equalling it. The prefix test then failed, the walk bailed on
+        # the very next line, and the Caller got the entire prompt back with
+        # the answer at the end -- the exact failure this method exists to
+        # prevent, reintroduced one line above it.
+        anchor = _collapse(lines[echo_index])
+        if remainder and remainder in anchor:
+            remainder = ""
+        elif anchor and remainder.startswith(anchor):
+            remainder = remainder[len(anchor):].lstrip()
+
+        for position in range(echo_index + 1, len(lines)):
+            if not remainder:
+                index += 1
+                if index >= len(body_lines):
+                    return position
+                remainder = body_lines[index]
+            line = _collapse(lines[position])
+            if not line:
+                continue
+            if not remainder.startswith(line):
+                return position
+            remainder = remainder[len(line):].lstrip()
+        return len(lines)
+
     def read_remote_result(self, *, partner_id_in_remote: str) -> str:
         """Screen-scrape the pane for whatever agy printed after the last prompt.
 
@@ -945,7 +1021,7 @@ class AntigravityExtension(RemoteExtension):
                 # positive evidence this pane is not the turn being read, so
                 # returning the pane would fabricate an answer. See docstring.
                 return ""
-            kept = lines[echo_index + 1 :]
+            kept = lines[self._past_echo(lines, last_body, echo_index) :]
         while kept:
             candidate = kept[-1]
             lowered = candidate.lower()

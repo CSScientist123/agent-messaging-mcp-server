@@ -63,6 +63,29 @@ LOCK = REPO / ".mutation_running"
 #: (label, file, find, replace, the invariant it breaks)
 MUTANTS: list[tuple[str, str, str, str, str]] = [
     (
+        "delivers-into-an-unready-tui", "adapters/antigravity/adapter.py",
+        "        if not self._await_idle(session):",
+        "        if False and not self._await_idle(session):",
+        "deliver_message types into a session that has not reached an input prompt -- "
+        "into agy's trust dialog, where the message goes nowhere and every check "
+        "afterwards reads as success",
+    ),
+    (
+        "unstarted-turn-called-finished", "adapters/antigravity/adapter.py",
+        "        if not self._saw_busy.get(session) and (",
+        "        if False and not self._saw_busy.get(session) and (",
+        "poll_completion reads an absent busy footer as FINISHED when the turn has "
+        "merely not started, so the caller gets an empty body and the working slot is "
+        "released while the agent is still about to answer",
+    ),
+    (
+        "echo-skipped-by-one-line-only", "adapters/antigravity/adapter.py",
+        "            kept = lines[self._past_echo(lines, last_body, echo_index) :]",
+        "            kept = lines[echo_index + 1 :]",
+        "read_remote_result slices one line into a multi-line prompt, so the caller "
+        "receives its own instructions back with the answer buried at the end",
+    ),
+    (
         "search-has-no-relevance-floor", "messaging_core/core.py",
         "    if len(query) >= _MIN_SUBSTRING_LEN and query in (candidate_title or \"\").lower():\n"
         "        return True\n"
