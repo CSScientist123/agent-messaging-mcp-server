@@ -63,6 +63,55 @@ LOCK = REPO / ".mutation_running"
 #: (label, file, find, replace, the invariant it breaks)
 MUTANTS: list[tuple[str, str, str, str, str]] = [
     (
+        "search-has-no-relevance-floor", "messaging_core/core.py",
+        "    if len(query) >= _MIN_SUBSTRING_LEN and query in (candidate_title or \"\").lower():\n"
+        "        return True\n"
+        "    return score >= _RELEVANCE_FLOOR",
+        "    return True",
+        "search returns the top N candidates whatever they scored, so a query matching "
+        "nothing still hands an agent three confident titles and it addresses one",
+    ),
+    (
+        "search-drops-a-deliberate-substring", "messaging_core/core.py",
+        "    if len(query) >= _MIN_SUBSTRING_LEN and query in (candidate_title or \"\").lower():\n"
+        "        return True\n",
+        "",
+        "an exact substring of a title is judged on its fuzzy ratio alone, so searching "
+        "'worker' for 'research-worker' (0.571) finds nothing",
+    ),
+    (
+        "archiving-tells-nobody", "messaging_core/core.py",
+        '                self._report_lost_work(conn, row["id"])',
+        "                pass",
+        "archiving a partner drops every caller's in-flight work with no notice, so each "
+        "one waits forever for a reply that was already discarded",
+    ),
+    (
+        "delete-does-not-check-work-in-flight", "messaging_core/core.py",
+        '                    "partner_has_work_in_flight",',
+        '                    "not_authorized",',
+        "the refusal that protects in-flight work from an irreversible delete is reported "
+        "as an authorization failure, so the caller fixes the wrong thing",
+    ),
+    (
+        "reverse-handshake-closed", "messaging_core/core.py",
+        "                reverse_row = self.db.read_one(\n"
+        '                    "SELECT id FROM handshakes WHERE from_partner = ? AND to_partner = ?",',
+        "                reverse_row = None and self.db.read_one(\n"
+        '                    "SELECT id FROM handshakes WHERE from_partner = ? AND to_partner = ?",',
+        "a Partner can no longer answer the Caller that handshook it -- the reply "
+        "direction closes and send refuses no_handshake, which is the state that made "
+        "the research dispatch's own instruction to message back impossible to follow",
+    ),
+    (
+        "research-travels-the-reverse-handshake", "messaging_core/core.py",
+        '                        "research_needs_a_forward_handshake",',
+        '                        "no_handshake",',
+        "a worker delegating [RESEARCH] back to its own director is refused under the "
+        "wrong code, so the caller is told to handshake rather than told the direction "
+        "is the problem",
+    ),
+    (
         "notebook-id-never-recovered", "adapters/notebooklm/adapter.py",
         "                notebook_id = self._resolve_project_system_id(partner_id_in_remote)",
         "                notebook_id = None",

@@ -31,6 +31,7 @@ transaction.
 from __future__ import annotations
 
 import collections
+import logging
 import threading
 import time
 from typing import Any
@@ -43,6 +44,11 @@ from messaging_core.labels import INTERRUPT_BEHAVIOR
 from extension.base import RemoteExtension
 
 __all__ = ["PollingServer"]
+
+# No `logging.basicConfig` here or anywhere else in this module -- see
+# `messaging_core.core`'s own logger comment for why a library never touches
+# the root logger.
+logger = logging.getLogger(__name__)
 
 # What a remote is assumed to have produced when it has no way to be read from.
 # Only NotebookLM implements `read_remote_result`; every other remote executes
@@ -227,6 +233,13 @@ class PollingServer:
         source_prefix = self._source_prefix_for(partner_id)
         if source_prefix not in self.extensions:
             named_source = source_prefix if source_prefix is not None else "unknown"
+            # DEBUG, not a WARNING: in a multi-process deployment this is the
+            # expected outcome for a source this process was never meant to
+            # serve, not a sign that anything is wrong.
+            logger.debug(
+                "declining to arm a drain thread for partner %s: source %s is not served here",
+                label, named_source,
+            )
             return responses.nothing_new(
                 f"partner {label}'s source is {named_source!r}; this process holds no "
                 "extension for it."
@@ -433,8 +446,75 @@ class PollingServer:
         return False
 
     def _record_error(self, exc: BaseException) -> None:
-        """Keep a bounded record of what a drain loop swallowed."""
+        """Keep a bounded record of what a drain loop swallowed.
+
+        Logged at WARNING, not swallowed silently alongside the exception
+        itself -- a daemon thread staying alive through a failure it retries
+        past is correct, but a thread failing on every single pass must not
+        be indistinguishable from one with nothing to do. This is the one
+        logging call in this class that matters most for exactly that reason.
+        """
+        logger.warning("drain loop swallowed %s to stay alive: %s", type(exc).__name__, exc)
         self.last_errors.append(exc)
+
+    def diagnostics(self) -> dict:
+        """A plain, JSON-shaped snapshot of the three sinks nothing else reads.
+
+        `last_errors`, `self.core.uncancelled_displacements`, and an
+        extension's own `close_errors` are all write-only otherwise: a drain
+        thread failing on every single pass looks exactly like one with
+        nothing to do, because nothing surfaces what it swallowed. This is
+        the one place that reads all three and hands them back in a shape an
+        operator can actually use, rather than a deque of exception objects
+        or a list of tuples of ints to decode by hand.
+
+        Must never raise -- this is what an operator reaches for once
+        something is ALREADY wrong, so each field below is built
+        independently: a broken one degrades to empty rather than taking the
+        others down with it and leaving the operator with nothing at all.
+        """
+        try:
+            last_errors = [str(exc) for exc in self.last_errors]
+        except BaseException:
+            last_errors = []
+        try:
+            last_error_count = len(self.last_errors)
+        except BaseException:
+            last_error_count = 0
+
+        try:
+            uncancelled_displacements = [
+                {
+                    "partner_id": partner_id,
+                    "displaced_behavior": displaced_behavior,
+                    "arriving_behavior": arriving_behavior,
+                }
+                for partner_id, displaced_behavior, arriving_behavior in (
+                    self.core.uncancelled_displacements
+                )
+            ]
+        except BaseException:
+            uncancelled_displacements = []
+
+        # `close_errors` is an Antigravity implementation detail, not part of
+        # the `RemoteExtension` contract -- most extensions never have it, so
+        # a source is only ever added here when `getattr` actually finds one.
+        extension_errors: dict[str, list[str]] = {}
+        for source_prefix, extension in self.extensions.items():
+            try:
+                close_errors = getattr(extension, "close_errors", None)
+                if close_errors is None:
+                    continue
+                extension_errors[source_prefix] = [str(exc) for exc in close_errors]
+            except BaseException:
+                continue
+
+        return {
+            "last_errors": last_errors,
+            "last_error_count": last_error_count,
+            "uncancelled_displacements": uncancelled_displacements,
+            "extension_errors": extension_errors,
+        }
 
     def _stop_quietly(self, extension: RemoteExtension, remote_id: str, reason: str) -> None:
         """Stop the remote, tolerating a remote that cannot be stopped.

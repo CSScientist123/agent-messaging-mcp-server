@@ -91,6 +91,42 @@ that hurt most: `_HEAD_LABEL_SQL` in `messaging_core/core.py` must read `MIN(c.p
 and `_ADMIT_SQL` must still contain `+ :working`. Both have been left inverted by a killed run,
 and both leave the suite green while the system is wrong.
 
+## What the server can tell you about itself
+
+Two places, and neither of them is the database.
+
+`PollingServer.diagnostics()` returns a plain dict reading the three sinks that used to be
+write-only:
+
+| Key | What it holds |
+|---|---|
+| `last_errors` | Exceptions a drain loop swallowed to keep its daemon thread alive, newest last, bounded at 200 |
+| `last_error_count` | How many that list holds |
+| `uncancelled_displacements` | Displacements where the remote refused, by design, to be cancelled — so two turns really are running against it |
+| `extension_errors` | Per source, an adapter's own `close_errors` where it keeps them |
+
+**`last_errors` is the one to look at first.** A drain thread failing on every single pass
+looks exactly like one with nothing to do — same silence, same absent row — and this is what
+tells them apart. `diagnostics()` never raises; each field degrades to empty on its own rather
+than taking the others down, because it is reached for when something is already wrong.
+
+Logging is the other. `messaging_core` logs an admission and a delivery at INFO; `polling`
+logs every swallowed exception at WARNING and a declined drain thread (a Partner of a source
+this process does not serve) at DEBUG. Nothing configures the root logger — that decision
+belongs to whatever embeds this — so a bare run shows nothing until you ask:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+```
+
+A `Rejected` is never logged at ERROR. It is a rule working correctly, and a log full of
+correct behaviour is a log nobody reads.
+
+`status` reports `waited_ms` on the working task: how long it sat in the queue before it
+started. That number exists only because `enqueued_at` is carried onto the working slot when
+the row is deleted — a promoted row is gone, so nothing else could reconstruct it afterwards.
+
 ## Runbook
 
 Each entry runs symptom, verification, mitigation, diagnosis, resolution, escalation. Stop

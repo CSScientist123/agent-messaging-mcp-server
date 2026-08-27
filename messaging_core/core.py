@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import difflib
+import logging
 import sqlite3
 import uuid as uuid_lib
 from typing import Any
@@ -66,6 +67,12 @@ from messaging_core.db import Database
 from messaging_core.errors import NeedsRemote, Rejected
 from messaging_core.labels import BEHAVIORS, INTERRUPT_BEHAVIOR
 from messaging_core.slots import WorkingSlots
+
+# No `logging.basicConfig` here or anywhere else in this module -- that
+# configures the ROOT logger, and a library that does that has taken a
+# decision away from whoever embeds it. A logger under this module's own
+# name is all a library ever gets to assume.
+logger = logging.getLogger(__name__)
 
 # The four recognized source prefixes. A Partner has no type of its own --
 # see the module docstring and `MessagingCore._partner_type` -- so this
@@ -201,9 +208,89 @@ def _now() -> str:
     return f"{now:%Y-%m-%dT%H:%M:%S}.{now.microsecond // 1000:03d}Z"
 
 
+#: The exact shape `_now()` produces, and the shape SQLite's own
+#: `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` DEFAULTs produce too -- see
+#: `_now()`'s own docstring for why the two are made to match.
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+def _parse_ts(value: str | None) -> _dt.datetime | None:
+    """Parse a timestamp in the one shape this module ever writes.
+
+    Total, deliberately: `None`, an empty string, or a value that simply
+    isn't that shape all come back as `None` rather than raising. This is
+    what lets a wait be computed from two timestamps that are supposed to
+    agree without a malformed or missing one taking down whatever asked for
+    the wait -- `status` is a diagnostic, not the thing that should be
+    breaking.
+    """
+    if not value:
+        return None
+    try:
+        return _dt.datetime.strptime(value, _TS_FORMAT).replace(tzinfo=_dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
 def _score(query: str, candidate: str) -> float:
     """difflib ratio between `query` and `candidate`, case-insensitive."""
     return difflib.SequenceMatcher(None, (query or "").lower(), (candidate or "").lower()).ratio()
+
+
+# The fuzzy half of relevance: below this, a ratio is coincidence, not a
+# candidate. difflib's own `get_close_matches` treats 0.6 as its default
+# "close enough" cutoff, and this is where it earns that trust -- as TYPO
+# tolerance, not as the whole test (see `_is_relevant`). "reserch" against
+# "research-worker" scores 0.636 and needs to survive; that is the shape of
+# match 0.6 is actually good at recognizing.
+_RELEVANCE_FLOOR = 0.6
+
+#: Shortest query `_is_relevant`'s substring rule will accept on its own.
+#: Below this a match is too likely by chance to count as "deliberate" --
+#: a single letter matches nearly everything.
+_MIN_SUBSTRING_LEN = 3
+
+
+def _is_relevant(query_title: str, candidate_title: str, score: float) -> bool:
+    """Whether a candidate clears the bar `search_partner`/`search_project` enforce.
+
+    A fuzzy floor alone cannot do this job. `difflib.ratio` penalises length
+    difference, so a short, deliberate query against a long title scores low
+    no matter how exact the match is: "gemini" against
+    "gemini-orchestrator" scores 0.48, and "orch" against that same title
+    scores 0.35 -- both well under `_RELEVANCE_FLOOR`, and neither a query
+    anybody would call a coincidence.
+
+    Lowering the floor to catch them does not work either, and this is the
+    part that rules out a one-rule design rather than just complicating it:
+    "xylophone" -- a word sharing nothing meaningful with
+    "photosynthesis-study" -- scores 0.345 against it, which is HIGHER than
+    "res" scores against its own exact, intended target, "research-worker"
+    (0.333), and about equal to "orch" against "gemini-orchestrator"
+    (0.348). There is no cutoff that keeps "res" and "orch" while dropping
+    "xylophone": ratio alone does not separate a short, exact prefix from an
+    unrelated word of similar length.
+
+    What does separate them is that "gemini", "orch", and every other short
+    query above is a literal substring of its target, and "xylophone" is a
+    substring of nothing here. So a candidate qualifies if EITHER rule
+    fires:
+
+    1. A literal, case-insensitive substring match at least
+       `_MIN_SUBSTRING_LEN` characters long. A deliberate substring is a
+       deliberate search, not a coincidence, whatever it does to the ratio.
+    2. A fuzzy ratio at or above `_RELEVANCE_FLOOR`, for the near-misses a
+       substring test cannot catch -- a typo, a transposed letter.
+
+    Sorting is untouched by this: candidates are still ranked by `score`
+    alone, descending, so an exact match still outranks a bare substring
+    hit. This only changes which candidates are eligible to be ranked at
+    all.
+    """
+    query = (query_title or "").strip().lower()
+    if len(query) >= _MIN_SUBSTRING_LEN and query in (candidate_title or "").lower():
+        return True
+    return score >= _RELEVANCE_FLOOR
 
 
 def _preview(descr: str, length: int = _DESCR_PREVIEW_LEN) -> str:
@@ -549,6 +636,19 @@ class MessagingCore:
         project_id: int | None = None,
         limit: int = 3,
     ) -> list[dict]:
+        """Fuzzy-match live partners by title against `query_title`, best first.
+
+        A candidate that fails `_is_relevant` is dropped before `limit` is
+        ever applied -- see that function for why a single fuzzy floor
+        cannot tell a short, deliberate query from a coincidence, and why a
+        literal substring match is checked as well as a fuzzy one. A query
+        that matches nothing well returns fewer than `limit` results,
+        possibly none, and an empty list is a normal, correct answer here,
+        not a failure: the alternative is handing back `limit`
+        confident-looking results for a query none of them actually
+        resemble, and an agent then addressing a partner by a title it was
+        never asked for.
+        """
         self._resolve_requester(requester_uuid)
         sql = (
             "SELECT id, title, project_id, descr, orchestrator_type FROM partners "
@@ -577,7 +677,16 @@ class MessagingCore:
             reverse=True,
         )
         result = []
-        for score, item in scored[:limit]:
+        for score, item in scored:
+            # Not a `break` on score: substring qualification is not
+            # monotone in `score` (see `_is_relevant`), so a later, lower-
+            # scoring row can still qualify after an earlier one didn't.
+            # Every candidate has to be checked; only the count already
+            # collected caps how far this goes.
+            if not _is_relevant(query_title, item["title"], score):
+                continue
+            if len(result) >= limit:
+                break
             item = dict(item)
             item["score"] = score
             result.append(item)
@@ -586,6 +695,14 @@ class MessagingCore:
     def search_project(
         self, *, requester_uuid: str, query_title: str, limit: int = 3
     ) -> list[dict]:
+        """Fuzzy-match projects by title against `query_title`, best first.
+
+        Same relevance test as `search_partner`, and the same reasoning: a
+        candidate that fails `_is_relevant` is dropped before `limit` is
+        applied, so an empty list is a normal, correct answer for a query
+        that matches no project well -- not `limit` weak guesses padded out
+        to look like confident ones.
+        """
         self._resolve_requester(requester_uuid)
         rows = self.db.read(
             "SELECT id, title, source_prefix, project_system_id FROM projects", ()
@@ -607,7 +724,16 @@ class MessagingCore:
             reverse=True,
         )
         result = []
-        for score, item in scored[:limit]:
+        for score, item in scored:
+            # Not a `break` on score: substring qualification is not
+            # monotone in `score` (see `_is_relevant`), so a later, lower-
+            # scoring row can still qualify after an earlier one didn't.
+            # Every candidate has to be checked; only the count already
+            # collected caps how far this goes.
+            if not _is_relevant(query_title, item["title"], score):
+                continue
+            if len(result) >= limit:
+                break
             item = dict(item)
             item["score"] = score
             result.append(item)
@@ -996,17 +1122,30 @@ class MessagingCore:
         ]
         queue_depth = sum(r["count"] for r in queued)
         working = self.slots.get(requester["id"])
-        working_task = (
-            None
-            if working is None
-            else {
+        working_task = None
+        if working is not None:
+            # `enqueued_at` and `started_at` are written in the same UTC shape
+            # on purpose (see `_now()`) so this subtraction is possible at
+            # all -- the queue row that held `enqueued_at` is long gone by the
+            # time a task is in the working slot; the slot is the only place
+            # the wait survives to be measured. `_parse_ts` is total, so a
+            # missing or malformed timestamp yields `None` here rather than an
+            # exception in a diagnostic call.
+            enqueued_dt = _parse_ts(working.get("enqueued_at"))
+            started_dt = _parse_ts(working.get("started_at"))
+            waited_ms = (
+                round((started_dt - enqueued_dt).total_seconds() * 1000)
+                if enqueued_dt is not None and started_dt is not None
+                else None
+            )
+            working_task = {
                 "behavior": working["behavior"],
                 "caller_id": working["caller_id"],
                 "resumed": bool(working.get("in_process")),
                 "enqueued_at": working.get("enqueued_at"),
                 "started_at": working.get("started_at"),
+                "waited_ms": waited_ms,
             }
-        )
 
         # An archived partner "never appears in status" -- filter both
         # directions of the handshake join, not just the read/send/handshake
@@ -1789,6 +1928,14 @@ class MessagingCore:
         with lock:
             message_id, depth = self.db.write(_push)
 
+        # Admission is local and is now committed -- worth a record on its
+        # own, before delivery is even attempted: a `NeedsRemote` or
+        # `Rejected` raised by the `advance()` call below leaves this the only
+        # trace that the message was accepted at all.
+        logger.info(
+            "admitted %s for %s (queue depth now %s)", behavior, target["title"], depth
+        )
+
         # Admission is local and is now committed. Delivery never is: it goes
         # through advance(), which is also what the drain thread calls, so
         # there is one implementation of "compare the head against the working
@@ -1981,10 +2128,18 @@ class MessagingCore:
             # it describes rather than in a queue row that no longer exists.
             task["started_at"] = _now()
             self.slots.set(partner_id, task)
+            displaced = None if working is None or holding else working["behavior"]
+            if displaced is None:
+                logger.info("delivered %s to partner %s", task["behavior"], partner_id)
+            else:
+                logger.info(
+                    "delivered %s to partner %s, displacing %s",
+                    task["behavior"], partner_id, displaced,
+                )
             return {
                 "delivered": task["behavior"],
                 "resumed": bool(task["in_process"]),
-                "displaced": None if working is None or holding else working["behavior"],
+                "displaced": displaced,
                 "remote_call_id": remote_call_id,
             }
 
@@ -2237,6 +2392,15 @@ class MessagingCore:
 
         with self.slots.lock_for(to_partner_id):
             message_id, depth, delivered = self.db.write(_push)
+        if not delivered:
+            # The row may still exist (archived) or may be gone outright
+            # (deleted) -- either way the title, if there still is one, is
+            # more useful to whoever reads the log than a bare id.
+            target = self.db.read_one("SELECT title FROM partners WHERE id = ?", (to_partner_id,))
+            logger.info(
+                "could not report back to partner %s: gone or archived",
+                target["title"] if target is not None else to_partner_id,
+            )
         return {
             "message_id": message_id,
             "queue_depth": depth,
