@@ -44,8 +44,14 @@ the Claude Science adapter in this same package solves the analogous gap:
 ``verify_partner_id_in_remote`` IS given both ids, and messaging_core always
 calls it once, when a partner is registered, before any delivery -- so it
 caches the source's notebook id for later calls to consult (see
-``_notebook_id_by_source``). A cache miss raises ``NlmNotebookIdUnknown``
-rather than guessing or silently querying the wrong notebook.
+``_notebook_id_by_source``). A cache miss is not automatically fatal: the
+same mapping also lives in the database (`partners.partner_id_in_remote`
+joined to `projects.project_system_id`), which survives a restart the
+in-memory cache does not, so a miss falls back to whatever
+``resolve_project_system_id`` callable the constructor was given, caching
+whatever it returns for next time. ``NlmNotebookIdUnknown`` is raised only
+when no resolver was supplied, or the resolver itself comes up empty --
+guessing or silently querying the wrong notebook is never the alternative.
 
 Even once the right notebook is found, there is no way for this adapter to
 scope a query to just one of its sources -- the real CLI has no such
@@ -83,6 +89,7 @@ import json
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 
 from extension.base import NonExecutingExtension, RemoteFailure
 
@@ -135,7 +142,13 @@ class NotebookLMExtension(NonExecutingExtension):
 
     source_prefix = "nlm_"
 
-    def __init__(self, *, nlm_path: str | None = None, harvest_wait_seconds: float = 20.0) -> None:
+    def __init__(
+        self,
+        *,
+        nlm_path: str | None = None,
+        harvest_wait_seconds: float = 20.0,
+        resolve_project_system_id: Callable[[str], str | None] | None = None,
+    ) -> None:
         """
         Args:
             nlm_path: Explicit path to the ``nlm`` binary. If omitted, resolved
@@ -146,9 +159,18 @@ class NotebookLMExtension(NonExecutingExtension):
                 a query before returning, to give NotebookLM real time to
                 finish before `read_remote_result` harvests the answer. Tests
                 should pass ``0`` here.
+            resolve_project_system_id: Looks up a source id's notebook id
+                (`project_system_id`) when `_notebook_id_by_source` has no
+                entry for it -- typically backed by the same database row
+                `verify_partner_id_in_remote` would have cached from, had this
+                process been the one to register the partner. `None` (the
+                default) means a cache miss has nowhere else to go, so it
+                raises `NlmNotebookIdUnknown` immediately, same as before this
+                argument existed.
         """
         self._nlm_path_override = nlm_path
         self.harvest_wait_seconds = harvest_wait_seconds
+        self._resolve_project_system_id = resolve_project_system_id
         self._delivery_count = 0
         # partner_id_in_remote (source id) -> project_system_id (notebook
         # id). Populated by verify_partner_id_in_remote; see module docstring.
@@ -168,6 +190,23 @@ class NotebookLMExtension(NonExecutingExtension):
 
     def _require_notebook_id(self, partner_id_in_remote: str) -> str:
         notebook_id = self._notebook_id_by_source.get(partner_id_in_remote)
+        if notebook_id is None and self._resolve_project_system_id is not None:
+            # The in-memory cache is process-local and empty after a restart;
+            # the resolver reaches the database row verify_partner_id_in_remote
+            # would have written here, so a fresh process self-heals instead
+            # of raising on every delivery until it happens to be the one
+            # that registered this partner. The resolver is an injected
+            # callable, not code this adapter controls -- this class is what
+            # promises callers a specific NlmNotebookIdUnknown on an
+            # unresolvable id, and it cannot keep that promise while trusting
+            # an arbitrary callable not to throw something else instead, so a
+            # raising resolver is treated as just another miss.
+            try:
+                notebook_id = self._resolve_project_system_id(partner_id_in_remote)
+            except Exception:
+                notebook_id = None
+            if notebook_id is not None:
+                self._notebook_id_by_source[partner_id_in_remote] = notebook_id
         if notebook_id is None:
             raise NlmNotebookIdUnknown(partner_id_in_remote)
         return notebook_id

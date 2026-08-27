@@ -32,6 +32,7 @@ allowed to surface here unchanged rather than being papered over.
 
 from __future__ import annotations
 
+import functools
 import os
 
 from adapters.registry import build_extension as _build_real_extension
@@ -44,6 +45,41 @@ ENV_DB_PATH = "MESSAGING_MCP_DB"
 ENV_STUB = "MESSAGING_MCP_STUB"
 
 KNOWN_SOURCES: tuple[str, ...] = ("nlm_", "code_", "science_", "gemini_")
+
+# The two sources whose adapters keep a partner_id_in_remote -> project_system_id
+# cache that is empty after a restart (see NotebookLMExtension._notebook_id_by_source
+# and ClaudeScienceExtension._project_id_by_frame) -- these are the only adapter
+# constructors that accept `resolve_project_system_id`.
+_RESOLVABLE_SOURCES = frozenset({"nlm_", "science_"})
+
+_RESOLVE_SQL = """
+    SELECT pr.project_system_id AS psid
+      FROM partners p JOIN projects pr ON pr.id = p.project_id
+     WHERE p.partner_id_in_remote = ? AND pr.source_prefix = ?
+     ORDER BY (p.archived_at IS NULL) DESC, p.id DESC
+     LIMIT 1
+"""
+
+
+def _resolve_project_system_id(db: Database, source_prefix: str, partner_id_in_remote: str) -> str | None:
+    """Look up the project a partner's remote id belongs to, straight from
+    the row `verify_partner_id_in_remote` would already have written on a
+    live Partner (see the two adapters' module docstrings). Filtered on
+    `source_prefix` because `partner_id_in_remote` is only unique WITHIN a
+    project -- an unfiltered lookup could hand back another source's
+    container that happens to reuse the same remote id string. Preferring a
+    live Partner over an archived one carrying the same remote id is what the
+    ORDER BY does.
+
+    Never raises: this backs a cache-miss fallback inside a `RemoteExtension`
+    adapter, and an exception escaping here would turn a recoverable miss
+    into the exact unrecoverable failure this resolver exists to avoid.
+    """
+    try:
+        row = db.read_one(_RESOLVE_SQL, (partner_id_in_remote, source_prefix))
+    except Exception:
+        return None
+    return row["psid"] if row is not None else None
 
 
 def source_prefix_from_env() -> str:
@@ -60,7 +96,7 @@ def source_prefix_from_env() -> str:
     return value
 
 
-def build_extension(source_prefix: str) -> RemoteExtension:
+def build_extension(source_prefix: str, db: Database | None = None) -> RemoteExtension:
     """Return the `RemoteExtension` a live MCP server process wires up.
 
     Delegates to `adapters.registry.build_extension` for every real source --
@@ -73,12 +109,20 @@ def build_extension(source_prefix: str) -> RemoteExtension:
     Left unset -- the default, and what production always does -- this
     always returns the real adapter.
 
-    `"code_"` has no real adapter; `adapters.registry.build_extension` raises
-    `Rejected("no_adapter_for_code", ...)` for it, and that exception is
-    allowed to propagate unchanged.
+    `db` is optional and, when given, is only used for `source_prefix` in
+    `_RESOLVABLE_SOURCES`: those adapters get a `resolve_project_system_id`
+    callable so a `partner_id_in_remote` -> `project_system_id` cache miss --
+    inevitable in a fresh process, since that cache is only ever populated by
+    `verify_partner_id_in_remote` -- can self-heal from the database instead
+    of failing forever (see the two adapters' module docstrings). Omitting
+    `db` leaves those adapters exactly as they were before this argument
+    existed, which is what the stub path and any other existing caller need.
     """
     if os.environ.get(ENV_STUB):
         return StubExtension(source_prefix=source_prefix)
+    if db is not None and source_prefix in _RESOLVABLE_SOURCES:
+        resolver = functools.partial(_resolve_project_system_id, db, source_prefix)
+        return _build_real_extension(source_prefix, resolve_project_system_id=resolver)
     return _build_real_extension(source_prefix)
 
 
@@ -115,7 +159,7 @@ def build_stack_from_env() -> tuple[MessagingCore, "PollingServer"]:
     source_prefix = source_prefix_from_env()
     db_path = os.environ.get(ENV_DB_PATH)
     db = Database(path=db_path) if db_path else Database()
-    extension = build_extension(source_prefix)
+    extension = build_extension(source_prefix, db=db)
 
     core = MessagingCore(db, extension)
     polling = PollingServer(db, extensions={source_prefix: extension}, core=core)

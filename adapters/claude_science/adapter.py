@@ -35,10 +35,15 @@ routes originally guessed here. What changed and why:
   ``messaging_core`` always calls it once, when a partner is registered,
   before any delivery -- so it caches that association for
   ``deliver_message`` to consult later (see
-  ``_project_id_by_frame``). A cache miss (e.g. this extension was
-  reconstructed in a fresh process that never saw that registration) raises
-  ``ClaudeScienceProjectIdUnknown`` rather than sending Claude Science a
-  request it will very likely reject, or guessing a value.
+  ``_project_id_by_frame``). That in-memory cache is process-local and does
+  not survive a restart, but the same association also lives in the
+  database (``partners.partner_id_in_remote`` joined to
+  ``projects.project_system_id``), so a cache miss first falls back to
+  whatever ``resolve_project_system_id`` callable the constructor was given,
+  caching whatever it returns for next time. ``ClaudeScienceProjectIdUnknown``
+  is raised only when no resolver was supplied, or the resolver also comes
+  up empty -- rather than sending Claude Science a request it will very
+  likely reject, or guessing a value.
 
 Two things the earlier, guessed version of this file assumed exist, but do
 not, as far as anything in the ground truth shows:
@@ -104,6 +109,7 @@ import os
 import uuid
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 from extension.base import RemoteExtension, RemoteFailure
 from messaging_core.errors import Rejected
@@ -163,7 +169,13 @@ class ClaudeScienceProjectIdUnknown(RemoteFailure):
 class ClaudeScienceExtension(RemoteExtension):
     source_prefix = "science_"
 
-    def __init__(self, *, base_url: str | None = None, cookie: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        cookie: str | None = None,
+        resolve_project_system_id: Callable[[str], str | None] | None = None,
+    ) -> None:
         """
         Args:
             base_url: Root of the Claude Science API, e.g. ``http://127.0.0.1:8000``.
@@ -171,11 +183,20 @@ class ClaudeScienceExtension(RemoteExtension):
                 ``http://127.0.0.1:8000``.
             cookie: The full ``Cookie`` header value used to authenticate.
                 Defaults to ``$CLAUDE_SCIENCE_COOKIE``, then to an empty string.
+            resolve_project_system_id: Looks up a frame id's project id
+                (`project_system_id`) when `_project_id_by_frame` has no entry
+                for it -- typically backed by the same database row
+                `verify_partner_id_in_remote` would have cached from, had this
+                process been the one to register the partner. `None` (the
+                default) means a cache miss has nowhere else to go, so it
+                raises `ClaudeScienceProjectIdUnknown` immediately, same as
+                before this argument existed.
         """
         resolved_base = base_url or os.environ.get(ENV_BASE_URL) or DEFAULT_BASE_URL
         self.base_url = resolved_base.rstrip("/")
         self.cookie = cookie if cookie is not None else os.environ.get(ENV_COOKIE, "")
         self._csrf_token: str | None = None
+        self._resolve_project_system_id = resolve_project_system_id
         # partner_id_in_remote (frame id) -> project_system_id (project id).
         # Populated by verify_partner_id_in_remote; see module docstring.
         self._project_id_by_frame: dict[str, str] = {}
@@ -284,6 +305,31 @@ class ClaudeScienceExtension(RemoteExtension):
             raise ClaudeScienceHTTPError(method, path, status, body)
         return payload or {}
 
+    def _require_project_id(self, frame_id: str) -> str:
+        """Mirrors NotebookLM's `_require_notebook_id`: the in-memory cache
+        `verify_partner_id_in_remote` wrote to is empty in a fresh process,
+        but the same association also lives in the database, so a miss
+        defers to `_resolve_project_system_id` (when one was given) and
+        caches whatever it returns before raising only if that also comes up
+        empty -- see the module docstring. The resolver is an injected
+        callable, not code this adapter controls -- this class is what
+        promises callers a specific ClaudeScienceProjectIdUnknown on an
+        unresolvable id, and it cannot keep that promise while trusting an
+        arbitrary callable not to throw something else instead, so a raising
+        resolver is treated as just another miss.
+        """
+        project_id = self._project_id_by_frame.get(frame_id)
+        if project_id is None and self._resolve_project_system_id is not None:
+            try:
+                project_id = self._resolve_project_system_id(frame_id)
+            except Exception:
+                project_id = None
+            if project_id is not None:
+                self._project_id_by_frame[frame_id] = project_id
+        if project_id is None:
+            raise ClaudeScienceProjectIdUnknown(frame_id)
+        return project_id
+
     def _submit_into_frame(self, frame_id: str, text: str) -> tuple[str, dict]:
         """The real `POST /api/request` call the Claude Science UI uses to
         send `text` into `frame_id`, whether it is cancelled or not
@@ -292,9 +338,7 @@ class ClaudeScienceExtension(RemoteExtension):
         shows they are, for a real Claude Science instance, the same
         operation. Returns (intent_id, response_payload).
         """
-        project_id = self._project_id_by_frame.get(frame_id)
-        if project_id is None:
-            raise ClaudeScienceProjectIdUnknown(frame_id)
+        project_id = self._require_project_id(frame_id)
         intent_id = str(uuid.uuid4())
         body = {
             "target_agent": "OPERON",
