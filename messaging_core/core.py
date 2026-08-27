@@ -108,7 +108,8 @@ INSERT INTO message_queue (partner_id, caller_id, behavior, body, message_id)
 SELECT :pid, :cid, :behavior, :body, :mid
  WHERE (SELECT max_outstanding FROM label_caps WHERE behavior = :behavior) IS NULL
     OR (SELECT COUNT(*) FROM message_queue
-         WHERE partner_id = :pid AND caller_id = :cid AND behavior = :behavior) + :working
+         WHERE partner_id = :pid AND caller_id = :cid
+           AND COALESCE(origin_behavior, behavior) = :behavior) + :working
      < (SELECT max_outstanding FROM label_caps WHERE behavior = :behavior)
 """
 
@@ -146,6 +147,7 @@ _HEAD_ROW_SQL = """
 SELECT q.id AS id, q.partner_id AS partner_id, q.caller_id AS caller_id,
        q.behavior AS behavior, q.body AS body, q.in_process AS in_process,
        q.message_id AS message_id, q.enqueued_at AS enqueued_at,
+       q.summary_phase AS summary_phase, q.origin_behavior AS origin_behavior,
        c.priority AS priority
   FROM message_queue q JOIN label_caps c ON c.behavior = q.behavior
  WHERE q.partner_id = :pid AND q.behavior = :behavior
@@ -1724,14 +1726,24 @@ class MessagingCore:
                 if working is not None and not holding:
                     conn.execute(
                         "INSERT INTO message_queue "
-                        "(partner_id, caller_id, behavior, body, in_process, message_id) "
-                        "VALUES (?, ?, ?, ?, 1, ?)",
+                        "(partner_id, caller_id, behavior, body, in_process, message_id, "
+                        "summary_phase, origin_behavior) "
+                        "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
                         (
                             partner_id,
                             working["caller_id"],
                             working["behavior"],
                             working["body"],
                             working["message_id"],
+                            # Carried through so a displaced summary phase is
+                            # still recognisable as one on resume -- otherwise
+                            # it comes back as an ordinary [TRUTHFUL-REPORT]
+                            # with no marker saying its Caller is still owed
+                            # the report (see _render) and no marker saying it
+                            # still counts against the [RESEARCH] cap (see
+                            # WorkingSlots.outstanding / _ADMIT_SQL).
+                            int(bool(working.get("summary_phase"))),
+                            working.get("origin_behavior"),
                         ),
                     )
 
@@ -1774,14 +1786,20 @@ class MessagingCore:
         def _put(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO message_queue "
-                "(partner_id, caller_id, behavior, body, in_process, message_id) "
-                "VALUES (?, ?, ?, ?, 1, ?)",
+                "(partner_id, caller_id, behavior, body, in_process, message_id, "
+                "summary_phase, origin_behavior) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
                 (
                     task["partner_id"],
                     task["caller_id"],
                     task["behavior"],
                     task["body"],
                     task["message_id"],
+                    # Same reason as the _swap insert above: a failed delivery
+                    # must not be the second, quieter way a summary phase loses
+                    # its markers and comes back as an ordinary report.
+                    int(bool(task.get("summary_phase"))),
+                    task.get("origin_behavior"),
                 ),
             )
 
@@ -1809,6 +1827,18 @@ class MessagingCore:
         # one thing it was for removed.
         if task["behavior"] == INTERRUPT_BEHAVIOR:
             return templates.idle_interruption(caller_title=caller_title, reason=task["body"])
+        # Checked BEFORE the general in_process branch below, for the same
+        # reason [IDLE] is: a displaced-and-resumed summary phase is not an
+        # ordinary paused task, and the general branch renders it wrong. Its
+        # row's body is deliberately the ORIGINAL request (see
+        # begin_summary_phase), not the instruction to summarize -- so
+        # falling through to resume_displaced would hand back "resume your
+        # previous [TRUTHFUL-REPORT]", which names nothing the agent is
+        # holding, instead of asking for the summary again.
+        if task.get("summary_phase"):
+            return templates.truthful_report_request(
+                caller_title=caller_title, original_request=task["body"]
+            )
         if task["in_process"]:
             return templates.resume_displaced(behavior=task["behavior"])
         if task["behavior"] == "[RESEARCH]":
@@ -1819,12 +1849,13 @@ class MessagingCore:
                 read_paths=paths["read"],
                 write_paths=paths["write"],
             )
-        # A [TRUTHFUL-REPORT] in a queue is always a summary being DELIVERED,
-        # never a request for one. The request is not a queued message at all
-        # -- it is the second phase of the [RESEARCH] task that is already in
-        # the working slot, and `begin_summary_phase` renders it. That is what
-        # keeps one label from meaning two opposite things depending on which
-        # end of the exchange is reading it.
+        # A [TRUTHFUL-REPORT] reaching this point is always a summary being
+        # DELIVERED, never a request for one -- a request still in progress
+        # was already caught by the summary_phase branch above, whether it is
+        # fresh (rendered by begin_summary_phase, never queued) or a displaced
+        # copy resuming (queued, but marked). That is what keeps one label
+        # from meaning two opposite things depending on which end of the
+        # exchange is reading it.
         return templates.relay(
             caller_title=caller_title, behavior=task["behavior"], body=task["body"]
         )
@@ -1886,6 +1917,13 @@ class MessagingCore:
             # a directly-sent report replies with another report, and the pair
             # never stops.
             task["summary_phase"] = True
+            # The label being run is now [TRUTHFUL-REPORT], but the cap this
+            # task was admitted under was [RESEARCH]'s -- it is still the same
+            # delegated work, just under a second instruction. Recording the
+            # origin is what lets a displaced-and-resumed copy keep counting
+            # against that cap instead of escaping it for as long as the
+            # summary takes (see WorkingSlots.outstanding / _ADMIT_SQL).
+            task["origin_behavior"] = "[RESEARCH]"
             # The body stays the ORIGINAL request. If this phase is later
             # displaced and resumed, the row that goes back into the queue
             # carries the request the summary is supposed to be about --

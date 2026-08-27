@@ -797,9 +797,13 @@ One priority queue per Partner. A row is a QUEUED poll task.
 | `body` | `TEXT` | `NOT NULL` |
 | `in_process` | `INTEGER` | `NOT NULL DEFAULT 0`, `CHECK IN (0,1)` — 1 means paused |
 | `message_id` | `INTEGER` | FK → `messages(id) ON DELETE SET NULL`; set only for stored labels |
+| `summary_phase` | `INTEGER` | `NOT NULL DEFAULT 0`, `CHECK IN (0,1)` — 1 means this row is a displaced `[RESEARCH]` summary phase |
+| `origin_behavior` | `TEXT` | FK → `label_caps(behavior)`; the label the task was admitted under, when it differs from `behavior` |
 | `enqueued_at` | `TEXT` | `NOT NULL DEFAULT` current UTC timestamp |
 
 `CHECK (caller_id <> partner_id)`. Index: `message_queue_order (partner_id, behavior, in_process DESC, enqueued_at)`.
+
+`summary_phase` and `origin_behavior` exist because a `[RESEARCH]` task changes label mid-flight without leaving the working slot: `begin_summary_phase` relabels it `[TRUTHFUL-REPORT]` so that nothing below `[IDLE]` can interrupt the summary. If it *is* interrupted, the row that goes back into the queue would otherwise be indistinguishable from a `[TRUTHFUL-REPORT]` an agent sent directly — which owes nothing back, because it already **is** the report. The two columns carry the distinction across the interruption: `summary_phase` says the Caller is still owed a report, and `origin_behavior` says the work still counts against that Caller's `[RESEARCH]` cap.
 
 The task actually being worked — the working slot — is deliberately **not** in this table. It is held in memory by the Polling Server: it is process state, it changes on every swap, and persisting it would invite a reader to believe it survives a restart when it does not.
 

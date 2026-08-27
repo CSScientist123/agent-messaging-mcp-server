@@ -41,9 +41,13 @@ class WorkingSlots:
 
     A slot holds the same shape of dict a queue row is popped into:
     ``{"id", "partner_id", "caller_id", "behavior", "body", "in_process",
-    "message_id", "enqueued_at"}``. ``id`` is the `message_queue` row id the
-    task came from; the row itself is gone, deleted when the task was
-    promoted, so the id is a provenance breadcrumb rather than a live key.
+    "message_id", "enqueued_at", "summary_phase", "origin_behavior"}``. ``id``
+    is the `message_queue` row id the task came from; the row itself is gone,
+    deleted when the task was promoted, so the id is a provenance breadcrumb
+    rather than a live key. ``summary_phase`` and ``origin_behavior`` are
+    usually absent -- `begin_summary_phase` is what adds them, in place, to
+    mark a `[RESEARCH]` task that has been relabelled `[TRUTHFUL-REPORT]` and
+    still owes its Caller the report.
     """
 
     def __init__(self) -> None:
@@ -81,18 +85,30 @@ class WorkingSlots:
             return list(self._slots)
 
     def outstanding(self, partner_id: int, caller_id: int, behavior: str) -> int:
-        """1 if the working slot holds this caller's task with this label, else 0.
+        """1 if the working slot holds this caller's task counting against this label, else 0.
 
         This is the term a cap check adds to its count of queued rows. A cap
         limits work in flight, not work waiting: a caller allowed three
         `[QUERY]` tasks against a partner has three including the one the
         partner is answering right now, otherwise the fourth arrives the
         moment the third starts and the cap means one more than it says.
+
+        A match on the current `behavior` OR a recorded `origin_behavior` --
+        not `behavior` alone -- because `begin_summary_phase` relabels a
+        `[RESEARCH]` task to `[TRUTHFUL-REPORT]` in place, in this same slot,
+        without the task ever leaving it. If the label check followed
+        `behavior` only, the relabelling itself would silently free a
+        `[RESEARCH]` cap slot for as long as the summary took to write, and
+        the same Caller could admit one more `[RESEARCH]` than the cap
+        allows. It is still the same delegated work under a second
+        instruction, so it must still count.
         """
         with self._guard:
             task = self._slots.get(partner_id)
             if task is None:
                 return 0
-            if task["caller_id"] == caller_id and task["behavior"] == behavior:
+            if task["caller_id"] != caller_id:
+                return 0
+            if task["behavior"] == behavior or task.get("origin_behavior") == behavior:
                 return 1
             return 0

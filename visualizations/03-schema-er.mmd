@@ -88,6 +88,8 @@ erDiagram
         string body
         int in_process "1 = paused; tie-break WITHIN a label"
         int message_id FK "set only for stored labels"
+        int summary_phase "1 = a displaced [RESEARCH] summary; still owes its Caller"
+        string origin_behavior FK "label admitted under, when it differs from behavior"
         string enqueued_at "start time is on the in-memory slot, not here"
     }
 

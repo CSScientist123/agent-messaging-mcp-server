@@ -277,6 +277,17 @@ CREATE TABLE message_queue (
     body         TEXT NOT NULL,
     in_process   INTEGER NOT NULL DEFAULT 0 CHECK (in_process IN (0, 1)),
     message_id   INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    -- Set when this row is a displaced [RESEARCH] summary phase: the task was
+    -- relabelled [TRUTHFUL-REPORT] by begin_summary_phase and still owes its
+    -- Caller the report. The label alone cannot say it -- a [TRUTHFUL-REPORT]
+    -- can equally be one an agent sent directly, and that one owes nothing
+    -- back, because it already IS the report.
+    summary_phase   INTEGER NOT NULL DEFAULT 0 CHECK (summary_phase IN (0, 1)),
+    -- The label this task was admitted under, when it differs from `behavior`.
+    -- A summary phase runs at [TRUTHFUL-REPORT]'s priority but still counts
+    -- against its Caller's [RESEARCH] cap, because it is the same delegated
+    -- work under a second instruction.
+    origin_behavior TEXT REFERENCES label_caps(behavior),
     -- When the message entered the queue. The other half of the latency measurement --
     -- when it actually started running -- is deliberately NOT a column here: a promoted row
     -- is DELETED, so a `dequeued_at` would only ever be written to a row about to
