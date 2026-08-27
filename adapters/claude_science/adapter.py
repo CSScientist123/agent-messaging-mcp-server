@@ -105,7 +105,7 @@ import uuid
 import urllib.error
 import urllib.request
 
-from extension.base import RemoteExtension
+from extension.base import RemoteExtension, RemoteFailure
 from messaging_core.errors import Rejected
 
 __all__ = [
@@ -128,7 +128,7 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _BUSY_STATUSES = frozenset({"running", "queued", "in_progress", "streaming", "processing"})
 
 
-class ClaudeScienceHTTPError(RuntimeError):
+class ClaudeScienceHTTPError(RemoteFailure):
     """An HTTP call to the Claude Science API returned something other than
     the status codes this adapter knows how to interpret for that call."""
 
@@ -143,7 +143,7 @@ class ClaudeScienceHTTPError(RuntimeError):
         super().__init__(message)
 
 
-class ClaudeScienceProjectIdUnknown(RuntimeError):
+class ClaudeScienceProjectIdUnknown(RemoteFailure):
     """`deliver_message` needs `partner_id_in_remote`'s
     project id to build a real `POST /api/request` body, but no
     `verify_partner_id_in_remote` call has ever cached one for it on this

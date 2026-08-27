@@ -114,7 +114,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from extension.base import RemoteExtension
+from extension.base import RemoteExtension, RemoteFailure
 from messaging_core.errors import Rejected
 
 __all__ = ["AntigravityExtension", "TmuxBinaryMissing"]
@@ -173,7 +173,7 @@ _PERMISSION_VIEW_MARKERS = ("allowlist (", "a add rule", "switch view")
 _ADD_RULE_MARKERS = ("add rule —", "enter a permission rule", "format: action(target)")
 
 
-class TmuxBinaryMissing(RuntimeError):
+class TmuxBinaryMissing(RemoteFailure):
     """The ``tmux`` binary is not on PATH (and no explicit path was given)."""
 
     def __init__(self, detail: str = "") -> None:

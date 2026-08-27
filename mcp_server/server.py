@@ -16,12 +16,17 @@ House rules every tool below follows -- see the module-level docstrings of
 3. A `NeedsRemote` is reported honestly: local work already happened (or
    didn't -- see `_needs_remote_body`) and a remote step could not be taken.
    It is never dressed up as success.
-4. `send` is fire-and-forget: it returns a receipt, never a reply, and its
+4. A `RemoteFailure` -- an adapter's own exception for a remote that exists
+   and was supposed to work but didn't (a missing binary, a refused
+   connection, an HTTP error) -- is caught here too, after the two above,
+   and turned into `_remote_failed_body(...)`. It reads as a failed attempt,
+   never as a stack trace and never as a rule-based rejection.
+5. `send` is fire-and-forget: it returns a receipt, never a reply, and its
    body always ends with `responses.ANTI_POLL`.
-5. Tool docstrings are the whole tool description an agent sees at listing
+6. Tool docstrings are the whole tool description an agent sees at listing
    time -- what the tool does, what it returns, what to call next, and (in
    an `Args:` section) what each parameter means. No changelog, no rationale.
-6. Every tool identifies its caller by `requester_uuid` alone; nothing here
+7. Every tool identifies its caller by `requester_uuid` alone; nothing here
    ever takes a requester title.
 """
 
@@ -30,6 +35,7 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
+from extension.base import RemoteFailure
 from messaging_core import responses
 from messaging_core.core import MessagingCore
 from messaging_core.errors import NeedsRemote, Rejected
@@ -62,6 +68,23 @@ def _needs_remote_body(exc: NeedsRemote) -> str:
 
 def _rejected_body(exc: Rejected) -> str:
     return responses.rejected(exc.message, next_call=exc.next_call)
+
+
+def _remote_failed_body(exc: RemoteFailure) -> str:
+    """Render a `RemoteFailure` as a failed attempt, never as a rule-based rejection.
+
+    `_rejected_body` says a rule said no; this says the remote itself did not
+    cooperate -- a missing binary, a refused connection, an HTTP error -- and
+    the wording is kept deliberately apart from `responses.rejected`'s own
+    ("nothing was changed") so an agent reading it goes looking for what
+    broke on the remote side, not for a permission or a grant it is missing.
+    """
+    return (
+        f"[remote failed] {exc}\n\n"
+        "The remote did not work the way this adapter needs it to -- this was not "
+        "a rule refusing the request. Fix whatever is named above (a missing "
+        "binary, a refused connection, an HTTP error) and send the work again."
+    )
 
 
 def _render_partner_hits(hits: list[dict]) -> str:
@@ -197,6 +220,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(
             f"Project {title!r} created (id={project_id}, source_prefix={source_prefix!r}).",
             next_call="Call create_partner to add a partner to this project.",
@@ -245,6 +270,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(
             f"Partner {result['title']!r} created (id={result['id']}, "
             f"project_id={result['project_id']}). Its identity credential is "
@@ -278,6 +305,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(_render_partner_hits(hits))
 
     @mcp.tool()
@@ -295,6 +324,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(_render_project_hits(hits))
 
     @mcp.tool()
@@ -315,6 +346,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(f"Deleted partner {result['title']!r} (id={result['deleted_id']}).")
 
     @mcp.tool()
@@ -331,6 +364,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(
             f"Deleted project {result['title']!r} (id={result['deleted_id']}) and "
             f"{result['partners_deleted']} partner(s) with it."
@@ -361,6 +396,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(
             f"Partner {result['partner_id']} now holds {result['orchestrator_type']!r} "
             f"in project {result['project_id']}."
@@ -389,6 +426,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(
             f"Granted a gemini budget of {result['budget_count']} to partner "
             f"{result['grantee_id']} (granted by partner {result['granted_by_id']})."
@@ -413,6 +452,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         body = f"Archived {result['archived_count']} of {len(titles)} requested: {result['archived']}."
         if result["skipped"]:
             skipped = ", ".join(f"{s['title']!r} ({s['reason']})" for s in result["skipped"])
@@ -434,6 +475,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(_render_status(result))
 
     @mcp.tool()
@@ -459,6 +502,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(
             f"Handshake established from partner {result['from_partner_id']} to "
             f"{result['to_partner_title']!r} (id={result['to_partner_id']}, "
@@ -507,9 +552,43 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
                 behavior=behavior,
             )
         except Rejected as exc:
+            # `MessagingCore.send` commits the queue row and only THEN calls
+            # `advance()`, which is what can raise this. `already_committed`
+            # (set on the exception by the code that raised it past that
+            # commit) is what tells the two failures apart: read
+            # defensively, since that marking may or may not have landed in
+            # this checkout yet. When it's set, the message is queued
+            # despite the rejection -- saying "nothing changed" here would be
+            # false, and an agent that believed it would send the same
+            # message again and double it.
+            if getattr(exc, "already_committed", False):
+                return responses.rejected(
+                    exc.message,
+                    noop=(
+                        "The message IS queued -- advance() failed after the queue "
+                        "row was already committed. Do not send it again; that would "
+                        "double-send it."
+                    ),
+                    next_call=exc.next_call,
+                )
             return _rejected_body(exc)
         except NeedsRemote as exc:
+            # Same commit-then-advance gap as above, on the other exception
+            # `advance()` can raise. `_needs_remote_body` renders `exc.reason`
+            # verbatim and that text was written for the ordinary case, so
+            # the committed case is handled here instead of in the shared
+            # helper.
+            if getattr(exc, "already_committed", False):
+                return (
+                    f"[needs remote] {exc.reason}\n\n"
+                    f"The message IS queued -- advance() could not finish without a "
+                    f"remote extension providing {exc.capability!r}, but the queue row "
+                    f"was already committed before that step. Do not send it again; "
+                    f"that would double-send it."
+                )
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         if polling is not None:
             try:
                 polling.ensure_partner_thread(partner_id=result["partner_id"])
@@ -552,6 +631,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(_render_read(result))
 
     @mcp.tool()
@@ -582,6 +663,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         displaced = result["displaced"]
         what = f"Its {displaced} is paused and will resume." if displaced else "It was idle."
         return responses.ok(
@@ -613,6 +696,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         if result["already_linked"]:
             return responses.nothing_new(
                 f"Projects {result['project_a']} and {result['project_b']} were already linked."
@@ -651,6 +736,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         return responses.ok(_render_permissions(result))
 
     @mcp.tool()
@@ -687,6 +774,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         granted = ", ".join(result["granted"]) or "(nothing new)"
         return responses.ok(
             f"Granted to {partner_title!r}: {granted}. "
@@ -720,6 +809,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _rejected_body(exc)
         except NeedsRemote as exc:
             return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
         revoked = ", ".join(result["revoked"]) or "(nothing was held)"
         return responses.ok(
             f"Revoked from {partner_title!r}: {revoked}. It now allows "
@@ -750,6 +841,8 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
                 return _rejected_body(exc)
             except NeedsRemote as exc:
                 return _needs_remote_body(exc)
+            except RemoteFailure as exc:
+                return _remote_failed_body(exc)
 
     return mcp
 

@@ -84,12 +84,12 @@ import shutil
 import subprocess
 import time
 
-from extension.base import NonExecutingExtension
+from extension.base import NonExecutingExtension, RemoteFailure
 
 __all__ = ["NotebookLMExtension", "NlmBinaryMissing", "NlmNotebookIdUnknown"]
 
 
-class NlmBinaryMissing(RuntimeError):
+class NlmBinaryMissing(RemoteFailure):
     """The ``nlm`` CLI is not on PATH (and no explicit path was given)."""
 
     def __init__(self, detail: str = "") -> None:
@@ -103,7 +103,7 @@ class NlmBinaryMissing(RuntimeError):
         super().__init__(message)
 
 
-class NlmNotebookIdUnknown(RuntimeError):
+class NlmNotebookIdUnknown(RemoteFailure):
     """`deliver_message`/`read_remote_result` need to know which notebook
     `partner_id_in_remote` (a source id) belongs to, but no
     `verify_partner_id_in_remote` call has ever cached one for it on this

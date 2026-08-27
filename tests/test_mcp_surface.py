@@ -32,6 +32,7 @@ import pytest
 
 from extension.base import StubExtension
 from mcp.types import ContentBlock
+from extension.base import RemoteFailure
 from mcp_server.server import build_server
 from messaging_core.core import MessagingCore
 from messaging_core.db import Database
@@ -319,6 +320,117 @@ def test_every_tool_turns_rejected_and_needs_remote_into_a_response_body(monkeyp
         assert not body.startswith("[ok]"), f"{tool.name}: NeedsRemote was read as success: {body!r}"
         assert "[rejected]" not in body, f"{tool.name}: NeedsRemote was read as a rejection: {body!r}"
         assert repr(tool.name) in body, f"{tool.name}: needs-remote body does not name the capability: {body!r}"
+
+
+def test_every_tool_turns_a_remote_failure_into_a_response_body(monkeypatch, db):
+    """An adapter's own exception must not reach an agent as a traceback.
+
+    Every adapter raises `RuntimeError` subclasses of its own -- a missing
+    binary, a refused connection, an HTTP error. None of them is a `Rejected`
+    or a `NeedsRemote`, so before `RemoteFailure` existed each one escaped
+    every tool wrapper here as a raw Python stack trace, against this
+    module's own rule that a failure is never one.
+
+    Discovered live from `list_tools` for the same reason as the test above:
+    a hard-coded list would silently stop covering a tool added later.
+    """
+    core2 = MessagingCore(db, ext("science_"))
+    polling = PollingServer(db, extensions={})
+    srv = build_server(name="messaging-test", core=core2, polling=polling)
+
+    tools = list_tools(srv)
+    assert tools, "no tools registered; nothing to check"
+
+    for tool in tools:
+        args = _synthetic_args(tool)
+        owner = polling if tool.name == "notify_partner_push" else core2
+        monkeypatch.setattr(
+            owner, tool.name, _raise(RemoteFailure(f"{tool.name}: tmux is not installed"))
+        )
+        body = call(srv, tool.name, args)
+        assert body.startswith("[remote failed]"), (
+            f"{tool.name}: a RemoteFailure leaked out as {body!r}"
+        )
+        assert "tmux is not installed" in body, (
+            f"{tool.name}: the body must name what actually broke: {body!r}"
+        )
+        assert NOTHING_CHANGED not in body, (
+            f"{tool.name}: a transport failure is not a rule-based rejection and must not "
+            f"borrow its wording: {body!r}"
+        )
+        assert "Traceback" not in body
+
+
+def test_an_adapter_error_really_is_a_remote_failure():
+    """The renderer above is only reachable if the adapters actually inherit it.
+
+    Checked on the concrete classes rather than trusting the base: each was
+    a plain RuntimeError, and re-parenting is what routes it to the handler.
+    """
+    from adapters.antigravity.adapter import TmuxBinaryMissing
+    from adapters.claude_science.adapter import (
+        ClaudeScienceHTTPError,
+        ClaudeScienceProjectIdUnknown,
+    )
+    from adapters.notebooklm.adapter import NlmBinaryMissing
+
+    for cls in (TmuxBinaryMissing, ClaudeScienceHTTPError,
+                ClaudeScienceProjectIdUnknown, NlmBinaryMissing):
+        assert issubclass(cls, RemoteFailure), (
+            f"{cls.__name__} still escapes every tool wrapper as a raw traceback"
+        )
+        assert issubclass(cls, RuntimeError), (
+            f"{cls.__name__} must stay a RuntimeError so existing handlers are unaffected"
+        )
+
+
+# ---------------------------------------------------------------------------
+# send never claims nothing happened once the message is committed
+# ---------------------------------------------------------------------------
+
+
+def test_send_does_not_say_nothing_changed_when_the_message_is_queued(monkeypatch, db):
+    """`send` commits the queue row and THEN calls `advance`, which can fail.
+
+    Rendering that failure with "Nothing was changed." tells the agent to
+    retry -- which double-sends and burns its `[QUERY]` cap on work the
+    system already accepted.
+    """
+    core2 = MessagingCore(db, ext("science_"))
+    srv = build_server(name="messaging-test", core=core2)
+
+    committed = Rejected("synthetic", "the remote refused the swap")
+    committed.already_committed = True
+    monkeypatch.setattr(core2, "send", _raise(committed))
+
+    body = call(srv, "send", {
+        "requester_uuid": "u-1", "queried_partner_title": "bob",
+        "message": "hi", "behavior": "[QUERY]",
+    })
+
+    assert NOTHING_CHANGED not in body, (
+        f"the message IS queued; saying nothing changed invites a double-send: {body!r}"
+    )
+    assert "queue" in body.lower(), (
+        f"the body must say the message is queued, so the agent does not resend: {body!r}"
+    )
+
+
+def test_send_still_says_nothing_changed_when_nothing_was_committed(monkeypatch, db):
+    """The ordinary refusal is unchanged -- a cap or a missing handshake really
+    did leave the queue untouched, and an agent must be free to fix and retry."""
+    core2 = MessagingCore(db, ext("science_"))
+    srv = build_server(name="messaging-test", core=core2)
+
+    monkeypatch.setattr(core2, "send", _raise(Rejected("no_handshake", "no handshake exists")))
+
+    body = call(srv, "send", {
+        "requester_uuid": "u-1", "queried_partner_title": "bob",
+        "message": "hi", "behavior": "[QUERY]",
+    })
+
+    assert body.startswith("[rejected]")
+    assert NOTHING_CHANGED in body, f"a genuine refusal must still say so: {body!r}"
 
 
 # ---------------------------------------------------------------------------

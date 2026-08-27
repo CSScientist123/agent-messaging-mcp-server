@@ -20,7 +20,21 @@ from abc import ABC, abstractmethod
 
 from messaging_core.errors import NeedsRemote, Rejected
 
-__all__ = ["RemoteExtension", "NonExecutingExtension", "StubExtension"]
+__all__ = ["RemoteExtension", "NonExecutingExtension", "StubExtension", "RemoteFailure"]
+
+
+class RemoteFailure(RuntimeError):
+    """A remote could not be reached or refused at the transport level.
+
+    Distinct from the other two ways an operation against a remote doesn't
+    simply succeed: a `Rejected` is a rule saying no -- something this system
+    itself refuses regardless of the remote's own state. A `NeedsRemote` is a
+    capability this package does not have -- there is nothing wrong, the
+    extension just was never taught how to do that. A `RemoteFailure` is
+    neither: the remote exists and is supposed to work, and did not -- a
+    missing binary, a connection refused, an HTTP error. Concrete adapters
+    raise their own subclasses of this for exactly that case.
+    """
 
 
 class RemoteExtension(ABC):
