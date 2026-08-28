@@ -173,9 +173,10 @@ def test_research_still_cannot_travel_upward_across_layers(db, core):
 
 def test_a_partner_can_still_answer_a_caller_that_outranks_it(db, core):
     """The whole point: everything that is not delegation still travels back."""
-    caller, worker = make_pair(core)
-
+    # A fresh pair per label. Two of these four are blocking: sending one stops
+    # the worker until it is answered, so a single worker cannot send all four.
     for behavior in ("[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]", "[QUERY]", "[ERROR]"):
+        caller, worker = make_pair(core)
         result = core.send(
             requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
             message="x", behavior=behavior,

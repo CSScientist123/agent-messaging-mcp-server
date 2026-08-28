@@ -23,7 +23,7 @@ flowchart TB
         direction LR
         CP["create_project\n-> verify_project_system_id"]
         CPART["create_partner\n-> verify_partner_id_in_remote"]
-        SEND["send / interrupt_partner\n-> advance -> deliver_message"]
+        SEND["send\n-> advance -> deliver_message\n(a blocking label also stops the SENDER)"]
         ADV["advance\n-> stop_remote_execution\n(only when displacing)"]
         GETP["get_permissions"]
         ADDP["add_permissions"]

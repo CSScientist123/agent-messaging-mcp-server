@@ -34,6 +34,11 @@ from tests.test_polling_working_slot import make_pair
 
 SENDABLE = ["[QUERY]", "[ERROR]", "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]", "[RESEARCH]"]
 
+# Sending one of these stops the sender and gives its slot to the question, so
+# a sequence that includes them exercises the interruption path as well as the
+# ordinary swap -- which is where a second paused row would come from if one
+# could.
+
 
 class FlakyStub(StubExtension):
     """A stub whose delivery fails whenever `fail_next` is set."""
@@ -53,8 +58,13 @@ class FlakyStub(StubExtension):
 
 def paused_counts(db: Database, partner_id: int) -> dict[str, int]:
     rows = db.read(
+        # `awaiting_resolution = 0` scopes this to WORK rows. A displaced wait
+        # is also stored paused and carries the label of the question that was
+        # asked, so it can coexist with a paused work row of the same label --
+        # but it is never rendered and so is never what a resume prompt names.
         "SELECT behavior, COUNT(*) AS n FROM message_queue "
-        "WHERE partner_id = ? AND in_process = 1 GROUP BY behavior",
+        "WHERE partner_id = ? AND in_process = 1 AND awaiting_resolution = 0 "
+        "GROUP BY behavior",
         (partner_id,),
     )
     return {r["behavior"]: r["n"] for r in rows}
@@ -87,10 +97,12 @@ def test_at_most_one_row_per_label_is_ever_paused(db, seed):
                     message=f"m{step}", behavior=behavior,
                 )
             elif action == "interrupt":
-                history.append(f"{step}: interrupt")
-                core.interrupt_partner(
-                    requester_uuid=caller["uuid"], partner_title=worker["title"],
-                    reason=f"stop {step}",
+                # The interruption is no longer a capability of its own: an
+                # agent is stopped by ASKING something, which is what this does.
+                history.append(f"{step}: worker asks a blocking question")
+                core.send(
+                    requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+                    message=f"blocked at step {step}", behavior=rng.choice(["[QUERY]", "[ERROR]"]),
                 )
             elif action == "fail":
                 history.append(f"{step}: fail next delivery, then advance")
@@ -135,9 +147,10 @@ def test_a_paused_row_never_loses_its_body(db, seed):
                     message=f"body-{step}", behavior=rng.choice(SENDABLE),
                 )
             else:
-                core.interrupt_partner(
-                    requester_uuid=caller["uuid"], partner_title=worker["title"],
-                    reason=f"stop {step}",
+                core.send(
+                    requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+                    message=f"blocked at step {step}",
+                    behavior=rng.choice(["[QUERY]", "[ERROR]"]),
                 )
         except (Rejected, NeedsRemote, RuntimeError):
             pass

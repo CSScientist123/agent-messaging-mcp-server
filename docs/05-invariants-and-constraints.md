@@ -55,8 +55,8 @@ and neither would ever get an answer.
 never completes anything.
 
 **Where enforced.** Application code — `MessagingCore.advance`, which is the only
-implementation of the swap. `send`, `interrupt_partner`, and the Polling Server's drain
-thread all call it rather than repeating it. Covered by the `displace-on-equal` and
+implementation of the swap. `send` and the Polling Server's drain thread both call it rather
+than repeating it. Covered by the `displace-on-equal` and
 `priority-inverted` mutants.
 
 ## 3. `in_process` outranks only within its own label
@@ -141,8 +141,7 @@ mutants: `cap-ignores-working`, `cap-ignores-the-origin-label` (slot side) and
 ## 6. Only labels marked `stored` reach `messages`
 
 **The rule.** `messages` accepts `[QUERY]`, `[TRUTHFUL-REPORT]` and `[MESSAGE-RESPONSE]` —
-exactly the labels with `label_caps.stored = 1`. `[RESEARCH]`, `[ERROR]` and `[IDLE]` are
-transport.
+exactly the labels with `label_caps.stored = 1`. `[RESEARCH]` and `[ERROR]` are transport.
 
 **Why a trigger reading `label_caps` rather than a `CHECK` listing labels.** A list in the
 `CHECK` would be a second copy of `label_caps.stored`, and two copies of one fact eventually
@@ -169,20 +168,42 @@ that produced a message. Two agents would talk to each other until one was archi
 `PollingServer._complete`. A `CHECK` additionally forbids a label replying with itself,
 which is the same infinite exchange written more compactly.
 
-## 8. `[IDLE]` enters the slot by priority and leaves it by anything
+## 8. A blocking question stops the agent that asked it
 
-**The rule.** `[IDLE]` holds the highest priority, so pushing one takes the working slot by
-construction — that is all a forced interruption is. But an `[IDLE]` *in* the slot is a hold,
-not a task: any arrival displaces it regardless of priority, and it is discarded rather than
-requeued.
+**The rule.** Sending a `[QUERY]` or an `[ERROR]` stops the sender: its remote is stopped,
+whatever it was working on is pushed back into its own queue marked `in_process`, and the
+question takes its working slot. Nothing is rendered or delivered for that slot. An agent
+already waiting is refused a second question with `already_awaiting_an_answer`. The wait ends
+only when a `[MESSAGE-RESPONSE]` reaches the head of that agent's queue; the question is then
+discarded, never requeued.
 
-**Why.** Comparing priorities on the way out would make the interruption permanent, since
-nothing outranks `[IDLE]`. And requeuing it would stop the Partner again the moment it
-resumed.
+**Why there is no separate hold label.** The question *is* the hold, and it holds at its own
+natural priority — 2, unraised. Only `[TRUTHFUL-REPORT]` at 1 outranks it, so everything else
+queues behind an unanswered question by ordinary priority rather than by a special case. A
+hold label would need a rule saying anything displaces it, which is a second comparison to
+keep in step with the first.
 
-**Where enforced.** Application code, in `MessagingCore.advance` (`holding`). `send` refuses
-`[IDLE]` with `idle_not_sendable`, so `interrupt_partner` is the only producer. Covered by the
-`idle-requeued` mutant.
+**Why nothing is delivered.** The remote was stopped a moment earlier. Handing a stopped
+agent a paragraph gives it something to act on when the entire point is that it does nothing
+until it hears back.
+
+**Where enforced.** Application code: `MessagingCore.send` (`labels.BLOCKING_BEHAVIORS`,
+`_already_waiting`, `_await_answer`) and `MessagingCore.advance`, which consumes the answer
+and folds it into whatever the queue holds next.
+
+## 8a. A displaced question returns to waiting, not to work
+
+**The rule.** A `[TRUTHFUL-REPORT]` outranks a waiting agent and can take the slot. The
+requeued row carries `awaiting_resolution = 1`; it then outranks every other row in that
+agent's queue, and promoting it re-enters the wait rather than delivering anything.
+
+**What breaks without it.** The question comes back indistinguishable from an ordinary
+`[QUERY]` a caller sent, and the agent is told to answer a question it asked. Or the answer
+arrives to a slot holding unrelated work and has nothing to resolve.
+
+**Where enforced.** The `awaiting_resolution` column on `message_queue`, written by
+`advance`'s swap and by `_requeue`, and read first in both `_HEAD_LABEL_SQL` and
+`_HEAD_ROW_SQL`.
 
 ## 9. Delegated work never travels upward
 
@@ -361,7 +382,8 @@ any adapter.
 **Why.** Answering leaves the permission set that caused the prompt unchanged, so the next
 turn blocks identically.
 
-**The route back.** `interrupt_partner`, an `[ERROR]` reply naming what was missing,
+**The route back.** An `[ERROR]` reported on the Partner's behalf naming what was missing —
+which stops nothing extra, because an agent halted on a prompt is already not running —
 `get_permissions` to see what the conversation actually allows, `add_permissions` /
 `delete_permissions` to correct it, and then a fresh `send`. There is no resume capability
 and no resume extension method: correcting the grant and sending again *is* the resumption.

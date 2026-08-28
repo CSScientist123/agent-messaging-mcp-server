@@ -456,30 +456,30 @@ class _RecordingEvent:
         return self._set
 
 
-def test_an_idle_hold_waits_instead_of_spinning(db, core, server):
-    """A held Partner is deliberately stopped and has nothing to poll.
+def test_a_waiting_agent_waits_instead_of_spinning(db, core, server):
+    """A waiting Partner is deliberately stopped and has nothing to poll.
 
-    `drain_once` returns False for an [IDLE] -- correctly, since the queue may
-    hold the task the interruption displaced, so the thread must not retire.
-    But the loop then waited a QUARTER of the poll interval, which at the
-    default is a wake-up roughly sixteen times a second, forever, for a
-    Partner that will not change until something displaces the hold.
+    `drain_once` returns False for an agent awaiting an answer -- correctly,
+    since the queue may hold the work its question displaced, so the thread
+    must not retire. But the loop then waited a QUARTER of the poll interval,
+    which at the default is a wake-up roughly sixteen times a second, forever,
+    for a Partner that will not change until the answer arrives.
     """
     caller = make_orchestrator(core)
     worker = make_worker(core, caller, "science_")
-    # Interrupted with nothing queued behind it. That is what makes the hold
-    # PERSIST: anything in the queue outranks an [IDLE] and displaces it on the
-    # very next advance(), so a hold only lasts while there is nothing to take
-    # it -- which is exactly the state that used to spin.
-    core.interrupt_partner(
-        requester_uuid=caller["uuid"], partner_title=worker["title"], reason="stop"
+    # The worker asks its caller a question and is stopped by it, with nothing
+    # queued behind it. That is what makes the wait PERSIST: the answer would
+    # end it immediately, and this is the state that used to spin.
+    core.send(
+        requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+        message="which dataset?", behavior="[QUERY]",
     )
     working = core.working_task(partner_id=worker["id"])
-    assert working is not None and working["behavior"] == "[IDLE]", (
-        f"setup failed: expected an [IDLE] hold, got {working}"
+    assert working is not None and working["awaiting_resolution"], (
+        f"setup failed: expected the worker to be waiting on its own [QUERY], got {working}"
     )
     assert queued_behaviors(db, worker["id"]) == [], (
-        "setup failed: a queued task would displace the hold immediately"
+        "setup failed: a queued task would change what the loop does"
     )
 
     event = _RecordingEvent(stop_after=2)
@@ -487,13 +487,13 @@ def test_an_idle_hold_waits_instead_of_spinning(db, core, server):
 
     assert event.waits, "the loop should have waited at least once"
     assert all(w == server.hold_interval for w in event.waits), (
-        f"a hold must wait hold_interval ({server.hold_interval}s), not a fraction of "
-        f"the poll interval; recorded waits: {event.waits}"
+        f"a wait must poll at hold_interval ({server.hold_interval}s), not a fraction "
+        f"of the poll interval; recorded waits: {event.waits}"
     )
 
 
 def test_a_working_partner_is_still_polled_at_the_poll_interval(db, core, server):
-    """The slow path is for holds only -- real work must not be slowed down."""
+    """The slow path is for waits only -- real work must not be slowed down."""
     caller = make_orchestrator(core)
     worker = make_worker(core, caller, "science_")
     core.send(

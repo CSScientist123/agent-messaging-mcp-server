@@ -10,7 +10,7 @@ stateDiagram-v2
     state "Working<br/>(the in-memory slot)" as Working
     state "Summary phase<br/>(same slot, priority raised<br/>to [TRUTHFUL-REPORT])" as Summary
 
-    [*] --> Queued : send() / interrupt_partner()<br/>admits it
+    [*] --> Queued : send() admits it
 
     Queued --> Working : advance() -- slot empty,<br/>or this head STRICTLY beats<br/>the working task
 
@@ -25,18 +25,23 @@ stateDiagram-v2
     Working --> [*] : label_caps.reply_behavior:<br/>[QUERY] -> [MESSAGE-RESPONSE] to the Caller,<br/>everything else -> NOTHING
 
     note right of Working
-        An [IDLE] here is a HOLD, not a task.
-        Highest priority for ENTERING the slot --
-        that is how a forced interruption works --
-        and no claim on staying: the next arrival
-        displaces it, and it is NOT requeued.
-        Comparing priorities would make the
-        interruption permanent, since nothing
-        outranks [IDLE].
+        A slot can also hold a WAIT: the agent's
+        own unanswered [QUERY] or [ERROR], put
+        there by its own send(). No queue row
+        backs it, nothing is rendered for it, and
+        it is discarded the moment the answer
+        arrives. It holds at its natural priority
+        of 2, so only a [TRUTHFUL-REPORT] can take
+        the slot from it -- and a wait displaced
+        that way goes back to the queue carrying
+        awaiting_resolution = 1, which makes it
+        outrank everything else in that agent's
+        queue and re-enter the wait rather than
+        come back as work it already asked.
     end note
 
     note left of Summary
-        The reply for four of the six labels is
+        The reply for two of the five labels is
         NOTHING. Without a terminating label,
         every completed task would produce a
         message that produced a task, and two

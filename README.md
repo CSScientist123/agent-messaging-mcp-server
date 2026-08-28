@@ -38,15 +38,20 @@ python3 tests/test_schema_constraints.py schema/schema.sql    # 63 passed, 0 fai
 
 `MessagingCore` (`messaging_core/core.py`) is a **logic class, not a server** — no port, no
 socket, no process. Three MCP server processes each construct their own instance and expose its
-eighteen capabilities as tools. What makes them behave as one system is not a protocol between
+seventeen capabilities as tools. What makes them behave as one system is not a protocol between
 them: they all point at the same SQLite file. The database *is* the integration layer.
 
 Each Partner has **one priority queue** and one in-memory working slot. Every message is a push;
 the label decides how urgently it is taken up relative to whatever the Partner is already doing.
 
 ```
-[IDLE] > [TRUTHFUL-REPORT] > [QUERY] = [ERROR] > [MESSAGE-RESPONSE] > [RESEARCH]
+[TRUTHFUL-REPORT] > [QUERY] = [ERROR] > [MESSAGE-RESPONSE] > [RESEARCH]
 ```
+
+There is no label for "stop". An agent is stopped by what it sends: a `[QUERY]` or an `[ERROR]`
+says it cannot continue without an answer, so its remote is stopped, its work is paused back
+into its own queue, and the question takes its working slot until the answer arrives. Nothing
+below `[TRUTHFUL-REPORT]` can reach it while it waits — an unanswered question is the blocker.
 
 Everything a label implies — its priority, its cap, whether it is stored, what a finished task
 carrying it replies with — is a row in `label_caps`, not a branch in code.

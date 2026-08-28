@@ -20,10 +20,16 @@ answers the quotation.
 no closing instruction treats the interruption as its new task and never goes
 back.
 
-**And nothing at all for an `[IDLE]`.** A hold is not a message. The remote is
-already stopped before the swap, so there is no prompt to render and none is
-rendered -- handing a stopped agent a paragraph gives it something to act on
-when the entire point is that it should be doing nothing.
+**And nothing at all for an agent waiting on its own question.** The wait is
+not a message. The remote is already stopped before the slot changes hands, so
+there is no prompt to render and none is rendered -- handing a stopped agent a
+paragraph gives it something to act on when the entire point is that it should
+be doing nothing until it hears back.
+
+**A resolution is never delivered bare.** When the answer arrives it is folded
+into whatever the agent should do next, because a response on its own leaves an
+agent holding a fact and no instruction. Only when the queue is empty behind it
+does the answer stand alone.
 """
 
 from __future__ import annotations
@@ -238,6 +244,64 @@ def notebook_query(*, caller_title: str, source: str, body: str) -> str:
         "",
         body,
     ])
+
+
+def resolution(*, asked_behavior: str, response: str, next_job: str | None = None,
+               resumed_behavior: str | None = None) -> str:
+    """Render an answer to a blocking question, folded into whatever comes next.
+
+    A raw answer is close to useless on its own. The agent that asked was
+    stopped mid-work, and by the time the answer arrives the thing it should do
+    next is already decided -- it is the head of its own queue. Handing over
+    just the response leaves the agent holding a fact and no instruction, and
+    it has to guess whether to resume, wait, or start something.
+
+    So the response and the next instruction arrive as one prompt. Three
+    shapes, and which one applies is decided by what the queue actually holds:
+
+    - Something new is waiting: the answer, then that work, in full.
+    - Paused work is waiting: the answer, then one line naming what to resume.
+      The body is not restated -- the agent never stopped holding it, and a
+      worse copy would invite it to start over.
+    - Nothing is waiting: the answer alone. This is the only case where a bare
+      response is the right prompt, because there is nothing to attach it to.
+
+    Args:
+        asked_behavior: The label of the question being answered -- `[QUERY]`
+            or `[ERROR]`.
+        response: What the answering agent said, verbatim.
+        next_job: The body of a fresh task being promoted behind the answer.
+        resumed_behavior: The label of a paused task being resumed instead.
+
+    Returns:
+        The full prompt text to hand to the remote.
+    """
+    lines = [
+        INSTRUCTS,
+        "",
+        f"Resolution attempt on {asked_behavior} is returned.",
+        "",
+        f"Response: {response}",
+    ]
+    if next_job is not None:
+        lines += ["", "Resume your work with this new job:", "", next_job]
+    elif resumed_behavior is not None:
+        lines += ["", f"Resume your work on: {resumed_behavior}"]
+    return "\n".join(lines)
+
+
+def awaiting_resolution(*, asked_behavior: str, target_title: str) -> str:
+    """What the queue records while an agent waits on its own question.
+
+    Never delivered anywhere. The agent that asked has already been stopped;
+    this is the text a human reading `status` sees in the working slot, and it
+    exists so that "what is this partner doing" has an answer other than a
+    label with no context.
+    """
+    return (
+        f"Waiting on {target_title} to answer the {asked_behavior} just sent. "
+        "The work paused behind this resumes when that answer arrives."
+    )
 
 
 def resume_displaced(*, behavior: str) -> str:

@@ -1,21 +1,21 @@
 # Two: One queue, and the slot that is not in it
 
-## Six labels, and one table that means all of them
+## Five labels, and one table that means all of them
 
-Every message carries a label. There are six, and they are not a taxonomy for its own sake — each says something about how urgently the message should be taken up and what, if anything, comes back.
+Every message carries a label. There are five, and they are not a taxonomy for its own sake — each says something about how urgently the message should be taken up and what, if anything, comes back.
 
 - **`[RESEARCH]`** delegates work. "Go and do this."
 - **`[QUERY]`** asks a question about something the recipient already holds.
 - **`[ERROR]`** says something went wrong and names it.
 - **`[MESSAGE-RESPONSE]`** is an answer to a question.
 - **`[TRUTHFUL-REPORT]`** is a summary of work done.
-- **`[IDLE]`** is not a message at all. It is a hold, and it gets its own treatment later.
+
+There is deliberately no sixth label meaning *stop*. Two of these five already stop somebody, and that turns out to be enough — it gets its own treatment later.
 
 Here is the part that matters more than the list. Everything a label *implies* lives in one table, `label_caps`, with one row per label and four columns:
 
 | label | priority | cap | stored | replies with |
 |---|---|---|---|---|
-| `[IDLE]` | 0 | — | no | nothing |
 | `[TRUTHFUL-REPORT]` | 1 | — | yes | nothing |
 | `[QUERY]` | 2 | 3 | yes | `[MESSAGE-RESPONSE]` |
 | `[ERROR]` | 2 | — | no | `[MESSAGE-RESPONSE]` |
@@ -26,7 +26,7 @@ Read that table as four separate rules that happen to share a home.
 
 **Priority** decides what runs next. Lower wins.
 
-**Cap** limits how many of that label one caller may have outstanding against one partner. Two of the six are capped — the two that ask a partner to go and do something. The other four carry no limit.
+**Cap** limits how many of that label one caller may have outstanding against one partner. Two of the five are capped — the two that ask a partner to go and do something. The other three carry no limit.
 
 **Stored** decides whether the message is written to durable history. Three labels are; three are not.
 
@@ -128,7 +128,7 @@ There is one place where a task's label changes while it sits in the slot, and i
 
 A `[RESEARCH]` task is two exchanges against one remote: do the work, then report on it. When the work finishes, the task is *relabelled* `[TRUTHFUL-REPORT]` in place, without leaving the slot, and its priority is raised to that label's.
 
-The priority raise is the point. `[TRUTHFUL-REPORT]` sits at 1, above everything except `[IDLE]`. From the moment the relabelling happens, **arriving messages queue rather than reach the agent** — `[QUERY]`, `[ERROR]`, `[MESSAGE-RESPONSE]` and `[RESEARCH]` all wait, because displacement requires a strictly lower priority number and only `[IDLE]` has one.
+The priority raise is the point. `[TRUTHFUL-REPORT]` sits at 1, at the top of the table. From the moment the relabelling happens, **arriving messages queue rather than reach the agent** — `[QUERY]`, `[ERROR]`, `[MESSAGE-RESPONSE]` and `[RESEARCH]` all wait, because displacement requires a strictly lower priority number and nothing has one.
 
 That blocking is the whole reason for the raise. A summary written while other traffic was reaching the same context would summarise the traffic.
 
@@ -142,7 +142,7 @@ The same marker travels on the queue row if the summary is displaced, which matt
 
 ## One place where the swap happens
 
-`advance` is the single implementation of "compare the head against the working slot and act." Sending calls it. Parking a partner calls it. The background thread that watches remotes calls it. None of them reimplements it.
+`advance` is the single implementation of "compare the head against the working slot and act." Sending calls it. The background thread that watches remotes calls it. Neither reimplements it.
 
 That is not merely good hygiene. An earlier arrangement had two implementations — one in the core, one in the component that watches remotes — and two implementations of a swap rule are two chances to answer differently about which task is running.
 
@@ -160,21 +160,33 @@ When a task is displaced, the remote is stopped **before** the queue is touched.
 
 And if delivery fails after the row has already been removed, the task is put **back**, marked paused, and the error propagates. From the queue's point of view it is a task that started and stopped, which is exactly what paused means. Silently dropping it is the one outcome nothing downstream could detect.
 
-## An `[IDLE]` enters by priority and leaves by anything
+## The other thing a slot can hold
 
-`[IDLE]` holds priority 0, so pushing one takes the working slot by construction. That is the entirety of what a forced stop is — no special code path, just a normal push of a message that outranks everything.
+Almost everything in the slot got there by being promoted out of the queue. There is one exception, and it is the closest thing this system has to a hold — except that it is not a separate concept at all.
 
-But an `[IDLE]` *in* the slot is treated differently from every other task: **anything displaces it, regardless of priority.**
+When an agent sends a `[QUERY]` or an `[ERROR]`, that act stops **the agent that sent it.** Its remote is stopped, whatever it was working on is pushed back into its own queue marked paused, and the question it just asked takes its working slot.
 
-Comparing priorities on the way out would make the hold permanent, since nothing outranks `[IDLE]`. A partner stopped this way would never start again.
+That task is synthetic. It has no `message_queue` row and, ordinarily, never gets one. It exists so that the slot is *occupied* — without it, the next `advance` would find an empty slot, promote the very work just paused, and hand it straight back to an agent that has already said it cannot continue.
 
-And when it is displaced, it is **discarded rather than requeued.** It has already done its whole job, which was to stop the partner. Requeuing it would stop the partner again the moment it resumed — a hold that reapplies itself forever, one swap at a time.
+The elegance is in what is **not** here. There is no hold label, no priority zero, and no rule saying "anything displaces this." The question defends the slot at the priority it already has: `[QUERY]` and `[ERROR]` sit at 2, and they are never raised. That single fact makes an unanswered question a blocker, because only `[TRUTHFUL-REPORT]` at 1 is strictly lower — everything else queues behind it under the ordinary rule.
 
-There is one more thing about an `[IDLE]`, and it is the cleanest illustration of what a hold is: **nothing is sent to the remote for one.** The slot is taken, and no prompt is rendered or delivered. Handing a deliberately stopped agent a paragraph gives it something to act on when the entire point is that it should be doing nothing.
+Compare that with a hold at priority 0. A hold that outranks everything can never be displaced by priority, so it needs a *second*, contradicting rule to ever leave — and a second rule about the same slot is a second chance to disagree with the first. The question needs no second rule. It leaves when it is answered.
 
-If the hold displaced something, that something's remote was stopped as part of the swap, so the agent is already halted by the time the slot changes hands. If it entered an empty slot there was nothing running to stop, and the hold is purely local bookkeeping — a placeholder saying this partner is not to be given work yet.
+**Nothing is sent to the remote for a wait.** The slot is taken, and no prompt is rendered or delivered. Handing a deliberately stopped agent a paragraph gives it something to act on when the entire point is that it should be doing nothing until it hears back.
 
-A hold is not a message. It is the absence of one, made explicit so that the queue has something to hold the place with.
+And an agent already waiting cannot ask again. A second question is refused outright — it is stopped, so it could not act on the answer to the first, let alone the second.
+
+## When the one thing that outranks a wait arrives
+
+A `[TRUTHFUL-REPORT]` *is* strictly lower than 2, so a summary really can take the slot from an agent waiting on its own question. This is the one case where the synthetic task becomes a real row, and the column that makes it work is worth naming: `awaiting_resolution`.
+
+The requeued question carries that flag, and it earns its place twice.
+
+It makes the row **outrank everything else in that agent's queue** — it is read first, ahead of priority. So when the summary finishes, what resumes is the wait, not some job the agent still cannot do.
+
+And it makes the resumed row **re-enter the wait** rather than be delivered. Without the flag, the question would come back indistinguishable from an ordinary `[QUERY]` that a caller had sent — and the agent would be handed, as work, the question it asked.
+
+It also quietly qualifies something said earlier in this note. At most one row per label is ever paused, which is what lets the resume prompt be a single line. That remains true of *work* rows; a wait carries a label too and can share one with a paused task. It never collides, because a wait is never rendered, and so is never what a resume prompt names.
 
 ---
 

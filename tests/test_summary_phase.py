@@ -69,29 +69,105 @@ def into_summary_phase(core: MessagingCore, server: PollingServer, caller: dict,
     )
 
 
+
+
+def displace_the_summary(core: MessagingCore, stub, worker: dict) -> None:
+    """Push the summary phase back into the queue, paused.
+
+    Nothing outranks a `[TRUTHFUL-REPORT]` -- that is the point of raising a
+    research task to it -- so the only way one leaves the slot before finishing
+    is a delivery that fails. `advance` puts a task whose delivery raised back
+    into the queue marked `in_process`, which is exactly the state a resumed
+    summary has to survive.
+    """
+    original = stub.deliver_message
+
+    def failing(*, partner_id_in_remote, behavior, body):
+        raise RuntimeError("the remote refused the delivery")
+
+    stub.deliver_message = failing
+    try:
+        core.advance(partner_id=worker["id"])
+    except Exception:
+        pass
+    finally:
+        stub.deliver_message = original
+
+
 # ---------------------------------------------------------------------------
 # 1. The result survives an interruption.
 # ---------------------------------------------------------------------------
 
 
-def test_a_displaced_summary_still_reports_its_result_to_the_caller(
+def test_a_summary_whose_delivery_fails_still_reports_its_result_to_the_caller(
     db, stub, core, server, monkeypatch
 ):
-    """This is the silent one: no error, no log, the Caller simply never hears back.
+    """The reachable route back into the queue, and the silent failure it guards.
 
-    Displaced, the task is requeued as an ordinary [TRUTHFUL-REPORT] row. On
-    resume the marker is gone, so `_complete` looks up
+    Nothing DISPLACES a summary phase: it runs at `[TRUTHFUL-REPORT]`'s own
+    priority of 1, and `advance` displaces only on a strictly lower number. What
+    does put one back in the queue is a delivery that fails after the row was
+    already removed -- `advance` calls `_requeue`, and `_requeue` has to carry
+    the same two markers the swap does.
+
+    Without `summary_phase` on that row, the task comes back as an ordinary
+    `[TRUTHFUL-REPORT]`. On resume `_complete` looks up
     `reply_behavior('[TRUTHFUL-REPORT]')`, finds NULL, releases the slot and
-    pushes nothing. The research was done and the answer is discarded.
+    pushes nothing. The research was done and the answer is discarded, with no
+    error and no log anywhere.
     """
     caller, worker = make_pair(core)
     suppress_no_op(monkeypatch, server)
     into_summary_phase(core, server, caller, worker)
 
-    # Only [IDLE] outranks a summary phase -- that is the point of raising it.
-    core.interrupt_partner(
-        requester_uuid=caller["uuid"], partner_title=worker["title"], reason="stop for now"
+    # Put the summary phase back in the queue the only way it can get there.
+    task = core.working_task(partner_id=worker["id"])
+    assert task is not None and task["summary_phase"], (
+        f"setup failed: expected a summary phase in the slot, got {task!r}"
     )
+    core.slots.clear(worker["id"])
+    core._requeue(task)
+
+    row = db.read_one(
+        "SELECT summary_phase, origin_behavior FROM message_queue "
+        "WHERE partner_id = ? AND behavior = '[TRUTHFUL-REPORT]'", (worker["id"],)
+    )
+    assert row is not None and row["summary_phase"] == 1, (
+        f"a requeued summary phase must still be marked as one, got {dict(row) if row else None}"
+    )
+    assert row["origin_behavior"] == "[RESEARCH]", (
+        f"and must still count against its Caller's [RESEARCH] cap, got {dict(row)}"
+    )
+
+    server.drain_once(partner_id=worker["id"])
+    server.drain_once(partner_id=worker["id"])
+
+    behaviors = queued_behaviors(db, caller["id"])
+    assert "[TRUTHFUL-REPORT]" in behaviors, (
+        "a summary that was requeued and resumed still owes its Caller the report; "
+        f"the caller's queue holds: {behaviors}"
+    )
+
+
+def test_a_displaced_summary_still_reports_its_result_to_the_caller(
+    db, stub, core, server, monkeypatch
+):
+    """The same guarantee, from a row built the way the swap would build one.
+
+    Nothing can displace a summary today, so this reaches the resume path by
+    writing the row directly rather than staging a displacement that cannot
+    happen. It is the resume half of the property; the test above covers the
+    half that actually writes the row.
+    """
+    caller, worker = make_pair(core)
+    suppress_no_op(monkeypatch, server)
+    into_summary_phase(core, server, caller, worker)
+
+    core.slots.clear(worker["id"])
+    core.db.write(lambda c: c.execute(
+        "INSERT INTO message_queue(partner_id, caller_id, behavior, body, in_process, "
+        "summary_phase, origin_behavior) VALUES (?, ?, '[TRUTHFUL-REPORT]', ?, 1, 1, "
+        "'[RESEARCH]')", (worker["id"], caller["id"], "investigate x")))
     assert "[TRUTHFUL-REPORT]" in queued_behaviors(db, worker["id"]), (
         "setup failed: the displaced summary should be sitting in the queue"
     )
@@ -121,9 +197,11 @@ def test_a_resumed_summary_is_asked_for_again_rather_than_told_to_resume(
     suppress_no_op(monkeypatch, server)
     into_summary_phase(core, server, caller, worker)
 
-    core.interrupt_partner(
-        requester_uuid=caller["uuid"], partner_title=worker["title"], reason="stop for now"
-    )
+    core.slots.clear(worker["id"])
+    core.db.write(lambda c: c.execute(
+        "INSERT INTO message_queue(partner_id, caller_id, behavior, body, in_process, "
+        "summary_phase, origin_behavior) VALUES (?, ?, '[TRUTHFUL-REPORT]', ?, 1, 1, "
+        "'[RESEARCH]')", (worker["id"], caller["id"], "investigate x")))
     before = len(deliver_calls(stub))
     server.drain_once(partner_id=worker["id"])
 
@@ -191,9 +269,11 @@ def test_the_research_cap_counts_a_displaced_summary_sitting_in_the_queue(
     core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
               message="investigate y", behavior="[RESEARCH]")
     server.drain_once(partner_id=worker["id"])
-    core.interrupt_partner(
-        requester_uuid=caller["uuid"], partner_title=worker["title"], reason="stop for now"
-    )
+    core.slots.clear(worker["id"])
+    core.db.write(lambda c: c.execute(
+        "INSERT INTO message_queue(partner_id, caller_id, behavior, body, in_process, "
+        "summary_phase, origin_behavior) VALUES (?, ?, '[TRUTHFUL-REPORT]', ?, 1, 1, "
+        "'[RESEARCH]')", (worker["id"], caller["id"], "investigate x")))
     assert "[TRUTHFUL-REPORT]" in queued_behaviors(db, worker["id"]), (
         "setup failed: the displaced summary should be in the queue, not the slot"
     )

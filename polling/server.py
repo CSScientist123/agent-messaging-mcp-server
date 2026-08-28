@@ -19,10 +19,10 @@ that question, and they answer it in one place. What remains of "state" is:
 a task is queued, or it holds the working slot, or it is neither.
 
 The swap logic itself is NOT here. `MessagingCore.advance` owns it, and this
-module calls it exactly like `send` and `interrupt_partner` do, so there is one
-implementation of "compare the head against the working slot and act" rather
-than one per caller. That was a real bug in the previous design, where the core
-and this module each had their own drain.
+module calls it exactly like `send` does, so there is one implementation of
+"compare the head against the working slot and act" rather than one per caller.
+That was a real bug in the previous design, where the core and this module each
+had their own drain.
 
 All writes go through `Database.write` -- nothing here ever opens its own write
 transaction.
@@ -39,7 +39,6 @@ from typing import Any
 from messaging_core import responses
 from messaging_core.core import MessagingCore
 from messaging_core.errors import NeedsRemote, Rejected
-from messaging_core.labels import INTERRUPT_BEHAVIOR
 
 from extension.base import RemoteExtension
 
@@ -121,10 +120,10 @@ class PollingServer:
         self.extensions = extensions
         self.poll_interval = poll_interval
         self.supervisor_interval = supervisor_interval
-        #: How long a drain thread waits between passes while the working
-        #: slot holds an `[IDLE]`. Deliberately coarser than `poll_interval`
-        #: -- see the wait call in `_drain_loop` for why a slow poll is safe
-        #: here.
+        #: How long a drain thread waits between passes while the agent is
+        #: waiting on its own unanswered question. Deliberately coarser than
+        #: `poll_interval` -- see the wait call in `_drain_loop` for why a slow
+        #: poll is safe here.
         self.hold_interval = hold_interval
         # One core, holding the slots every per-source view shares.
         self.core = core if core is not None else MessagingCore(db)
@@ -380,16 +379,16 @@ class PollingServer:
                             return
                     continue
                 held_task = self.core.slots.get(partner_id)
-                if held_task is not None and held_task["behavior"] == INTERRUPT_BEHAVIOR:
-                    # An [IDLE] hold is not something this thread waits to
-                    # change -- it is something SOMEBODY ELSE changes. The
-                    # message that ends a hold is delivered by whoever sends
-                    # it: `send` calls `advance()` directly, which displaces
-                    # the hold and delivers the new task in the sender's own
-                    # call, synchronously. So this loop is never racing to
-                    # notice a resume; it is only re-checking a slot that, if
-                    # it has changed at all, already changed before this wait
-                    # even started. Polling it 16x/second, forever, for a
+                if held_task is not None and held_task.get("awaiting_resolution"):
+                    # A wait is not something this thread waits to change --
+                    # it is something SOMEBODY ELSE changes. The message that
+                    # ends a wait is delivered by whoever answers: `send`
+                    # calls `advance()` directly, which consumes the answer
+                    # and delivers what comes next in the sender's own call,
+                    # synchronously. So this loop is never racing to notice a
+                    # resume; it is only re-checking a slot that, if it has
+                    # changed at all, already changed before this wait even
+                    # started. Polling it 16x/second, forever, for a
                     # partner deliberately stopped and with nothing to poll,
                     # bought nothing but wakeups.
                     #
@@ -430,12 +429,16 @@ class PollingServer:
             )["n"]
             return depth == 0
 
-        if task["behavior"] == INTERRUPT_BEHAVIOR:
-            # An [IDLE] is a hold, not work. There is nothing to poll for and
-            # nothing to report: the partner is stopped, and it stays stopped
-            # until something arrives that displaces the hold. Retiring here
-            # would be wrong -- the queue may hold the paused task this
-            # interruption displaced -- so the thread waits instead.
+        if task.get("awaiting_resolution"):
+            # The agent asked a blocking question and is stopped until it is
+            # answered. There is nothing to poll for and nothing to report: it
+            # is not running, and its own remote has no idea it is waiting.
+            #
+            # Retiring here would be wrong -- the queue holds the work this
+            # question displaced, and the answer that clears it arrives as an
+            # ordinary message. So the thread waits, and each pass calls
+            # `advance`, which is what notices the answer and folds it into
+            # whatever the agent should do next.
             return False
 
         extension = core.extension
@@ -752,7 +755,17 @@ class PollingServer:
         # followed that send did not happen (it is deliberately best-effort,
         # and a thread can also die), a queue-only scan would look straight
         # past a remote that is working with nobody watching it.
+        #
+        # An agent WAITING on its own question is the exception. Its remote was
+        # stopped when it asked, so there is no turn to harvest and no
+        # completion to notice -- a thread armed for it would poll a halted
+        # session forever. What ends the wait is the answer, and an answer is a
+        # queued row: it arms this partner through the branch above, in
+        # whichever process owns the remote.
         for partner_id in self.core.slots.occupied():
+            task = self.core.slots.get(partner_id)
+            if task is not None and task.get("awaiting_resolution"):
+                continue
             candidates.setdefault(partner_id, str(partner_id))
 
         armed = 0

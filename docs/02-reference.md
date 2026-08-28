@@ -26,7 +26,7 @@ Every fact below is drawn from the source listed above. Where the source contain
 
 **Handshake.** A one-directional row in `handshakes` (`from_partner` → `to_partner`) that authorizes `send` from the first Partner to the second. `send` requires an existing handshake in that exact direction, except toward an `nlm_` Partner, which needs none. A reply direction is a second, independent row. Which pairings a handshake may legally connect is a fixed set of rules keyed on the two Partners' source prefixes and roles — see the `handshake` capability below.
 
-**Behavior label.** One of six fixed markers a message carries: `[IDLE]`, `[TRUTHFUL-REPORT]`, `[QUERY]`, `[ERROR]`, `[MESSAGE-RESPONSE]`, `[RESEARCH]` (`labels.BEHAVIORS`). Every per-label fact lives in the `label_caps` table rather than in code: its priority, how many one Caller may have outstanding, whether it is stored in `messages`, and what a finished task carrying it replies with. There is no direction in a label — any party may send any label either way.
+**Behavior label.** One of five fixed markers a message carries: `[TRUTHFUL-REPORT]`, `[QUERY]`, `[ERROR]`, `[MESSAGE-RESPONSE]`, `[RESEARCH]` (`labels.BEHAVIORS`). Two of them — `[QUERY]` and `[ERROR]`, listed in `labels.BLOCKING_BEHAVIORS` — also stop the agent that sends one, until it is answered. Every per-label fact lives in the `label_caps` table rather than in code: its priority, how many one Caller may have outstanding, whether it is stored in `messages`, and what a finished task carrying it replies with. There is no direction in a label — any party may send any label either way.
 
 **Priority queue.** One `message_queue` per Partner, holding what is waiting. The head is read in two steps: which **label** runs next (lowest `label_caps.priority`, then a label with any unpaused work over one whose rows are all paused, then arrival), and then which **row** of that label (paused first, then arrival). Two steps because `in_process` breaks ties only *within* a label, which one `ORDER BY` cannot say. A row is DELETED when its task is promoted — the queue holds what is waiting, not what is running.
 
@@ -40,7 +40,7 @@ Every fact below is drawn from the source listed above. Where the source contain
 
 ---
 
-## 2. The 18 capabilities
+## 2. The 17 capabilities
 
 Every capability below is a method on `MessagingCore` (`messaging_core/core.py`). Its MCP tool wrapper, in `mcp_server/server.py`, takes the same parameters, catches `Rejected` and `NeedsRemote`, and renders the result as a formatted string (see §5) rather than returning the raw value shown here. Two capabilities — `create_project` and `create_partner` — take no `requester_uuid` at all; they are the only two of the 18 not gated by caller identity, and consequently the only two that can never raise `unknown_requester`.
 
@@ -365,7 +365,7 @@ Pushes a message into another Partner's priority queue, then lets the queue run.
 | `requester_uuid` | `str` | required | — | must name a live partner | Caller's identity; the message's sender. |
 | `queried_partner_title` | `str` | required | — | exact title of a live partner | The message's recipient. |
 | `message` | `str` | required | — | any string | The message body. |
-| `behavior` | `str` | required | — | `"[RESEARCH]"`, `"[QUERY]"`, `"[ERROR]"`, `"[MESSAGE-RESPONSE]"`, `"[TRUTHFUL-REPORT]"` | The behavior label. `"[IDLE]"` is a recognized label but is refused here — see `idle_not_sendable`. Validated at runtime against `labels.BEHAVIORS`; the MCP tool declares this as a plain `str`, not a `Literal`, so nothing statically prevents an unrecognized value from being attempted. |
+| `behavior` | `str` | required | — | `"[RESEARCH]"`, `"[QUERY]"`, `"[ERROR]"`, `"[MESSAGE-RESPONSE]"`, `"[TRUTHFUL-REPORT]"` | The behavior label. Every label is sendable. `"[QUERY]"` and `"[ERROR]"` additionally stop the requester — see `already_awaiting_an_answer`. Validated at runtime against `labels.BEHAVIORS`; the MCP tool declares this as a plain `str`, not a `Literal`, so nothing statically prevents an unrecognized value from being attempted. |
 
 There is deliberately **no** `role` parameter and **no** path parameters. There is one queue, so there is no direction to choose; and permissions are configured in advance by `add_permissions`, because an approval prompt means the grant was already missing when the work started.
 
@@ -377,8 +377,8 @@ There is deliberately **no** `role` parameter and **no** path parameters. There 
 |---|---|---|
 | `unknown_requester` | `requester_uuid` not live. | Re-check the uuid. |
 | `no_such_partner` | `queried_partner_title` names no live partner. | Call `search_partner` to find the exact title. |
-| `unknown_behavior` | `behavior` not one of the six labels. | Use one of the five sendable values. |
-| `idle_not_sendable` | `behavior` is `"[IDLE]"`. `[IDLE]` is not a message; it is how an interruption is carried. Accepting it here would be a second route to interrupting a Partner — one that skips the same-project and can-execute checks and never stops the remote. | Call `interrupt_partner`. |
+| `unknown_behavior` | `behavior` not one of the five labels. | Use one of the five values. |
+| `already_awaiting_an_answer` | `behavior` is `[QUERY]` or `[ERROR]` and the requester already has an unanswered question of its own. It is stopped until that is answered, so a second question is one it could not act on the answer to. | Wait for the answer. It arrives folded into whatever the queue holds next. |
 | `source_cannot_send` | The requester's source has `can_send = 0` — today, `nlm_`. A notebook has no agent behind it, so nothing there ever decides to speak. | Nothing to do; a NotebookLM Partner is reachable but never a Caller. |
 | `research_not_accepted` | `behavior` is `[RESEARCH]` and the target's source has `accepts_research = 0` — today, `nlm_`. It answers questions about what it holds; it does not go and do things. | Send `[QUERY]` instead. |
 | `research_cannot_flow_upward` | `behavior` is `[RESEARCH]` and the requester's `agent_layers` layer is greater than the target's. Delegated work travels down or sideways; a lower agent handing it up would be reassigning its own director's work. | Use `[QUERY]` to ask, or `[TRUTHFUL-REPORT]` to report back. Every other label travels freely in both directions. |
@@ -550,7 +550,8 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `cross_project_requires_same_role` | `handshake` | A handshake across a project extension needs both partners to hold the same orchestrator role. |
 | `cross_source_extension` | `extend_project` | Two projects of different sources already handshake without an extension. |
 | `descr_too_long` | `create_partner` | Shorten `descr` to ≤ 1200 characters. |
-| `different_project` | `handshake`, `interrupt_partner` | Share a project, or (for `handshake`) link the two with `extend_project`. |
+| `already_awaiting_an_answer` | `send` | This agent is stopped on its own unanswered `[QUERY]` or `[ERROR]`. Wait for the answer. |
+| `different_project` | `handshake` | Share a project, or link the two with `extend_project`. |
 | `duplicate_handshake` | `handshake` | Skip `handshake`; the direction already exists — call `send`. |
 | `duplicate_partner_title` | `create_partner` | Choose an unused title (server-wide, archived included). |
 | `duplicate_project_system_id` | `create_project` | Call `search_project` to find the existing project. |
@@ -561,7 +562,6 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `gemini_to_science_illegal` | `handshake` | Never succeeds; use `science_ → gemini_`. **Unreachable through the tools** — a `gemini_` partner can hold no role, so a pair that is not `gemini_ → gemini_` is refused at `requester_not_orchestrator` first. Kept as defence in depth against a role written straight into the database. |
 | `grantee_not_gemini_orchestrator` | `grant_gemini_budget` | Have the grantee claim `gemini-orchestrator` first. |
 | `handshake_not_needed` | `handshake` | Call `send` directly; `nlm_` needs no handshake. |
-| `idle_not_sendable` | `send` | `[IDLE]` is not a message. Call `interrupt_partner`. |
 | `invalid_budget_count` | `grant_gemini_budget` | Supply `0`–`3` inclusive. |
 | `invalid_orchestrator_type` | `claim_orchestrator` | Use one of the three role strings. |
 | `invalid_pagination` | `read` | Supply `page` and `page_size` both ≥ 1. |
@@ -572,11 +572,10 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `no_handshake_between_gemini` | `handshake` | Two Antigravity conversations in one Project. Inherit across a project extension instead. |
 | `gemini_already_inherited` | `handshake` | That conversation is already continued by another. Inherit from one nothing has claimed. |
 | `no_paths` | `add_permissions`, `delete_permissions` | Give at least one path. |
-| `not_reportable` | `report_back` (queue machinery, §8 — not a client tool) | `[RESEARCH]` is delegation and `[IDLE]` is a hold; neither is something a Partner reports. Delegating is what `send` is for, and `send` is where the hierarchy rules live. |
-| `no_such_partner` | `delete_partner`, `handshake`, `send`, `read`, `interrupt_partner`, `get_permissions`, `add_permissions`, `delete_permissions` | Call `search_partner` to find the exact title. |
+| `not_reportable` | `report_back` (queue machinery, §8 — not a client tool) | `[RESEARCH]` is delegation, not something a Partner reports. Delegating is what `send` is for, and `send` is where the hierarchy rules live. |
+| `no_such_partner` | `delete_partner`, `handshake`, `send`, `read`, `get_permissions`, `add_permissions`, `delete_permissions` | Call `search_partner` to find the exact title. |
 | `no_such_project` | `create_partner`, `delete_project`, `extend_project` | Call `search_project` to find or confirm the project. |
 | `not_authorized` | `delete_partner`, `delete_project`, `grant_gemini_budget` | Only the relevant `project-orchestrator` may perform this action. |
-| `not_executable` | `interrupt_partner` | The target's source never executes; there is nothing to stop. |
 | `not_path_configurable` | `get_permissions`, `add_permissions`, `delete_permissions` | Only Antigravity conversations carry path permissions. |
 | `over_queue` | `send` | This caller's allowance for this label is full, counting the working slot. Wait for one to complete. |
 | `partner_has_work_in_flight` | `delete_partner` | Archive it instead — archiving reports the loss to every caller waiting. |
@@ -655,14 +654,15 @@ Seeded rows:
 
 | behavior | priority | max_outstanding | stored | reply_behavior |
 |---|---|---|---|---|
-| `[IDLE]` | 0 | — | 0 | — |
 | `[TRUTHFUL-REPORT]` | 1 | — | 1 | — |
 | `[QUERY]` | 2 | 3 | 1 | `[MESSAGE-RESPONSE]` |
-| `[ERROR]` | 2 | — | 0 | — |
+| `[ERROR]` | 2 | — | 0 | `[MESSAGE-RESPONSE]` |
 | `[MESSAGE-RESPONSE]` | 3 | — | 1 | — |
 | `[RESEARCH]` | 4 | 2 | 0 | `[TRUTHFUL-REPORT]` |
 
-`reply_behavior`'s NULLs are the load-bearing values: four labels reply with nothing, and without them every completed task would produce a message that produced a task. The self-reference `CHECK` forbids the same infinite exchange written more compactly.
+`[QUERY]` and `[ERROR]` sit at 2 and are never raised above it. That is what makes an unanswered question a blocker: only `[TRUTHFUL-REPORT]` at 1 outranks a waiting agent, and everything else queues behind the question.
+
+`reply_behavior`'s NULLs are the load-bearing values: two labels reply with nothing, and without them every completed task would produce a message that produced a task. The self-reference `CHECK` forbids the same infinite exchange written more compactly.
 
 ### agent_layers
 
@@ -792,11 +792,14 @@ One priority queue per Partner. A row is a QUEUED poll task.
 | `message_id` | `INTEGER` | FK → `messages(id) ON DELETE SET NULL`; set only for stored labels |
 | `summary_phase` | `INTEGER` | `NOT NULL DEFAULT 0`, `CHECK IN (0,1)` — 1 means this row is a displaced `[RESEARCH]` summary phase |
 | `origin_behavior` | `TEXT` | FK → `label_caps(behavior)`; the label the task was admitted under, when it differs from `behavior` |
+| `awaiting_resolution` | `INTEGER` | `NOT NULL DEFAULT 0`, `CHECK IN (0,1)`; this row is an agent's own unanswered question, displaced out of its working slot |
 | `enqueued_at` | `TEXT` | `NOT NULL DEFAULT` current UTC timestamp |
 
 `CHECK (caller_id <> partner_id)`. Index: `message_queue_order (partner_id, behavior, in_process DESC, enqueued_at)`.
 
-`summary_phase` and `origin_behavior` exist because a `[RESEARCH]` task changes label mid-flight without leaving the working slot: `begin_summary_phase` relabels it `[TRUTHFUL-REPORT]` so that nothing below `[IDLE]` can interrupt the summary. If it *is* interrupted, the row that goes back into the queue would otherwise be indistinguishable from a `[TRUTHFUL-REPORT]` an agent sent directly — which owes nothing back, because it already **is** the report. The two columns carry the distinction across the interruption: `summary_phase` says the Caller is still owed a report, and `origin_behavior` says the work still counts against that Caller's `[RESEARCH]` cap.
+`summary_phase` and `origin_behavior` exist because a `[RESEARCH]` task changes label mid-flight without leaving the working slot: `begin_summary_phase` relabels it `[TRUTHFUL-REPORT]` so that nothing can interrupt the summary. If it *is* interrupted, the row that goes back into the queue would otherwise be indistinguishable from a `[TRUTHFUL-REPORT]` an agent sent directly — which owes nothing back, because it already **is** the report. The two columns carry the distinction across the interruption: `summary_phase` says the Caller is still owed a report, and `origin_behavior` says the work still counts against that Caller's `[RESEARCH]` cap.
+
+`awaiting_resolution` exists for the mirror case: a `[TRUTHFUL-REPORT]` is the one thing that outranks an agent waiting on its own question, so a question really can be displaced out of a working slot and into this table. The question is not work. Without the marker it would come back indistinguishable from an ordinary `[QUERY]` a caller had sent, and be handed to the agent as something to answer — a question it asked. The column is read **first** in both `_HEAD_LABEL_SQL` and `_HEAD_ROW_SQL`, so a displaced question outranks everything else in that agent's queue and re-enters the wait rather than being delivered. It is also what scopes the "at most one paused row per label" property to work rows: a wait carries a label too, and can share one with a paused task, but it is never rendered and so is never what a resume prompt names.
 
 The task actually being worked — the working slot — is deliberately **not** in this table. It is held in memory by the Polling Server: it is process state, it changes on every swap, and persisting it would invite a reader to believe it survives a restart when it does not.
 
@@ -955,8 +958,8 @@ the Polling Server drives, and they are documented here because a maintainer rea
 
 `advance(*, partner_id: int) -> dict | None`
 
-The single implementation of the pushing mechanism. `send`, `interrupt_partner`, and the drain
-thread all call it; none reimplements it.
+The single implementation of the pushing mechanism. `send` and the drain thread both call it;
+neither reimplements it.
 
 Under the Partner's slot lock: read the queue head (two statements — the label, then the
 row within it); promote it if the slot is empty or the head strictly beats the working
@@ -995,7 +998,7 @@ deliver, or `None` if the slot is empty or holds a different label.
 
 The task stays in the same slot; its `behavior` becomes `[TRUTHFUL-REPORT]` and its effective
 priority is raised from 4 to 1, which blocks the queue: every arriving message waits, because
-`advance` displaces only on a strictly lower priority number and only `[IDLE]` has one. Its
+`advance` displaces only on a strictly lower priority number and nothing has one. Its
 `body` stays the **original request** — if this phase is later displaced and resumed, the row
 that goes back into the queue has to carry the request the summary is about, not the
 instruction to summarize, which would summarize itself.
@@ -1016,7 +1019,7 @@ requester holding a UUID here, and the handshake that made the exchange possible
 established in the other direction. It does keep the cap and the storage rule, because those
 are about the Caller's queue rather than about who may talk to whom.
 
-`behavior` must be something a Partner can **report**. `[RESEARCH]` and `[IDLE]` are refused
+`behavior` must be something a Partner can **report**. `[RESEARCH]` is refused
 with `not_reportable`: the first is delegation, and admitting it here would be a second door
 into a superior's queue that skips the layer check `send` makes; the second is a hold and means
 nothing in a queue. It is not reachable from the tool surface, but "not currently reachable" is
@@ -1070,7 +1073,8 @@ saying something is blocked). It is deliberately **absent** from `truthful_repor
 `truthful_report_request`, `notebook_query` and `resume_displaced`: a summary is harvested, a
 notebook cannot send, and a resume line is one line on purpose.
 
-**There is no template for an `[IDLE]`, and that is the point.** A hold is not a message. The
-remote is stopped by `stop_remote_execution` before the swap, so the slot is taken and nothing
-is rendered or delivered — handing a stopped agent a paragraph gives it something to act on
-when the entire purpose of the hold is that it should be doing nothing.
+**There is no template for a wait, and that is the point.** An agent stopped on its own
+unanswered question is not being told anything. The remote is stopped by
+`stop_remote_execution` before the slot changes hands, so the slot is taken and nothing is
+rendered or delivered — handing a stopped agent a paragraph gives it something to act on when
+the entire purpose of the wait is that it should be doing nothing until it hears back.

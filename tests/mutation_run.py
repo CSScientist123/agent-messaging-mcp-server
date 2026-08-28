@@ -103,27 +103,50 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
         "a Caller that corrects a blocked Partner never learns the correction landed",
     ),
     (
-        "a-hold-is-typed-at-the-agent", "messaging_core/core.py",
-        '            if task["behavior"] == INTERRUPT_BEHAVIOR:\n'
-        '                task["remote_call_id"] = None',
-        '            if False and task["behavior"] == INTERRUPT_BEHAVIOR:\n'
-        '                task["remote_call_id"] = None',
-        "an [IDLE] is rendered and delivered, so a deliberately stopped agent is handed a "
-        "paragraph to act on",
+        "a-wait-is-typed-at-the-agent", "messaging_core/core.py",
+        '            if task.get("awaiting_resolution"):\n'
+        '                # The question came back after a summary displaced it.',
+        '            if False and task.get("awaiting_resolution"):\n'
+        '                # The question came back after a summary displaced it.',
+        "a resumed wait is rendered and delivered, so an agent that is still waiting on its "
+        "own unanswered question is handed that question back as work",
     ),
     (
-        "a-partner-does-not-park-itself", "messaging_core/core.py",
-        "            behavior in _RAISES_UPWARD",
-        "            False and behavior in _RAISES_UPWARD",
-        "a Partner that raises a question upward keeps working, so the next queued message "
+        "an-asker-does-not-stop-itself", "messaging_core/core.py",
+        "        if behavior in BLOCKING_BEHAVIORS:",
+        "        if False and behavior in BLOCKING_BEHAVIORS:",
+        "an agent that says it cannot continue keeps working, so the next queued message "
         "reaches an agent blocked on an unanswered question and the two interleave",
     ),
     (
-        "a-caller-parks-itself-dispatching-work", "messaging_core/core.py",
-        "            and travelling_up\n",
-        "",
-        "the direction test is dropped, so an orchestrator stops itself every time it asks "
-        "a worker anything and halts everything it drives",
+        "a-second-question-while-stopped", "messaging_core/core.py",
+        "        if behavior in BLOCKING_BEHAVIORS and self._already_waiting(requester[\"id\"]):",
+        "        if False and self._already_waiting(requester[\"id\"]):",
+        "a stopped agent may ask again, so two of its questions are unanswered at once and "
+        "the first is requeued as work it can neither do nor drop",
+    ),
+    (
+        "the-answer-is-ordered-by-priority", "messaging_core/core.py",
+        '                answer = self.db.read_one(\n'
+        '                    _HEAD_ROW_SQL, {"pid": partner_id, "behavior": "[MESSAGE-RESPONSE]"}\n'
+        "                )",
+        '                answer = head if head["behavior"] == "[MESSAGE-RESPONSE]" else None',
+        "the answer that ends a wait is taken from the queue head instead of by label, so an "
+        "agent whose paused work carries a lower priority number than [MESSAGE-RESPONSE] "
+        "never sees an answer that has already arrived and waits forever",
+    ),
+    (
+        "a-bare-response-is-the-prompt", "messaging_core/core.py",
+        "                prompt = templates.resolution(\n"
+        "                    asked_behavior=asked,\n"
+        "                    response=resolution_text,\n"
+        "                    next_job=None if task[\"in_process\"] else task[\"body\"],",
+        "                prompt = templates.resolution(\n"
+        "                    asked_behavior=asked,\n"
+        "                    response=resolution_text,\n"
+        "                    next_job=None,",
+        "the next job is dropped from the resolution prompt, so an agent is handed an answer "
+        "and no instruction while the work it should do sits deleted from the queue",
     ),
     (
         "a-lineage-may-fork", "messaging_core/core.py",
@@ -257,10 +280,10 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
         "[ERROR] of equal priority and the correction is never delivered",
     ),
     (
-        "idle-hold-spins", "polling/server.py",
+        "a-wait-spins", "polling/server.py",
         "                    stop_event.wait(self.hold_interval)",
         "                    stop_event.wait(max(self.poll_interval / 4, 0.0))",
-        "an [IDLE] hold polls at four times the poll rate forever, for a partner "
+        "a waiting agent is polled at four times the poll rate forever, for a partner "
         "deliberately stopped with nothing to poll",
     ),
     (
@@ -309,11 +332,11 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "summary-phase-not-carried", "messaging_core/core.py",
-        '                            int(bool(working.get("summary_phase"))),',
-        "                            0,",
-        "a displaced summary phase is requeued without its marker, so on resume it is "
-        "an ordinary [TRUTHFUL-REPORT] that owes nothing back and the research result "
-        "is silently dropped",
+        '                    int(bool(task.get("summary_phase"))),',
+        "                    0,",
+        "a summary phase whose delivery failed is requeued without its marker, so on "
+        "resume it is an ordinary [TRUTHFUL-REPORT] that owes nothing back and the "
+        "research result is silently dropped",
     ),
     (
         "summary-resumed-as-a-plain-pause", "messaging_core/core.py",
@@ -347,15 +370,15 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "priority-inverted", "messaging_core/core.py",
-        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC,",
-        " ORDER BY MIN(c.priority) DESC, MIN(q.in_process) ASC,",
+        "          MIN(c.priority) ASC, MIN(q.in_process) ASC,",
+        "          MIN(c.priority) DESC, MIN(q.in_process) ASC,",
         "_HEAD_LABEL_SQL picks the LOWEST-priority label last instead of first, so a "
         "[RESEARCH] can win the working slot over a [QUERY] that stops work",
     ),
     (
         "in-process-ignored", "messaging_core/core.py",
-        " ORDER BY q.in_process DESC, q.enqueued_at ASC, q.id ASC",
-        " ORDER BY q.enqueued_at ASC, q.id ASC",
+        " ORDER BY q.awaiting_resolution DESC, q.in_process DESC, q.enqueued_at ASC, q.id ASC",
+        " ORDER BY q.awaiting_resolution DESC, q.enqueued_at ASC, q.id ASC",
         "_HEAD_ROW_SQL drops the paused-first tie-break, so a paused task loses "
         "to a fresh arrival carrying the same label and a partner never resumes "
         "what it was already doing",
@@ -378,11 +401,11 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "displaced-not-paused", "messaging_core/core.py",
-        '                        "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",\n'
+        '                        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",\n'
         "                        (\n"
         "                            partner_id,\n"
         '                            working["caller_id"],',
-        '                        "VALUES (?, ?, ?, ?, 0, ?, ?, ?)",\n'
+        '                        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",\n'
         "                        (\n"
         "                            partner_id,\n"
         '                            working["caller_id"],',
@@ -391,24 +414,25 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
         "prompt is wrong",
     ),
     (
-        "idle-requeued", "messaging_core/core.py",
-        "                # Requeuing it would stop the partner again the moment it\n"
-        "                # resumed.\n"
-        "                if working is not None and not holding:\n"
-        "                    conn.execute(",
-        "                # Requeuing it would stop the partner again the moment it\n"
-        "                # resumed.\n"
-        "                if working is not None:\n"
-        "                    conn.execute(",
-        "advance()'s _swap requeues a displaced [IDLE] hold instead of "
-        "discarding it, so a cleared interruption re-interrupts the partner "
-        "the moment it comes back around",
+        "a-displaced-wait-comes-back-as-work", "messaging_core/core.py",
+        "                            int(bool(working.get(\"awaiting_resolution\"))),",
+        "                            0,",
+        "advance()'s _swap drops the awaiting_resolution marker, so a question displaced by "
+        "a summary comes back looking like an ordinary [QUERY] a caller sent and the agent "
+        "is told to answer the question it asked",
+    ),
+    (
+        "a-wait-does-not-outrank-its-own-queue", "messaging_core/core.py",
+        " ORDER BY q.awaiting_resolution DESC, q.in_process DESC, q.enqueued_at ASC, q.id ASC",
+        " ORDER BY q.in_process DESC, q.enqueued_at ASC, q.id ASC",
+        "a displaced question loses to an ordinary paused row of its own label, so the agent "
+        "resumes work it still cannot do and the answer arrives with nothing to resolve",
     ),
     (
         "in-process-crosses-labels", "messaging_core/core.py",
-        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC,\n"
+        "          MIN(c.priority) ASC, MIN(q.in_process) ASC,\n"
         "          MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) ASC,",
-        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) DESC,\n"
+        "          MIN(c.priority) ASC, MIN(q.in_process) DESC,\n"
         "          MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) DESC,",
         "the paused-vs-fresh tie-break stops being scoped to one label, so a "
         "paused [QUERY] beats a fresh [ERROR] at the same priority and a Caller's "

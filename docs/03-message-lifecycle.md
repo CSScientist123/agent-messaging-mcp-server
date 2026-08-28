@@ -15,13 +15,12 @@ is `docs/01-architecture-and-rationale.md`.
 
 **Assumed prior knowledge.** Python, SQLite, and roughly what MCP is.
 
-## The six labels
+## The five labels
 
 Every message carries one behavior label. They describe what a message is *about*.
 
 | Label | What it is |
 |---|---|
-| `[IDLE]` | stop and wait — the vehicle for a forced interruption |
 | `[TRUTHFUL-REPORT]` | a summary of work that has finished |
 | `[QUERY]` | a request for context the sender does not have |
 | `[ERROR]` | something went wrong and the sender is stopped |
@@ -54,7 +53,6 @@ Priority lives in `label_caps.priority`, and lower wins:
 
 | Priority | Label | Why here |
 |---|---|---|
-| 0 | `[IDLE]` | An interruption must always win, or it is not an interruption |
 | 1 | `[TRUTHFUL-REPORT]` | A summary must be written without other traffic contaminating the context it summarizes |
 | 2 | `[QUERY]`, `[ERROR]` | Both stop work; neither is more urgent than the other |
 | 3 | `[MESSAGE-RESPONSE]` | The answer that unblocks — outranks the work that is blocked |
@@ -67,7 +65,7 @@ a row.
 
 `label_caps.max_outstanding` limits how many tasks of one label one Caller may have
 outstanding against one Partner: three for `[QUERY]`, two for `[RESEARCH]`, and NULL —
-uncapped — for the other four.
+uncapped — for the other three.
 
 Two things about the key are worth being precise about, because both were wrong in an
 earlier version.
@@ -116,8 +114,8 @@ holds what is waiting; the moment work starts it is no longer waiting.
 ## Advancing: the one place the swap happens
 
 `MessagingCore.advance(partner_id)` is the single implementation of "compare the head
-against the working slot and act". `send`, `interrupt_partner`, and the Polling Server's
-drain thread all call it. None of them reimplements it — an earlier version had two copies
+against the working slot and act". `send` and the Polling Server's drain thread both call
+it. None of them reimplements it — an earlier version had two copies
 of this logic, in the core and in the polling server, and keeping two copies in step is a
 bug waiting for the next person.
 
@@ -186,62 +184,86 @@ over instead of continue.
 
 The row's `body` stays the **original request** throughout, precisely so this holds.
 
-## A Partner that cannot finish on its own
+## An agent that cannot continue on its own
 
-A Partner working a `[RESEARCH]` sometimes hits something only the agent that sent it can
-resolve — a path it was not granted, a question about what was actually meant. It raises a
-`[QUERY]` or an `[ERROR]` **upward**, along the reverse handshake, and then stops.
+Any agent — Caller or Partner, it makes no difference — sometimes hits something only
+another one can resolve: a path it was not granted, a question about what was actually
+meant. It sends a `[QUERY]` or an `[ERROR]`, and **that act stops it.**
 
 The stopping is the part worth explaining. Without it the next queued message reaches an
 agent that is blocked on an unanswered question, and the two interleave in one context with
-nothing marking where either begins. So `send` parks the sender: an `[IDLE]` takes its
-working slot, and the unfinished work sits paused in its own queue.
+nothing marking where either begins. So `send` does three things for a blocking label, in
+this order: it stops the sender's remote, pushes whatever the sender was working on back
+into the sender's own queue marked `in_process`, and puts the question itself into the
+sender's working slot.
 
-Three conditions, all required. The label is `[QUERY]` or `[ERROR]`; the sender holds a
-working slot; and the message travels back **along** a handshake rather than out along one.
-That last condition is what makes it precise. A Caller dispatching a routine `[QUERY]` down
-to a worker holds a slot too, and an orchestrator that stopped itself every time it asked a
-worker anything would halt everything it was driving.
+There is one condition, not three: the label is `[QUERY]` or `[ERROR]`. Direction does not
+matter, and neither does whether the sender held work. A Caller that asks a question has
+said exactly what a Partner does when it asks one — *I need this before I go on* — and an
+orchestrator that keeps working on other things while blocked is an orchestrator producing
+work it will have to redo. An agent with nothing in flight still needs its wait represented,
+or the next arrival would look like something it can act on.
+
+**The question is the hold.** There is no separate label for stopping. The question sits in
+the slot at its own natural priority — `[QUERY]` and `[ERROR]` are never raised above the 2
+they already hold — and that alone makes it a blocker: only `[TRUTHFUL-REPORT]`, at 1,
+outranks it. Everything else queues behind it.
+
+Nothing is delivered for a wait. The remote was just stopped; handing it a paragraph would
+give it something to act on when the whole point is that it does nothing until it hears
+back. The drain thread does not poll a waiting agent for completion, does not report
+anything back for it, and the supervisor does not arm a thread for one.
+
+An agent already waiting is refused a second question, `already_awaiting_an_answer`. It is
+stopped; a question it cannot act on the answer to is not a question.
 
 On the receiving side nothing new is needed. The `[QUERY]` or `[ERROR]` arrives at priority
-2 and goes to the front of everything below it, displacing a running task unless that task ties or outranks it — that displacement *is* the interruption. The
-Caller resolves it and answers; the `[MESSAGE-RESPONSE]` lands in the Partner's queue and
-displaces the hold, because anything displaces a hold. The paused work resumes behind it.
-Nothing has to remember to release anything.
+2 and goes to the front of everything below it, displacing a running task unless that task
+ties or outranks it — that displacement *is* the interruption on that end. There is no
+capability for one agent to stop another; being stopped is always a consequence of what
+arrives, or of what you yourself sent.
 
-## Interruption is a normal push
+## The answer, and what it is folded into
 
-`interrupt_partner` does not have a mechanism of its own. It pushes a dummy `[IDLE]` into
-the target's queue and calls `advance`. Because `[IDLE]` holds priority 0, it takes the
-working slot by construction.
+The wait ends when a `[MESSAGE-RESPONSE]` reaches the head of the waiting agent's queue.
+`advance` then does something it does for no other label: it **consumes** the answer's row
+without promoting it as a task, discards the question in the slot (never requeuing it — it
+was asked, and it was answered), and re-reads the head to find what the agent should
+actually do next.
 
-That is the point: interruption and ordinary delivery are the same code path, so there is no
-second implementation to keep in step with the first, and no way for the two to disagree
-about what happens to the displaced task.
+The reason is that a bare response is close to useless as a prompt. An agent handed only
+"the 2024 set" is holding a fact and no instruction, and has to guess whether to resume, to
+wait, or to start something. What it should do next is already decided and sitting at the
+head of its own queue, so the two are delivered as one prompt. Three shapes, from
+`templates.resolution`:
 
-An `[IDLE]` sitting in the working slot is a **hold**, not a task, and it is handled
-differently in exactly two places:
+| What the head holds | What the agent is told |
+|---|---|
+| a new job | `Resolution attempt on <label> is returned.` / `Response: …` / `Resume your work with this new job: …` |
+| its own paused work | `Resolution attempt on <label> is returned.` / `Response: …` / `Resume your work on: <label>` |
+| nothing | `Resolution attempt on <label> is returned.` / `Response: …` |
 
-- **Anything displaces it**, regardless of priority. Comparing priorities would make the
-  interruption permanent, since nothing outranks `[IDLE]`. The Partner is stopped and
-  waiting, and the next thing to arrive is what it was waiting for.
-- **It is discarded rather than requeued** when displaced. It has already done its whole
-  job, which was to stop the Partner. Requeuing it would stop the Partner again the moment
-  it resumed.
+The last is the one case where a bare response *is* right, because there is nothing to
+attach it to.
 
-The drain thread also never polls an `[IDLE]` for completion and never reports anything back
-for it.
+## A displaced question is still a question
 
-`send` refuses `[IDLE]` outright (`idle_not_sendable`). Accepting it would be a second route
-to interrupting a Partner — one that skips the same-project and can-execute checks and never
-stops the remote, leaving it working on something it has just been told to abandon.
+A `[TRUTHFUL-REPORT]` outranks a waiting agent, so a summary really can take the slot from
+one. The question is not lost: the row that goes back into the queue carries
+`awaiting_resolution = 1`.
+
+That column earns its place twice. It makes the row outrank everything else in that agent's
+queue, so the wait is what resumes when the summary finishes rather than some job the agent
+cannot do. And it makes the resumed row re-enter the wait — nothing rendered, nothing
+delivered — instead of coming back looking like an ordinary `[QUERY]` a caller had sent, and
+being handed to the agent as work it has already asked.
 
 ## What is stored, and what is only transported
 
 `label_caps.stored` decides. Three labels are written to `messages` and are readable later
-through `read`: `[QUERY]`, `[TRUTHFUL-REPORT]`, `[MESSAGE-RESPONSE]`. The other three —
-`[RESEARCH]`, `[ERROR]`, `[IDLE]` — are transport: they travel in a queue, are acted on, and
-are never written down.
+through `read`: `[QUERY]`, `[TRUTHFUL-REPORT]`, `[MESSAGE-RESPONSE]`. The other two —
+`[RESEARCH]` and `[ERROR]` — are transport: they travel in a queue, are acted on, and are
+never written down.
 
 The rule is enforced by a trigger (`messages_stored_labels_only`) that reads `label_caps`,
 rather than by a `CHECK` listing the labels. A list in the `CHECK` would be a second copy of
@@ -284,7 +306,9 @@ a summary being delivered.
 **The priority is raised for the second phase, and that is what blocks the queue.** Once the
 slot reads `[TRUTHFUL-REPORT]` at priority 1, every arriving message **queues instead of
 reaching the agent** — `[QUERY]` and `[ERROR]` at 2, `[MESSAGE-RESPONSE]` at 3, `[RESEARCH]`
-at 4 — because `advance` displaces only on a strictly lower number, and only `[IDLE]` has one.
+at 4 — because `advance` displaces only on a strictly lower number, and nothing has one.
+`[TRUTHFUL-REPORT]` is the top of the table, which is the same fact that lets a summary take
+the slot from an agent waiting on its own question.
 
 The blocking is the point, and it is worth stating as the counterfactual: a summary written
 while other traffic *was* reaching the same context would summarize the traffic.
@@ -311,13 +335,12 @@ When a working task finishes, what goes back to the Caller is `label_caps.reply_
 |---|---|
 | `[QUERY]` | `[MESSAGE-RESPONSE]` |
 | `[RESEARCH]` | `[TRUTHFUL-REPORT]` (after the summary phase) |
-| `[ERROR]` | nothing |
+| `[ERROR]` | `[MESSAGE-RESPONSE]` |
 | `[MESSAGE-RESPONSE]` | nothing |
 | `[TRUTHFUL-REPORT]` | nothing |
-| `[IDLE]` | nothing |
 
-**The NULL is the important value in that column.** Two labels ask for something; the other
-four *are* answers, or are not messages at all. Without a label whose reply is nothing, every
+**The NULL is the important value in that column.** Three labels ask for something; the other
+two *are* answers. Without a label whose reply is nothing, every
 completed task would produce a message that produced a task that produced a message, and two
 agents would talk to each other until one of them was archived. A `CHECK` on `label_caps`
 additionally forbids a label replying with itself, which is the same infinite exchange

@@ -21,7 +21,7 @@ flowchart LR
     Q[("message_queue -- ONE per Partner\n\nreading the head is TWO questions:\n1. which LABEL -- priority, then a label with\n   unpaused work over one entirely paused,\n   then arrival\n2. which ROW of it -- paused first, then arrival")]
     OK --> Q
 
-    PRIO["label_caps.priority -- lower wins\n\n0  [IDLE]                carries a forced interruption\n1  [TRUTHFUL-REPORT]    summarize without contamination\n2  [QUERY] = [ERROR]    both stop work; neither is more urgent\n3  [MESSAGE-RESPONSE]   the answer that unblocks\n4  [RESEARCH]           delegated work, the patient kind"]
+    PRIO["label_caps.priority -- lower wins\n\n1  [TRUTHFUL-REPORT]    summarize without contamination\n2  [QUERY] = [ERROR]    both stop the SENDER; an unanswered\n                     question is the blocker\n3  [MESSAGE-RESPONSE]   the answer that unblocks\n4  [RESEARCH]           delegated work, the patient kind"]
 
     Q -.->|"ordered by"| PRIO
 
@@ -36,4 +36,4 @@ flowchart LR
     SLOT -.-> EQ
 
     STORE[("messages\nonly labels with\nlabel_caps.stored = 1:\n[QUERY] [TRUTHFUL-REPORT]\n[MESSAGE-RESPONSE]")]
-    OK -.->|"[RESEARCH] [ERROR] [IDLE]\nare transport -- never written"| STORE
+    OK -.->|"[RESEARCH] and [ERROR]\nare transport -- never written"| STORE

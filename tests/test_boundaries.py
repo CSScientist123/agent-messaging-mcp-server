@@ -183,6 +183,22 @@ def _flatten_strings(obj):
         yield obj
 
 
+def evict(world: World, partner_id: int) -> None:
+    """Push the working task back into the queue, paused, and free the slot.
+
+    There is no interrupt capability: an agent is stopped only as a side
+    effect of something outranking its work, or of asking a blocking question
+    itself. The tests below are about which queue row `advance` picks NEXT,
+    not about what caused the eviction -- and staging a real displacement
+    would put the displacing message into the very slot under test. So they
+    take the eviction directly, in exactly the shape `advance`'s own swap
+    leaves behind: the old task back in the queue with `in_process = 1`.
+    """
+    task = world.sci.release(partner_id=partner_id)
+    assert task is not None, "nothing to evict -- the working slot was already empty"
+    world.sci._requeue(task)
+
+
 def assert_no_foreign_uuid(result, forbidden_uuids: set[str]) -> None:
     strings = set(_flatten_strings(result))
     leaked = strings & forbidden_uuids
@@ -200,36 +216,41 @@ def test_cap_counts_the_working_slot_deterministically(world: World):
     claim is specific: "the count is keyed (partner_id, caller_id, behavior)
     and INCLUDES the in-memory working slot." Isolate exactly that term
     without any concurrency, so this fails for certain (not "usually") if
-    `_ADMIT_SQL` ever stops adding `:working` to the count: push four
-    `[QUERY]`s from ONE caller, one at a time, in order. The first always
-    wins the empty slot (occupying 1 of the cap's 3), so admissions 2 and 3
-    must be admitted (bringing outstanding to 1 working + 2 queued = 3) and
-    the 4th must be refused -- if the slot's own occupant were not counted,
-    a strictly sequential send is exactly the case where the mutation
-    (`_ADMIT_SQL` counting only queued rows) would let a 4th through, since
+    `_ADMIT_SQL` ever stops adding `:working` to the count: push three
+    `[RESEARCH]`s from ONE caller, one at a time, in order. The first always
+    wins the empty slot (occupying 1 of the cap's 2), so admission 2 must be
+    admitted (bringing outstanding to 1 working + 1 queued = 2) and the 3rd
+    must be refused -- if the slot's own occupant were not counted, a
+    strictly sequential send is exactly the case where the mutation
+    (`_ADMIT_SQL` counting only queued rows) would let a 3rd through, since
     at admission time nothing is racing to obscure the count.
+
+    `[RESEARCH]` rather than the other capped label, `[QUERY]`: a `[QUERY]`
+    stops the agent that sends it, so one caller cannot push several without
+    tripping a rule that has nothing to do with caps.
     """
-    world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="workerA")
+    world.code.handshake(requester_uuid=world.code_partner["uuid"], partner_title="bridgeA")
 
-    r0 = world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m0", behavior="[QUERY]")
-    assert r0["delivered"] == "[QUERY]", "the first QUERY into an empty slot must be delivered immediately"
+    r0 = world.sci.send(requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA",
+                        message="m0", behavior="[RESEARCH]")
+    assert r0["delivered"] == "[RESEARCH]", "the first RESEARCH into an empty slot must be delivered immediately"
 
-    r1 = world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m1", behavior="[QUERY]")
+    r1 = world.sci.send(requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA",
+                        message="m1", behavior="[RESEARCH]")
     assert r1["delivered"] is None
-    r2 = world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m2", behavior="[QUERY]")
-    assert r2["delivered"] is None
 
     with pytest.raises(Rejected) as exc:
-        world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m3", behavior="[QUERY]")
+        world.sci.send(requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA",
+                       message="m2", behavior="[RESEARCH]")
     assert exc.value.code == "over_queue"
 
     queued = world.db.read_one(
-        "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=? AND caller_id=? AND behavior='[QUERY]'",
-        (world.worker["id"], world.orch["id"]),
+        "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=? AND caller_id=? AND behavior='[RESEARCH]'",
+        (world.bridge["id"], world.code_partner["id"]),
     )["n"]
-    assert queued == 2, f"exactly m1 and m2 should still be queued (m0 is working, m3 was refused), got {queued}"
-    working = world.sci.working_task(partner_id=world.worker["id"])
-    assert working["behavior"] == "[QUERY]" and working["body"] == "m0"
+    assert queued == 1, f"exactly m1 should still be queued (m0 is working, m2 was refused), got {queued}"
+    working = world.sci.working_task(partner_id=world.bridge["id"])
+    assert working["behavior"] == "[RESEARCH]" and working["body"] == "m0"
 
 
 def test_cap_holds_under_concurrent_hammering(world: World):
@@ -394,7 +415,7 @@ def test_report_back_gate_runs_before_admission(world: World):
     depth_before = world.db.read_one(
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.worker["id"],)
     )["n"]
-    for blocked in ("[RESEARCH]", "[IDLE]"):
+    for blocked in ("[RESEARCH]",):
         with pytest.raises(Rejected) as exc:
             world.sci.report_back(
                 to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior=blocked, body="x"
@@ -483,22 +504,29 @@ def test_report_back_cap_holds_if_a_reply_label_is_ever_capped(world: World):
 
 
 def test_equal_priority_never_displaces_no_ping_pong(world: World):
-    """ATTACK: two different callers alternate sending [QUERY] (same priority)
-    to one partner, trying to make it ping-pong between them forever. `bridgeA`
-    is the one target BOTH a project-orchestrator and a code_ partner can
-    legitimately hold a standing handshake to at once, so this is a real,
-    reachable two-caller shape rather than a synthetic one. Held: `advance`
-    requires the head to STRICTLY beat the working task (`head_priority >=
-    working["priority"]` blocks the swap), so an arriving [QUERY] never
-    displaces a [QUERY] already being worked, regardless of who sent either.
+    """ATTACK: two different callers alternate sending the same label (and so
+    the same priority) to one partner, trying to make it ping-pong between
+    them forever. `bridgeA` is the one target BOTH a project-orchestrator and
+    a code_ partner can legitimately hold a standing handshake to at once, so
+    this is a real, reachable two-caller shape rather than a synthetic one.
+    Held: `advance` requires the head to STRICTLY beat the working task
+    (`head_priority >= working["priority"]` blocks the swap), so an arriving
+    message never displaces one of equal priority already being worked,
+    regardless of who sent either.
+
+    The label is `[MESSAGE-RESPONSE]` because the attack needs one caller to
+    send repeatedly. A blocking label would stop the attacker after its first
+    message and end the experiment for a reason unrelated to the rule under
+    test; the strict-beat comparison itself is label-agnostic.
     """
     world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="bridgeA")
     world.code.handshake(requester_uuid=world.code_partner["uuid"], partner_title="bridgeA")
 
     r1 = world.sci.send(
-        requester_uuid=world.orch["uuid"], queried_partner_title="bridgeA", message="a1", behavior="[QUERY]"
+        requester_uuid=world.orch["uuid"], queried_partner_title="bridgeA", message="a1",
+        behavior="[MESSAGE-RESPONSE]"
     )
-    assert r1["delivered"] == "[QUERY]"
+    assert r1["delivered"] == "[MESSAGE-RESPONSE]"
     working_before = world.sci.working_task(partner_id=world.bridge["id"])
     assert working_before["caller_id"] == world.orch["id"]
 
@@ -512,9 +540,10 @@ def test_equal_priority_never_displaces_no_ping_pong(world: World):
         # message is admitted there, then delivered by whichever process
         # actually holds a matching extension.
         r2 = world.sci.send(
-            requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA", message=f"b{i}", behavior="[QUERY]"
+            requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA", message=f"b{i}",
+            behavior="[MESSAGE-RESPONSE]"
         )
-        assert r2["delivered"] is None, "an equal-priority QUERY displaced the working QUERY"
+        assert r2["delivered"] is None, "an equal-priority message displaced the working task"
         working_now = world.sci.working_task(partner_id=world.bridge["id"])
         assert working_now["caller_id"] == world.orch["id"], "the working slot ping-ponged to the second caller"
         assert working_now["message_id"] == working_before["message_id"] or working_now["body"] == working_before["body"]
@@ -535,31 +564,35 @@ def test_paused_task_beats_fresh_task_of_the_same_label_only(world: World):
     win instead, purely by having arrived first; only the explicit
     same-label tie-break makes "first" (paused) win despite arriving later.
     """
-    world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="workerA")
-    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="first", behavior="[QUERY]")
+    # bridgeA is the one target two different callers can both hold a standing
+    # handshake to, which this test now needs: an agent that asks a [QUERY] is
+    # stopped by it, so "first" and "second" cannot come from the same caller.
+    world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="bridgeA")
+    world.code.handshake(requester_uuid=world.code_partner["uuid"], partner_title="bridgeA")
+    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="bridgeA", message="first", behavior="[QUERY]")
     # Equal priority: "second" does NOT displace "first" from the slot, and
     # is queued fresh (in_process=0) with the EARLIER of the two timestamps.
-    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="second", behavior="[QUERY]")
+    world.sci.send(requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA", message="second", behavior="[QUERY]")
 
-    # Displaces "first" out of the slot; it re-enters the queue paused
+    # Evicts "first" from the slot; it re-enters the queue paused
     # (in_process=1) with a NEW, LATER enqueued_at than "second" already has.
-    world.sci.interrupt_partner(requester_uuid=world.orch["uuid"], partner_title="workerA", reason="hold")
+    evict(world, world.bridge["id"])
     row = world.db.read_one(
-        "SELECT enqueued_at FROM message_queue WHERE partner_id=? AND body='second'", (world.worker["id"],)
+        "SELECT enqueued_at FROM message_queue WHERE partner_id=? AND body='second'", (world.bridge["id"],)
     )
     paused_row = world.db.read_one(
-        "SELECT enqueued_at FROM message_queue WHERE partner_id=? AND body='first'", (world.worker["id"],)
+        "SELECT enqueued_at FROM message_queue WHERE partner_id=? AND body='first'", (world.bridge["id"],)
     )
     assert paused_row["enqueued_at"] >= row["enqueued_at"], (
         "test setup assumption broken: the paused row must not be chronologically "
         "earlier than the fresh one, or this stops isolating the tie-break"
     )
 
-    # holding=True (slot holds [IDLE]) -- force the same head decision
-    # `send`'s own advance() call would make, without going through send()
-    # again (which would also work, but this isolates _HEAD_SQL directly).
-    world.sci.advance(partner_id=world.worker["id"])
-    working = world.sci.working_task(partner_id=world.worker["id"])
+    # The slot is empty -- force the same head decision `send`'s own advance()
+    # call would make, without going through send() again (which would also
+    # work, but this isolates the head SQL directly).
+    world.sci.advance(partner_id=world.bridge["id"])
+    working = world.sci.working_task(partner_id=world.bridge["id"])
     assert working["behavior"] == "[QUERY]"
     assert working["body"] == "first", (
         f"a fresh QUERY (arrived first) beat the paused QUERY of the same label: working={working!r}"
@@ -585,7 +618,7 @@ def test_paused_research_does_not_beat_a_fresh_query(world: World):
     working = world.sci.working_task(partner_id=world.bridge["id"])
     assert working["behavior"] == "[RESEARCH]"
 
-    world.sci.interrupt_partner(requester_uuid=world.orch["uuid"], partner_title="bridgeA", reason="hold")
+    evict(world, world.bridge["id"])
     row = world.db.read_one(
         "SELECT in_process FROM message_queue WHERE partner_id=? AND behavior='[RESEARCH]'", (world.bridge["id"],)
     )
@@ -599,28 +632,59 @@ def test_paused_research_does_not_beat_a_fresh_query(world: World):
     assert bool(working_after["in_process"]) is False
 
 
-def test_idle_hold_is_never_requeued_after_being_displaced(world: World):
-    """ATTACK: after an [IDLE] hold takes the slot, can it come back? Held:
-    when the hold itself is displaced, `advance`'s swap only requeues
-    `working` `if working is not None and not holding` -- the hold's own
-    displacement has `holding=True`, so it is dropped, never re-inserted.
+def test_a_waiting_agents_own_question_is_never_handed_back_to_it_as_work(world: World):
+    """ATTACK: an agent that asked a blocking question holds its own question
+    in its working slot while it waits. That task is synthetic -- it has no
+    queue row and never gets one. Can it be turned back into work?
+
+    Two routes are tried. First, displacement: a `[TRUTHFUL-REPORT]`
+    outranks the wait, and if the swap requeued the waiting task like an
+    ordinary one, the agent would later be handed its OWN question as though
+    a caller had sent it. Held: the row goes back carrying
+    `awaiting_resolution = 1`, and promoting it re-enters the wait rather
+    than delivering anything.
+
+    Second, delivery: nothing is ever handed to the remote for a wait. The
+    agent was just stopped; typing at it would give it something to act on
+    when the whole point is that it does nothing until it hears back.
     """
     world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="bridgeA")
     world.code.handshake(requester_uuid=world.code_partner["uuid"], partner_title="bridgeA")
 
-    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="bridgeA", message="q0", behavior="[QUERY]")
-    world.sci.interrupt_partner(requester_uuid=world.orch["uuid"], partner_title="bridgeA", reason="stop")
-    assert world.sci.working_task(partner_id=world.bridge["id"])["behavior"] == "[IDLE]"
-
-    world.sci.send(
-        requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA", message="q1", behavior="[QUERY]"
+    # bridgeA asks its own caller a [QUERY] and is stopped waiting for it.
+    world.sci.send(requester_uuid=world.bridge["uuid"], queried_partner_title="orchA",
+                   message="which path?", behavior="[QUERY]")
+    waiting = world.sci.working_task(partner_id=world.bridge["id"])
+    assert waiting is not None and waiting["awaiting_resolution"], (
+        f"precondition failed: bridgeA should be waiting on its own [QUERY], got {waiting!r}"
     )
-    assert world.sci.working_task(partner_id=world.bridge["id"])["behavior"] == "[QUERY]"
 
-    idle_rows = world.db.read(
-        "SELECT * FROM message_queue WHERE partner_id=? AND behavior='[IDLE]'", (world.bridge["id"],)
+    calls_before = len(world.sci_ext.calls)
+    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="bridgeA",
+                   message="summarise", behavior="[TRUTHFUL-REPORT]")
+    assert world.sci.working_task(partner_id=world.bridge["id"])["behavior"] == "[TRUTHFUL-REPORT]"
+
+    parked = world.db.read(
+        "SELECT * FROM message_queue WHERE partner_id=? AND behavior='[QUERY]'", (world.bridge["id"],)
     )
-    assert idle_rows == [], f"a displaced [IDLE] hold was requeued: {[dict(r) for r in idle_rows]}"
+    assert len(parked) == 1 and parked[0]["awaiting_resolution"] == 1, (
+        f"a displaced wait must return to the queue still marked as a wait: "
+        f"{[dict(r) for r in parked]}"
+    )
+
+    # Finish the report; the wait is promoted -- and resumes as a wait.
+    world.sci.release(partner_id=world.bridge["id"])
+    world.sci.advance(partner_id=world.bridge["id"])
+    resumed = world.sci.working_task(partner_id=world.bridge["id"])
+    assert resumed is not None and resumed["awaiting_resolution"], (
+        f"a promoted wait must re-enter the wait, not become work: {resumed!r}"
+    )
+    delivered = [c for c in world.sci_ext.calls[calls_before:]
+                 if c[0] == "deliver_message" and c[1]["partner_id_in_remote"] == "ra-bridge"]
+    assert len(delivered) == 1, (
+        f"exactly one delivery to bridgeA was legitimate (the [TRUTHFUL-REPORT]); "
+        f"a wait must never be delivered: {delivered!r}"
+    )
 
 
 
@@ -643,32 +707,37 @@ def test_paused_query_does_not_beat_a_fresh_error_of_equal_priority(world: World
     only waiting to resume -- so `in_process` only ever tie-breaks WITHIN
     one label, never across two sharing a priority.
     """
-    world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="workerA")
+    # The two messages come from two different callers, which bridgeA is the
+    # one target to allow: asking a blocking question stops the asker, so one
+    # caller cannot send both the [QUERY] and the [ERROR].
+    world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="bridgeA")
+    world.code.handshake(requester_uuid=world.code_partner["uuid"], partner_title="bridgeA")
 
     # 1. A [QUERY] takes the empty working slot.
     r0 = world.sci.send(
-        requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="what is X?", behavior="[QUERY]"
+        requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA",
+        message="what is X?", behavior="[QUERY]"
     )
     assert r0["delivered"] == "[QUERY]"
 
-    # 2. Interrupted: [IDLE] takes the slot, the [QUERY] is queued paused
+    # 2. Evicted: the slot is freed and the [QUERY] is queued paused
     # (in_process=1).
-    world.sci.interrupt_partner(requester_uuid=world.orch["uuid"], partner_title="workerA", reason="stop")
+    evict(world, world.bridge["id"])
     paused = world.db.read_one(
-        "SELECT in_process FROM message_queue WHERE partner_id=? AND behavior='[QUERY]'", (world.worker["id"],)
+        "SELECT in_process FROM message_queue WHERE partner_id=? AND behavior='[QUERY]'", (world.bridge["id"],)
     )
     assert paused["in_process"] == 1
 
     # 3. A fresh [ERROR] arrives -- same priority (2) as the paused [QUERY].
     r1 = world.sci.send(
-        requester_uuid=world.orch["uuid"], queried_partner_title="workerA",
+        requester_uuid=world.orch["uuid"], queried_partner_title="bridgeA",
         message="that call failed: bad path", behavior="[ERROR]",
     )
 
     # 4. The [ERROR] -- not the paused [QUERY] -- is what reaches the remote,
     # delivered as a plain relay, never the "resume" template.
     assert r1["delivered"] == "[ERROR]"
-    working = world.sci.working_task(partner_id=world.worker["id"])
+    working = world.sci.working_task(partner_id=world.bridge["id"])
     assert working["behavior"] == "[ERROR]", (
         f"a paused [QUERY] beat a fresh [ERROR] of equal priority: working={working!r}"
     )
@@ -680,9 +749,9 @@ def test_paused_query_does_not_beat_a_fresh_error_of_equal_priority(world: World
 
     # 5. Once the [ERROR] finishes and the slot is released, the paused
     # [QUERY] is what resumes next -- with its ORIGINAL body intact.
-    world.sci.release(partner_id=world.worker["id"])
-    world.sci.advance(partner_id=world.worker["id"])
-    resumed = world.sci.working_task(partner_id=world.worker["id"])
+    world.sci.release(partner_id=world.bridge["id"])
+    world.sci.advance(partner_id=world.bridge["id"])
+    resumed = world.sci.working_task(partner_id=world.bridge["id"])
     assert resumed["behavior"] == "[QUERY]"
     assert resumed["body"] == "what is X?"
     assert bool(resumed["in_process"]) is True
@@ -712,9 +781,9 @@ def test_paused_research_beats_a_fresh_research_same_label(world: World):
         requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA", message="second", behavior="[RESEARCH]"
     )
 
-    # Displaces "first" out of the slot; it re-enters the queue paused
+    # Evicts "first" from the slot; it re-enters the queue paused
     # (in_process=1) with a NEW, LATER enqueued_at than "second" already has.
-    world.sci.interrupt_partner(requester_uuid=world.orch["uuid"], partner_title="bridgeA", reason="hold")
+    evict(world, world.bridge["id"])
 
     world.sci.advance(partner_id=world.bridge["id"])
     working = world.sci.working_task(partner_id=world.bridge["id"])
@@ -794,14 +863,27 @@ def test_nlm_can_never_send_anything(world: World):
     assert depth == 0
 
 
-def test_interrupt_partner_cannot_cross_projects(world: World):
-    """ATTACK: interrupt a partner in a DIFFERENT project. Held: refused
-    `different_project`; no [IDLE] admitted, nothing recorded in
-    `drain_threads`, and the target's working slot is untouched.
+def test_a_partner_in_another_project_cannot_be_reached_or_stopped(world: World):
+    """ATTACK: stop a partner in a DIFFERENT project.
+
+    There is no interrupt capability to attack directly -- an agent is stopped
+    only as a consequence of a message reaching it. So the attack is the send
+    itself, and it must be refused before anything touches the target: nothing
+    admitted to its queue, and its working slot untouched.
     """
+    for behavior in ("[QUERY]", "[ERROR]", "[TRUTHFUL-REPORT]"):
+        with pytest.raises(Rejected) as exc:
+            world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="orchB",
+                           message="stop", behavior=behavior)
+        assert exc.value.code == "no_handshake", (
+            f"{behavior} across projects should be refused for want of a handshake, "
+            f"got {exc.value.code!r}"
+        )
     with pytest.raises(Rejected) as exc:
-        world.sci.interrupt_partner(requester_uuid=world.orch["uuid"], partner_title="orchB", reason="stop")
-    assert exc.value.code == "different_project"
+        world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="orchB")
+    assert exc.value.code == "different_project", (
+        f"expected different_project, got {exc.value.code!r}"
+    )
     depth = world.db.read_one(
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.orch_b["id"],)
     )["n"]
@@ -855,7 +937,7 @@ def test_report_back_refuses_a_non_reply_behavior_no_research_upward(world: Worl
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.orch["id"],)
     )["n"]
 
-    for blocked in ("[RESEARCH]", "[IDLE]"):
+    for blocked in ("[RESEARCH]",):
         with pytest.raises(Rejected) as exc2:
             world.sci.report_back(
                 to_partner_id=world.orch["id"], from_partner_id=world.bridge["id"], behavior=blocked, body="evil upward research"
@@ -1212,7 +1294,6 @@ def test_no_capability_leaks_a_foreign_uuid(world: World):
             requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="hi", behavior="[QUERY]"
         ),
         lambda: world.sci.read(requester_uuid=world.orch["uuid"], partner_title="workerA"),
-        lambda: world.sci.interrupt_partner(requester_uuid=world.orch["uuid"], partner_title="workerA", reason="x"),
     ]
     for call in calls:
         result = call()
@@ -1231,7 +1312,7 @@ def _archive(world: World, title: str) -> None:
     assert result["archived_count"] == 1
 
 
-def test_cannot_message_handshake_interrupt_or_read_an_archived_partner(world: World):
+def test_cannot_message_handshake_or_read_an_archived_partner(world: World):
     world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="workerA")
     _archive(world, "workerA")
 
@@ -1248,10 +1329,6 @@ def test_cannot_message_handshake_interrupt_or_read_an_archived_partner(world: W
     with pytest.raises(Rejected) as exc2:
         world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="workerA")
     assert exc2.value.code == "no_such_partner"
-
-    with pytest.raises(Rejected) as exc3:
-        world.sci.interrupt_partner(requester_uuid=world.orch["uuid"], partner_title="workerA", reason="x")
-    assert exc3.value.code == "no_such_partner"
 
     with pytest.raises(Rejected) as exc4:
         world.sci.read(requester_uuid=world.orch["uuid"], partner_title="workerA")
@@ -1304,8 +1381,11 @@ def test_work_queued_before_archiving_is_discarded_not_delivered(world: World):
     working slot is cleared; no new `deliver_message` call is made for it.
     """
     world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="workerA")
-    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m1", behavior="[QUERY]")
-    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m2", behavior="[QUERY]")
+    # Two messages of one label from one caller. [MESSAGE-RESPONSE] rather
+    # than [QUERY], because a [QUERY] would stop the orchestrator after the
+    # first and the second could never be sent.
+    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m1", behavior="[MESSAGE-RESPONSE]")
+    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m2", behavior="[MESSAGE-RESPONSE]")
 
     depth_before = world.db.read_one(
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.worker["id"],)

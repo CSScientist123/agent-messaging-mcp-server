@@ -1,4 +1,4 @@
-"""Behavior labels: what the six of them are, and where the rest of their meaning lives.
+"""Behavior labels: what the five of them are, and where the rest of their meaning lives.
 
 A label is only a label. It carries no direction: every labelled message is a
 push into the recipient's single priority queue, and the same label travels
@@ -24,7 +24,6 @@ from .errors import Rejected
 #: Every label the system recognizes, in priority order (highest first). The
 #: order is documentation; `label_caps.priority` is what the code reads.
 BEHAVIORS: tuple[str, ...] = (
-    "[IDLE]",
     "[TRUTHFUL-REPORT]",
     "[QUERY]",
     "[ERROR]",
@@ -32,12 +31,17 @@ BEHAVIORS: tuple[str, ...] = (
     "[RESEARCH]",
 )
 
-#: The one label no agent may hand to `send`. It exists to carry a forced
-#: interruption, and `interrupt_partner` is the only thing that pushes it --
-#: see `MessagingCore.interrupt_partner`. Accepting it in `send` would be a
-#: second route to interrupting a partner, one that skips the same-project and
-#: can-execute checks and never stops the remote.
-INTERRUPT_BEHAVIOR = "[IDLE]"
+#: The two labels an agent uses to say it cannot continue on its own -- a
+#: question about what was meant, or a statement that something blocked it.
+#: Sending either stops the sender: its working task is pushed back paused and
+#: the question itself takes the slot until an answer arrives.
+#:
+#: Their rank in `label_caps.priority` is the entire interruption mechanism:
+#: nothing below it can reach an agent while it waits. There is no separate
+#: hold label, because the question IS the hold. Only a `[TRUTHFUL-REPORT]`
+#: outranks a waiting agent, which is the one interruption worth allowing --
+#: a summary must not be contaminated by other traffic.
+BLOCKING_BEHAVIORS: tuple[str, ...] = ("[QUERY]", "[ERROR]")
 
 
 def validate_behavior(behavior: str) -> None:

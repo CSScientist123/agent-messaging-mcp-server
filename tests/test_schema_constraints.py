@@ -100,9 +100,15 @@ def main() -> int:
 
     # ---- label priority table -------------------------------------------------------
     order = [r[0] for r in db.execute("SELECT behavior FROM label_caps ORDER BY priority, behavior")]
-    ok(order[0] == "[IDLE]", "[IDLE] outranks every other label, so a forced interrupt always wins the slot")
-    ok(order[1] == "[TRUTHFUL-REPORT]",
-       "[TRUTHFUL-REPORT] outranks everything below it, so a summary is not contaminated")
+    ok("[IDLE]" not in order,
+       "there is no hold label -- the question an agent asked IS the hold")
+    ok(order[0] == "[TRUTHFUL-REPORT]",
+       "[TRUTHFUL-REPORT] outranks everything, so a summary is not contaminated")
+    q_pri = db.execute("SELECT priority FROM label_caps WHERE behavior='[QUERY]'").fetchone()[0]
+    tr_pri = db.execute(
+        "SELECT priority FROM label_caps WHERE behavior='[TRUTHFUL-REPORT]'").fetchone()[0]
+    ok(tr_pri < q_pri,
+       "only a summary outranks an agent waiting on its own [QUERY] or [ERROR]")
     ok(order[-1] == "[RESEARCH]", "[RESEARCH] is lowest -- new work never displaces an issue")
     q, e = (db.execute("SELECT priority FROM label_caps WHERE behavior=?", (b,)).fetchone()[0]
             for b in ("[QUERY]", "[ERROR]"))
@@ -126,8 +132,8 @@ def main() -> int:
     db.execute("DELETE FROM message_queue WHERE behavior='[QUERY]'")
     ok(admit(2, 1, "[QUERY]", working=3) == 0,
        "the working slot counts toward the cap -- it limits work in flight, not work waiting")
-    ok(all(admit(2, 1, "[IDLE]") == 1 for _ in range(5)),
-       "[IDLE] is uncapped -- a forced interrupt must never be refused")
+    ok(all(admit(2, 1, "[ERROR]") == 1 for _ in range(5)),
+       "[ERROR] is uncapped -- an agent saying it is blocked must never be refused")
     db.execute("DELETE FROM message_queue")
 
     # ---- storage --------------------------------------------------------------------
@@ -135,6 +141,9 @@ def main() -> int:
        "[RESEARCH] cannot be stored in messages -- it is transport only")
     ok(rejects(db, "INSERT INTO messages(from_partner,to_partner,behavior,body) VALUES (1,2,'[ERROR]','b')"),
        "[ERROR] cannot be stored in messages -- resolving it is all we keep")
+    ok(rejects(db, "INSERT INTO message_queue(partner_id,caller_id,behavior,body) "
+                   "VALUES (2,1,'[IDLE]','b')"),
+       "[IDLE] is not a label any more and cannot be queued")
     db.execute("INSERT INTO messages(from_partner,to_partner,behavior,body) VALUES (1,2,'[QUERY]','b')")
     ok(True, "[QUERY] is stored and therefore readable")
 
@@ -189,15 +198,16 @@ def main() -> int:
             "SELECT behavior, priority, max_outstanding, stored, reply_behavior FROM label_caps"
         )
     )
-    ok(caps["[IDLE]"][0] < caps["[TRUTHFUL-REPORT]"][0] < caps["[QUERY]"][0],
-       "[IDLE] outranks [TRUTHFUL-REPORT] outranks [QUERY] -- an interruption always wins")
+    ok(caps["[TRUTHFUL-REPORT]"][0] < caps["[QUERY]"][0] < caps["[MESSAGE-RESPONSE]"][0]
+       < caps["[RESEARCH]"][0],
+       "[TRUTHFUL-REPORT] outranks [QUERY] outranks [MESSAGE-RESPONSE] outranks [RESEARCH]")
     ok(caps["[QUERY]"][0] == caps["[ERROR]"][0],
        "[QUERY] and [ERROR] share a rank -- both stop work, neither is more urgent")
     ok(caps["[MESSAGE-RESPONSE]"][0] < caps["[RESEARCH]"][0],
        "an answer outranks delegated work -- otherwise a partner never gets unblocked")
     ok(caps["[QUERY]"][1] == 3 and caps["[RESEARCH]"][1] == 2,
        "the two capped labels are capped at 3 and 2")
-    ok(all(caps[b][1] is None for b in ("[IDLE]", "[ERROR]", "[TRUTHFUL-REPORT]",
+    ok(all(caps[b][1] is None for b in ("[ERROR]", "[TRUTHFUL-REPORT]",
                                         "[MESSAGE-RESPONSE]")),
        "every other label is uncapped -- an answer must never be refused for being the fourth")
     ok([b for b, v in caps.items() if v[2]] and
@@ -208,7 +218,7 @@ def main() -> int:
        and caps["[ERROR]"][3] == "[MESSAGE-RESPONSE]"
        and caps["[RESEARCH]"][3] == "[TRUTHFUL-REPORT]",
        "the three labels that ask for something name what comes back")
-    ok(all(caps[b][3] is None for b in ("[IDLE]", "[TRUTHFUL-REPORT]",
+    ok(all(caps[b][3] is None for b in ("[TRUTHFUL-REPORT]",
                                         "[MESSAGE-RESPONSE]")),
        "every other label replies with nothing -- that NULL is what terminates an exchange")
     ok(caps[caps["[ERROR]"][3]][3] is None,
@@ -233,7 +243,7 @@ def main() -> int:
                    (a, b, beh))
     ok(db.execute("SELECT COUNT(*) FROM messages WHERE to_partner=?", (b,)).fetchone()[0] == 3,
        "the three stored labels are accepted by messages")
-    for beh in ("[RESEARCH]", "[ERROR]", "[IDLE]"):
+    for beh in ("[RESEARCH]", "[ERROR]"):
         ok(rejects(db, "INSERT INTO messages(from_partner,to_partner,behavior,body)"
                        " VALUES (?,?,?,'x')", (a, b, beh)),
            f"{beh} is transport-only and is refused by messages")

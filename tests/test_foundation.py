@@ -32,7 +32,7 @@ from messaging_core import responses
 from messaging_core import templates
 from messaging_core.db import Database
 from messaging_core.errors import MessagingError, NeedsRemote, Rejected
-from messaging_core.labels import BEHAVIORS, INTERRUPT_BEHAVIOR, validate_behavior
+from messaging_core.labels import BEHAVIORS, BLOCKING_BEHAVIORS, validate_behavior
 from messaging_core.slots import WorkingSlots
 
 # A small standalone schema used only by these tests, kept independent of the
@@ -346,21 +346,27 @@ def test_validate_behavior_rejects_case_variant_of_a_real_label():
     assert excinfo.value.code == "unknown_behavior"
 
 
-def test_interrupt_behavior_is_idle_and_is_itself_a_recognized_label():
-    # INTERRUPT_BEHAVIOR is what carries a forced interruption (see
-    # MessagingCore.interrupt_partner); it must still be a label
-    # validate_behavior accepts, or the interruption path would be pushing
-    # something the rest of the system refuses to recognize.
-    assert INTERRUPT_BEHAVIOR == "[IDLE]"
-    validate_behavior(INTERRUPT_BEHAVIOR)  # must not raise
+def test_the_blocking_labels_are_the_two_that_stop_their_sender():
+    # Sending either stops the sender and gives its slot to the question. They
+    # are ordinary labels an agent may send -- there is no separate hold label
+    # any more, so both must be ones validate_behavior accepts.
+    assert set(BLOCKING_BEHAVIORS) == {"[QUERY]", "[ERROR]"}
+    for behavior in BLOCKING_BEHAVIORS:
+        validate_behavior(behavior)  # must not raise
 
 
-def test_behaviors_contains_exactly_the_six_labels_the_design_names():
+def test_there_is_no_hold_label():
+    """The question an agent asked IS the hold, so nothing else carries one."""
+    assert "[IDLE]" not in BEHAVIORS
+    with pytest.raises(Rejected):
+        validate_behavior("[IDLE]")
+
+
+def test_behaviors_contains_exactly_the_five_labels_the_design_names():
     # Membership, not order or count-as-shape: what matters behaviourally is
     # that every label the rest of the system refers to by name is one
     # validate_behavior will accept, and nothing else sneaks in.
     for name in (
-        "[IDLE]",
         "[TRUTHFUL-REPORT]",
         "[QUERY]",
         "[ERROR]",
@@ -369,7 +375,7 @@ def test_behaviors_contains_exactly_the_six_labels_the_design_names():
     ):
         assert name in BEHAVIORS
         validate_behavior(name)
-    assert len(BEHAVIORS) == 6
+    assert len(BEHAVIORS) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -571,15 +577,13 @@ def test_resume_displaced_does_not_name_a_behavior_it_was_not_given():
 
 
 def test_there_is_no_template_for_a_hold():
-    """An [IDLE] is not a message, so nothing renders one.
+    """Nothing is said to an agent that is waiting on its own question.
 
-    The remote is stopped before the swap. Handing a stopped agent a paragraph
-    gives it something to act on when the entire point of the hold is that it
-    should be doing nothing -- so the slot is taken and nothing is sent.
+    Its remote was stopped as the question took the slot. Handing it a
+    paragraph gives it something to act on when the point is that it should do
+    nothing until it hears back.
     """
-    assert not hasattr(templates, "idle_interruption"), (
-        "a template for [IDLE] means something is being said to a held agent"
-    )
+    assert not hasattr(templates, "idle_interruption")
 
 
 def test_relay_contains_behavior_body_and_caller():

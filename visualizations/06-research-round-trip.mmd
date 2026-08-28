@@ -26,7 +26,7 @@ sequenceDiagram
     Note over PS,CORE: PHASE 2 -- the summary, and it is NOT a queued message
     PS->>CORE: begin_summary_phase(partner_id)
     CORE->>CORE: SAME slot: behavior becomes [TRUTHFUL-REPORT],<br/>effective priority raised 4 -> 1,<br/>body stays the ORIGINAL request
-    Note over CORE: raised to 1, which BLOCKS the queue: every arriving<br/>message waits, because advance displaces only on a strictly<br/>lower number and only [IDLE] has one.<br/><br/>The counterfactual is why: a summary written while traffic<br/>WAS reaching the same context would summarize the traffic.
+    Note over CORE: raised to 1, which BLOCKS the queue: every arriving<br/>message waits, because advance displaces only on a strictly<br/>lower number and nothing has one.<br/><br/>The counterfactual is why: a summary written while traffic<br/>WAS reaching the same context would summarize the traffic.
     PS->>B: deliver_message(truthful_report_request prompt)<br/>original request quoted back verbatim
 
     loop drain thread

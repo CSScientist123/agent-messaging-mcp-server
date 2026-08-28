@@ -18,7 +18,7 @@ It calls `advance`, which may promote something, may displace something, may del
 
 It then looks at the working slot. If the slot is empty and the queue is empty, the thread has nothing left to do, and that is the signal to retire.
 
-If the slot holds an `[IDLE]`, the pass ends without polling anything. A hold is not work: there is nothing to ask the remote and nothing to report. The partner is stopped and stays stopped until something displaces the hold. Retiring here would be wrong, because the queue may hold the very task the interruption displaced — so the thread waits instead.
+If the slot holds a **wait** — the agent's own unanswered `[QUERY]` or `[ERROR]` — the pass ends without polling anything. A wait is not work: there is nothing to ask the remote, which was stopped the moment the question was sent, and nothing to report. The partner stays stopped until the answer arrives. Retiring here would be wrong, because the queue may hold the very work the question displaced — so the thread waits instead.
 
 Otherwise the slot holds real work, and the thread asks the remote whether the turn is finished. That question has three possible answers and only two of them are obvious.
 
@@ -30,7 +30,7 @@ The third answer is the one that makes this component non-trivial: **blocked on 
 
 So the Polling Server reports it, on the partner's behalf. It stops the remote so it is not left sitting on the prompt, releases the slot, and pushes an `[ERROR]` into the caller's queue naming the conversation and what was asked for.
 
-At priority 2 that `[ERROR]` outranks a good deal of what a caller might be doing — an answer it is processing, a research task, a hold — and displaces it. **That displacement is the interruption**, and there is no separate notification mechanism, because a priority queue already has one. It does not displace everything, though: displacement requires a *strictly* lower priority number, so a caller already working a `[QUERY]`, another `[ERROR]`, or a summary will finish that first and take the `[ERROR]` next. It is the front of the queue, not a signal that pre-empts unconditionally.
+At priority 2 that `[ERROR]` outranks a good deal of what a caller might be doing — an answer it is processing, a research task — and displaces it. **That displacement is the interruption**, and there is no separate notification mechanism, because a priority queue already has one. It does not displace everything, though: displacement requires a *strictly* lower priority number, so a caller already working a `[QUERY]`, another `[ERROR]`, or a summary will finish that first and take the `[ERROR]` next. It is the front of the queue, not a signal that pre-empts unconditionally.
 
 There is also the possibility that a remote cannot be asked about completion at all. A remote with no notion of turn completion refuses the question, and that refusal is treated as "finished" — because a remote that cannot be asked has already given the only answer it has. Polling it forever would hold the working slot against a partner that is perfectly free.
 
@@ -59,6 +59,8 @@ Recall the shape of the problem. A Claude Science process holds only the Claude 
 Nobody has told the Antigravity process anything. There is no notification. There is no bus. The row simply exists.
 
 So each Polling Server runs one extra daemon thread that periodically **scans** for exactly this: partners of its own sources that have queued work, or that hold a task in its own working slot, without a live thread serving them. For each, it arms one.
+
+One partner is deliberately skipped: an agent waiting on its own question. Its remote is stopped, so a thread armed for it would poll a halted session forever with nothing to harvest. What ends a wait is an answer, and an answer is a queued row — which arms the partner through the first branch anyway, in whichever process owns the remote.
 
 That scan is the mechanism that makes a message sent by *any* process end up drained by the process that owns the target's remote. It is the same architectural move as everything else here: nobody is told, the fact is written where both can see it, and the one that can act on it looks.
 
@@ -98,11 +100,11 @@ The loop waits between passes, and it waits by three different amounts depending
 
 **A quarter of the poll interval, when there is work in flight.** The remote is running; the answer could arrive at any moment; asking often is what "not polling" costs someone.
 
-**Longer, when the slot holds a hold.** A held partner is deliberately stopped and has nothing to poll. Waking sixteen times a second to confirm that a stopped thing is still stopped buys nothing but wakeups.
+**Longer, when the slot holds a wait.** A waiting partner is deliberately stopped and has nothing to poll. Waking sixteen times a second to confirm that a stopped thing is still stopped buys nothing but wakeups.
 
-Why is polling a hold slowly safe? Largely because **an agent's own message ends the hold as it is sent.** The `send` path calls `advance` directly, which displaces the hold and delivers the new task synchronously in the sender's own call — so on that path the thread is not racing to notice a resume, it is re-checking a slot that already changed.
+Why is polling a wait slowly safe? Largely because **an agent's own message ends the wait as it is sent.** The `send` path calls `advance` directly, which consumes the answer and delivers whatever comes next synchronously in the sender's own call — so on that path the thread is not racing to notice a resume, it is re-checking a slot that already changed.
 
-The Polling Server's own replies are the exception worth knowing. When it pushes an answer to a parked caller, it does not advance that caller's queue itself; the caller's existing thread picks the swap up on its next pass. So a hold ended that way clears within one hold interval rather than instantly. That is the reason the interval is kept small rather than backed off indefinitely — and the reason it is an interval at all rather than an indefinite sleep waiting to be woken.
+The Polling Server's own replies are the exception worth knowing. When it pushes an answer to a waiting caller, it does not advance that caller's queue itself; the caller's existing thread picks the swap up on its next pass. So a wait ended that way clears within one interval rather than instantly. That is the reason the interval is kept small rather than backed off indefinitely — and the reason it is an interval at all rather than an indefinite sleep waiting to be woken.
 
 **And an exponentially growing wait, after a failure.** A failure that repeats is usually one that will keep repeating — an unreachable session, a refusing remote — and polling it at full rate buys nothing while costing a request every interval. The backoff is capped so a transient failure still recovers promptly, and it resets the moment a pass succeeds.
 

@@ -12,7 +12,7 @@ An agent calls `send` with four things: its own identity, the title of the recip
 
 Before anything is written, a series of checks runs, and the order is not arbitrary — each depends on the last having passed.
 
-The requester is resolved from its uuid to a live partner. The target is resolved from its title. The label is checked against the six that exist. `[IDLE]` is refused outright here: it is not a message, it is a hold, and no tool sends one.
+The requester is resolved from its uuid to a live partner. The target is resolved from its title. The label is checked against the five that exist. All five are sendable — there is no label that exists only to be refused here.
 
 Then the source rules, which come from `source_caps` rather than from conditionals. A source that cannot send is refused — a notebook has no agent behind it that decides to speak. A `[RESEARCH]` aimed at a source that does not accept delegated work is refused with a different code, because a notebook answers questions about what it holds rather than going and doing things, and those are different refusals for different reasons.
 
@@ -80,9 +80,9 @@ When the remote finishes, the result is read back and the reply is pushed. Note 
 
 What happens to that reply afterwards depends on one column.
 
-`label_caps.stored` decides whether a message is written to durable history. Three labels are stored: `[QUERY]`, `[TRUTHFUL-REPORT]`, and `[MESSAGE-RESPONSE]`. Three are not: `[RESEARCH]`, `[ERROR]`, and `[IDLE]`.
+`label_caps.stored` decides whether a message is written to durable history. Three labels are stored: `[QUERY]`, `[TRUTHFUL-REPORT]`, and `[MESSAGE-RESPONSE]`. Two are not: `[RESEARCH]` and `[ERROR]`.
 
-The unstored three are **transport**. They travel in a queue, are acted on, and are never written down. A `[RESEARCH]` is an instruction whose *result* is what matters, and the result comes back as a `[TRUTHFUL-REPORT]`, which is stored. An `[ERROR]` is a condition to resolve; resolving it is all that is kept. An `[IDLE]` is not a message at all.
+The unstored two are **transport**. They travel in a queue, are acted on, and are never written down. A `[RESEARCH]` is an instruction whose *result* is what matters, and the result comes back as a `[TRUTHFUL-REPORT]`, which is stored. An `[ERROR]` is a condition to resolve; resolving it is all that is kept.
 
 The rule is enforced by a database trigger rather than by a list of labels in a `CHECK`, and the reason is the same one that put priority and caps in a table: a list in the trigger would be a second copy of `label_caps.stored`, and two copies of one fact eventually disagree.
 
@@ -98,7 +98,7 @@ When the work finishes, the second exchange is *not* pushed into the queue as a 
 
 A queued `[TRUTHFUL-REPORT]` would be ambiguous. The label would mean "summarise this" travelling one way and "here is the summary" travelling the other, and a queue row carries nothing that says which. Keeping the request out of the queue leaves the label with exactly one meaning everywhere it can be seen.
 
-And the summary is protected while it is being written. The task's priority is raised to `[TRUTHFUL-REPORT]`'s for the second phase, and the effect is that from then on arriving messages **queue rather than reach the agent** — everything except a hold, because displacement needs a strictly lower priority number and only `[IDLE]` has one.
+And the summary is protected while it is being written. The task's priority is raised to `[TRUTHFUL-REPORT]`'s for the second phase, and the effect is that from then on arriving messages **queue rather than reach the agent** — everything, because displacement needs a strictly lower priority number and nothing has one.
 
 That blocking is the entire point of the raise, and it is worth stating as the counterfactual: a summary written while other traffic was reaching the same context would summarise the traffic.
 
@@ -120,27 +120,59 @@ Now the failure this design has to survive, because it is the one that is silent
 
 The summary phase changes the task in place: it relabels it and marks it as owing a report. Both of those live on the in-memory slot.
 
-If the summary is displaced — and only a hold can displace it — the task goes back into the queue. If the marker lived only in memory, the row that comes back is indistinguishable from an ordinary `[TRUTHFUL-REPORT]`, which is a *delivered* summary and owes nothing to anyone. On resume, the system would look up what a `[TRUTHFUL-REPORT]` replies with, find nothing, release the slot, and push nothing. **The research would be done and its answer discarded, with no error anywhere.**
+If the summary is displaced — and only another summary can displace it — the task goes back into the queue. If the marker lived only in memory, the row that comes back is indistinguishable from an ordinary `[TRUTHFUL-REPORT]`, which is a *delivered* summary and owes nothing to anyone. On resume, the system would look up what a `[TRUTHFUL-REPORT]` replies with, find nothing, release the slot, and push nothing. **The research would be done and its answer discarded, with no error anywhere.**
 
 It would also be rendered wrong. The general resume path hands back "resume your previous `[TRUTHFUL-REPORT]`" — one line, naming nothing the agent is holding, when what it actually needs is to be asked for the summary again.
 
 So both facts travel on the queue row: that this is a summary phase, and what label the task was admitted under. A resumed summary is re-asked, against the original request the row still carries — which is why the body stays the original request rather than the summarise instruction. Summarising an instruction is not a thing anyone wants.
 
-## When a partner cannot finish on its own
+## When an agent cannot continue on its own
 
-There is one more flow, and it is the reason `[IDLE]` exists at all.
+There is one more flow, and it is where the system's refusal to add mechanisms shows most clearly.
 
-A partner working a `[RESEARCH]` sometimes hits something only the agent that sent it can resolve — a path it was not granted, a question about what was actually meant. It raises a `[QUERY]` or an `[ERROR]` **upward**, along the reverse handshake, and then it stops.
+An agent — any agent — sometimes hits something only another one can resolve: a path it was not granted, a question about what was actually meant. It sends a `[QUERY]` or an `[ERROR]`. **That act stops it.**
 
-The stopping is the new part. Without it, the next queued message reaches an agent that is blocked on an unanswered question, and the two interleave in one context with nothing marking where either begins. So the sender parks itself: an `[IDLE]` takes its working slot, and the unfinished work sits paused in its own queue.
+The stopping is the part worth dwelling on. Without it, the next queued message reaches an agent that is blocked on an unanswered question, and the two interleave in one context with nothing marking where either begins. So `send` does three things for a blocking label, in this order: it stops the sender's remote, pushes whatever the sender was working on back into the sender's own queue marked paused, and puts the question itself into the sender's working slot.
 
-Three conditions, all required. The label is `[QUERY]` or `[ERROR]`; the sender currently holds a working slot; and the message travels back **along** a handshake rather than out along one.
+There is exactly **one** condition: the label is `[QUERY]` or `[ERROR]`. Not the direction, not whether the sender held work.
 
-That third condition is what makes it precise, and it must not be dropped. A caller dispatching a routine `[QUERY]` down to a worker holds a slot too. An orchestrator that stopped itself every time it asked a worker anything would halt everything it was driving — and it would do so while behaving, at every individual step, exactly as specified.
+Direction is worth pausing on, because an earlier shape of this rule stopped only an agent answering *upward*, on the reasoning that a caller dispatching work should keep working. That reasoning does not survive contact with what the labels mean. A caller that sends a `[QUERY]` has said precisely what a partner does when it sends one — *I need this before I go on* — and an orchestrator that keeps driving other work while blocked on an answer is an orchestrator producing work it will have to redo. Whoever asked cannot continue. That is the whole rule.
 
-On the receiving side, nothing new was needed. The `[QUERY]` or `[ERROR]` arrives at priority 2 and goes to the front of everything below it — displacing a running task unless that task ties or outranks it, since displacement needs a strictly lower priority number. That displacement *is* the interruption; a caller already mid-question or mid-summary finishes that first and takes this next. The caller resolves it and answers; the `[MESSAGE-RESPONSE]` lands in the partner's queue and displaces the hold, because anything displaces a hold. The paused work resumes behind it.
+An agent with nothing in flight is stopped too, and for a reason that only shows up if you follow the machinery. The wait still has to be *represented*. If the slot were left empty, the very next `advance` would find nothing there, promote whatever is at the head, and hand it to an agent that has just said it cannot proceed.
 
-Nothing has to remember to release anything. The hold ends because something arrived, which is the same mechanism that makes everything else in the queue work.
+**The question is the hold.** There is no separate label, and no priority zero. The question sits in the slot at the natural priority `[QUERY]` and `[ERROR]` already have — 2, never raised — and that alone is enough: only `[TRUTHFUL-REPORT]` at 1 is strictly lower, so everything else queues behind an unanswered question by the ordinary comparison rather than by an exception written for this case.
+
+Nothing is delivered to a stopped asker. Its remote was halted a moment earlier, and typing a paragraph at it hands it something to act on when the entire point is that it acts on nothing until it hears back.
+
+And asking twice is refused. An agent already waiting cannot send a second `[QUERY]` — it is stopped, so it could not act on the first answer, let alone the second.
+
+On the receiving side, nothing new was needed. The `[QUERY]` or `[ERROR]` arrives at priority 2 and goes to the front of everything below it, displacing a running task unless that task ties or outranks it. That displacement *is* the interruption on that end; a caller already mid-question or mid-summary finishes that first and takes this next. **There is no capability anywhere for one agent to stop another.** Being stopped is always a consequence: of what arrived, or of what you yourself sent.
+
+## The answer, and why it never travels alone
+
+The wait ends when a `[MESSAGE-RESPONSE]` reaches the head of the waiting agent's queue, and `advance` then does something it does for no other label.
+
+It **consumes** the answer's row without promoting it as a task. It discards the question in the slot — asked, answered, and never requeued, because requeuing it would ask again. And then it re-reads the head to find what the agent should actually do next.
+
+The reason is a claim about prompts rather than about queues: **a raw response is close to useless to an agent.** Handed only "the 2024 set," an agent is holding a fact and no instruction, and has to guess whether to resume something, wait for more, or start fresh. What it should do next is not a guess — it is already decided and sitting at the head of its own queue. So the two are handed over as one prompt.
+
+Three shapes, and the difference between them is exactly the difference between the three states the queue can be in:
+
+If the head is **a new job**, the agent is told the resolution came back, given the response, and then told to resume with that new job — quoted in full, because it has not seen it before.
+
+If the head is **its own paused work**, it is told the resolution came back, given the response, and told to resume work on that label. The body is not restated: the agent never stopped holding it, and restating would hand back a worse copy of something it has not forgotten.
+
+If the head is **empty**, the resolution is delivered alone. This is the one case where a bare response is right, because there is nothing to attach it to — and the agent goes idle after it.
+
+## The one thing that outranks a wait
+
+A `[TRUTHFUL-REPORT]` is strictly lower than 2, so a summary really can take the slot from an agent waiting on its own question. That is deliberate: the caller owed a report is owed it before the asker's own question is worth anything.
+
+The question survives, and the column that makes it survive is `awaiting_resolution` on the requeued row.
+
+It earns its place twice. It makes the row outrank everything else in that agent's queue — read ahead of priority, not behind it — so when the summary finishes, what resumes is the wait rather than some job the agent still cannot do. And it makes the resumed row re-enter the wait instead of being delivered: without it, the question would come back indistinguishable from an ordinary `[QUERY]` a caller had sent, and the agent would be handed, as work, the question it asked.
+
+Nothing has to remember to release anything. The wait ends because the answer arrived, which is the same mechanism that makes everything else in the queue work.
 
 ## What ends an exchange
 

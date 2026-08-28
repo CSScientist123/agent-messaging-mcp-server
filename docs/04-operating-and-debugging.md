@@ -188,8 +188,8 @@ SELECT id, behavior, in_process, enqueued_at FROM message_queue WHERE partner_id
 the order worth checking:
 
 1. **Something higher-priority holds the slot.** Call `status` on the Partner and look at
-   `working`. A `[RESEARCH]` waits behind a `[QUERY]` by design, and behind an `[IDLE]`
-   indefinitely — an `[IDLE]` hold is released by the next arrival, not by time.
+   `working`. A `[RESEARCH]` waits behind a `[QUERY]` by design, and behind the Partner's
+   own unanswered question indefinitely — a wait is released by the answer, not by time.
 2. **No drain thread is running** (see `drain_threads` above).
 3. **The adapter's `deliver_message` is failing.** Check whether the server is
 running against a stub:
@@ -219,26 +219,38 @@ Check the adapter's own error; each raises a named exception rather than failing
 status(requester_uuid=<the partner's own uuid>)
 ```
 
-An `[IDLE]` in `working` means the Partner was interrupted. Its previous task is in the
-queue, paused:
+A `working` task the Partner sent *itself* — a `[QUERY]` or `[ERROR]` whose `caller_id` is
+the agent it asked — means the Partner stopped itself on a question. Whatever it was doing is
+in the queue, paused:
 
 ```sql
 SELECT id, caller_id, behavior, in_process, enqueued_at
   FROM message_queue WHERE partner_id = :partner_id AND in_process = 1;
 ```
 
-**Mitigate.** None needed — the Partner is stopped, which is what was asked for. Nothing is
-being lost.
+**Mitigate.** None needed — the Partner stopped itself, deliberately. Nothing is being lost.
 
-**Diagnose.** An `[IDLE]` hold is released by the next message that arrives, whatever its
-label. It is not released by time and there is no timeout. So the question is not "why is it
-stuck" but "who was supposed to send the next thing" — and that is the Caller who called
-`interrupt_partner`. Its id is the `caller_id` on the `[IDLE]`'s displaced sibling, or the
-`caller_id` shown in `working`.
+**Diagnose.** A wait is released by exactly one thing: a `[MESSAGE-RESPONSE]` reaching the
+head of this Partner's queue. Not by time, and there is no timeout. So the question is not
+"why is it stuck" but "who owes it an answer" — and that is the agent named by `caller_id` on
+the working task, which is the agent it asked.
 
-**Resolve.** That Caller sends what the Partner was stopped for: an `[ERROR]` naming what
-went wrong, or a `[MESSAGE-RESPONSE]` answering it. Either displaces the hold, and the paused
-task resumes after it, with a one-line "resume your previous …" prompt.
+To see the question itself, read the `[QUERY]` back out of `messages` (`[QUERY]` is stored;
+`[ERROR]` is not, so a Partner blocked on an `[ERROR]` shows only in `working`).
+
+**Resolve.** That agent answers with a `[MESSAGE-RESPONSE]`. The answer is not delivered on
+its own: `advance` consumes it, discards the question, and folds the response into whatever
+the queue holds next — a new job, the paused task the question interrupted, or nothing at all
+if the queue is empty.
+
+If a `[TRUTHFUL-REPORT]` displaced the wait, the question is in the queue with
+`awaiting_resolution = 1`. That is not a stall: it outranks everything else in that queue and
+re-enters the wait when the summary finishes.
+
+```sql
+SELECT id, caller_id, behavior, in_process, awaiting_resolution, enqueued_at
+  FROM message_queue WHERE partner_id = :partner_id ORDER BY id;
+```
 
 If the interruption was caused by a permission prompt, correct the grant first — that is what
 the doctrine in `docs/05` §20 requires, and sending work again without correcting it produces
@@ -460,8 +472,8 @@ SELECT e.project_a, e.project_b, p.title, p.orchestrator_type
  ORDER BY e.project_a, p.orchestrator_type;
 ```
 
-What a Partner can actually read back — remember `[RESEARCH]`, `[ERROR]` and `[IDLE]` are
-never stored (`label_caps.stored`):
+What a Partner can actually read back — remember `[RESEARCH]` and `[ERROR]` are never
+stored (`label_caps.stored`):
 
 ```sql
 SELECT behavior, created_at, substr(body, 1, 80) FROM messages

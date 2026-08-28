@@ -73,30 +73,36 @@ INSERT INTO agent_layers (source_prefix, orchestrator_type, layer) VALUES
     ('science_', '*',                    2),
     ('gemini_',  '*',                    4);
 
--- The three-plus-three message labels, their relative priority, and how many of each one
--- caller may have outstanding against one partner.
+-- The five message labels, their relative priority, and how many of each one caller may
+-- have outstanding against one partner.
 --
--- Priority is what decides which task holds the working slot: a lower number wins. [IDLE]
--- is highest so that a forced interruption is simply a normal push of an [IDLE] message --
--- it takes the slot by construction rather than by a special code path. [TRUTHFUL-REPORT]
--- outranks everything below it so a summarization completes without other traffic
--- contaminating the context it is summarizing. [QUERY] and [ERROR] share a rank: both are
--- issues that stop work, and neither is more urgent than the other.
+-- Priority is what decides which task holds the working slot: a lower number wins.
+--
+-- [TRUTHFUL-REPORT] is highest, so a summarization completes without other traffic
+-- contaminating the context it is summarizing. It is only ever produced after a [RESEARCH]
+-- has been drained, so nothing is starved by it sitting at the top.
+--
+-- [QUERY] and [ERROR] come next, sharing a rank: both are issues that stop work, and
+-- neither is more urgent than the other. That rank is also the whole interruption
+-- mechanism. An agent that SENDS one is stopped, its work pushed back paused, and the
+-- question it asked takes its own working slot -- and nothing below that rank can reach it
+-- while it waits. There is no separate hold label; the question IS the hold. Only a
+-- summary outranks a waiting agent, which is the one interruption worth allowing.
 --
 -- max_outstanding NULL means uncapped. A cap counts the working task as well as queued
 -- ones, so it limits work in flight, not merely work waiting.
+--
 -- reply_behavior is what a Partner sends back when a task carrying this label finishes,
 -- and NULL is the important value in the column: it is what makes the exchange terminate.
 -- Three labels expect an answer -- [RESEARCH] is answered with a summary, and [QUERY] and
--- [ERROR] are each answered with a [MESSAGE-RESPONSE], since a Caller that corrects a
--- blocked Partner otherwise has no way to know the correction landed. The other three ARE
--- answers, or are not messages at all. Without a label whose reply is nothing, every
--- completed task would produce a message that produced a task that produced a message, and
--- two agents would talk to each other until one of them was archived.
+-- [ERROR] are each answered with a [MESSAGE-RESPONSE], since an agent that asked otherwise
+-- has no way to know the answer landed. The other two ARE answers. Without a label whose
+-- reply is nothing, every completed task would produce a message that produced a task that
+-- produced a message, and two agents would talk to each other until one was archived.
 CREATE TABLE label_caps (
     behavior        TEXT PRIMARY KEY
-                    CHECK (behavior IN ('[IDLE]', '[TRUTHFUL-REPORT]', '[QUERY]',
-                                        '[ERROR]', '[MESSAGE-RESPONSE]', '[RESEARCH]')),
+                    CHECK (behavior IN ('[TRUTHFUL-REPORT]', '[QUERY]', '[ERROR]',
+                                        '[MESSAGE-RESPONSE]', '[RESEARCH]')),
     priority        INTEGER NOT NULL,
     max_outstanding INTEGER CHECK (max_outstanding IS NULL OR max_outstanding > 0),
     stored          INTEGER NOT NULL DEFAULT 0 CHECK (stored IN (0, 1)),
@@ -105,7 +111,6 @@ CREATE TABLE label_caps (
 );
 
 INSERT INTO label_caps (behavior, priority, max_outstanding, stored, reply_behavior) VALUES
-    ('[IDLE]',             0, NULL, 0, NULL),
     ('[TRUTHFUL-REPORT]',  1, NULL, 1, NULL),
     ('[QUERY]',            2,    3, 1, '[MESSAGE-RESPONSE]'),
     ('[ERROR]',            2, NULL, 0, '[MESSAGE-RESPONSE]'),
@@ -223,8 +228,8 @@ CREATE TABLE messages (
     id            INTEGER PRIMARY KEY,
     from_partner  INTEGER NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
     to_partner    INTEGER NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-    -- Only the labels marked `stored` in label_caps are ever written here. [RESEARCH],
-    -- [ERROR] and [IDLE] are transport: they travel in a queue, are acted on, and are never
+    -- Only the labels marked `stored` in label_caps are ever written here. [RESEARCH]
+    -- and [ERROR] are transport: they travel in a queue, are acted on, and are never
     -- written down. The rule is enforced by the trigger below rather than by a CHECK
     -- listing the labels, because a list here is a second copy of label_caps.stored and two
     -- copies of one fact eventually disagree. Storage follows label_caps.stored alone -- the
@@ -291,6 +296,14 @@ CREATE TABLE message_queue (
     -- against its Caller's [RESEARCH] cap, because it is the same delegated
     -- work under a second instruction.
     origin_behavior TEXT REFERENCES label_caps(behavior),
+    -- Set when this row is an agent's own unanswered question, displaced out of
+    -- its working slot. The question is not work: nothing is delivered for it,
+    -- and it returns to the slot to go on waiting rather than to be run. Only a
+    -- [TRUTHFUL-REPORT] outranks a waiting agent, so this is reachable exactly
+    -- when a summary interrupts one -- and without the marker the question
+    -- would come back looking like an ordinary [QUERY] and be handed to the
+    -- agent as work it has already asked.
+    awaiting_resolution INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_resolution IN (0, 1)),
     -- When the message entered the queue. The other half of the latency measurement --
     -- when it actually started running -- is deliberately NOT a column here: a promoted row
     -- is DELETED, so a `dequeued_at` would only ever be written to a row about to

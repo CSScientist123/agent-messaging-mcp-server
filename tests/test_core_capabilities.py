@@ -911,18 +911,6 @@ def test_send_rejects_unknown_behavior(core, world):
     assert after == before, f"an unrecognized behavior must not be queued: before={before}, after={after}"
 
 
-def test_send_rejects_idle_not_sendable(core, world):
-    before = queue_count(core.db, world["worker"]["id"])
-    with pytest.raises(Rejected) as exc:
-        core.send(
-            requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-            message="stop", behavior="[IDLE]",
-        )
-    assert exc.value.code == "idle_not_sendable", f"expected idle_not_sendable, got {exc.value.code!r}"
-    after = queue_count(core.db, world["worker"]["id"])
-    assert after == before, "[IDLE] must never be queued via send()"
-
-
 def test_send_rejects_source_cannot_send(core, world):
     """An nlm_ partner never originates a message (source_caps.can_send=0). No
     handshake is set up at all -- source_cannot_send is checked before the
@@ -1098,21 +1086,30 @@ def test_send_over_queue_is_per_caller(core, world):
 
 
 def test_send_uncapped_label_never_refuses(core, world):
-    """[ERROR] has max_outstanding=NULL in label_caps: it must never refuse,
-    no matter how many are outstanding."""
+    """[MESSAGE-RESPONSE] has max_outstanding=NULL in label_caps: it must never
+    refuse, no matter how many are outstanding.
+
+    [ERROR] is uncapped too, but it is a blocking label -- sending one stops
+    the sender, so a second send from the same agent is refused for a reason
+    that has nothing to do with caps. [MESSAGE-RESPONSE] isolates the cap
+    question.
+    """
     core.handshake(requester_uuid=world["orch"]["uuid"], partner_title="lit-review")
     set_ext(core, "science_")
     for i in range(10):
         result = core.send(
             requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-            message=f"err-{i}", behavior="[ERROR]",
+            message=f"msg-{i}", behavior="[MESSAGE-RESPONSE]",
         )
-        assert result["behavior"] == "[ERROR]", f"send #{i} of an uncapped label must not refuse, got {result!r}"
-    total = queue_count(core.db, world["worker"]["id"], caller_id=world["orch"]["id"], behavior="[ERROR]")
+        assert result["behavior"] == "[MESSAGE-RESPONSE]", (
+            f"send #{i} of an uncapped label must not refuse, got {result!r}"
+        )
+    total = queue_count(core.db, world["worker"]["id"], caller_id=world["orch"]["id"],
+                        behavior="[MESSAGE-RESPONSE]")
     working = core.working_task(partner_id=world["worker"]["id"])
-    working_is_error = working is not None and working["behavior"] == "[ERROR]"
+    working_is_error = working is not None and working["behavior"] == "[MESSAGE-RESPONSE]"
     assert total + (1 if working_is_error else 0) == 10, (
-        f"expected 10 [ERROR] tasks in flight total (queued + working), got {total} queued and "
+        f"expected 10 tasks in flight total (queued + working), got {total} queued and "
         f"working={working['behavior'] if working else None}"
     )
 
@@ -1127,7 +1124,7 @@ def test_read_success_paginates_newest_first(core, world):
     set_ext(core, "science_")
     for i in range(3):
         core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-                   message=f"m{i}", behavior="[QUERY]")
+                   message=f"m{i}", behavior="[MESSAGE-RESPONSE]")
     result = core.read(requester_uuid=world["orch"]["uuid"], partner_title="lit-review", page=1, page_size=2)
     assert result["total"] == 3, f"expected total 3, got {result!r}"
     bodies = [m["body"] for m in result["messages"]]
@@ -1217,26 +1214,36 @@ def test_extend_project_rejects_cross_source(core, world):
 
 
 # ---------------------------------------------------------------------------
-# interrupt_partner
+# displacement -- what replaced the old explicit interrupt capability
 # ---------------------------------------------------------------------------
 
 
-def test_interrupt_partner_displaces_working_task_and_stops_remote(core, world):
+def test_a_strictly_higher_arrival_displaces_the_working_task_and_stops_the_remote(core, world):
+    """No agent decides to stop another agent.
+
+    There is no interrupt capability. A partner is stopped only as a side
+    effect of something outranking what it is doing, and the stop is issued by
+    `advance` before the swap -- so the remote is never running two turns at
+    once.
+    """
     core.handshake(requester_uuid=world["orch"]["uuid"], partner_title="lit-review")
     stub = set_ext(core, "science_")
     core.send(
         requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-        message="do work", behavior="[QUERY]",
+        message="do work", behavior="[RESEARCH]",
     )
     working_before = core.working_task(partner_id=world["worker"]["id"])
-    assert working_before is not None and working_before["behavior"] == "[QUERY]", (
-        f"precondition failed: expected a working [QUERY] task, got {working_before!r}"
+    assert working_before is not None and working_before["behavior"] == "[RESEARCH]", (
+        f"precondition failed: expected a working [RESEARCH] task, got {working_before!r}"
     )
 
-    result = core.interrupt_partner(
-        requester_uuid=world["orch"]["uuid"], partner_title="lit-review", reason="stop now"
+    # [TRUTHFUL-REPORT] is priority 1, strictly above [RESEARCH]'s 4.
+    # Neither label stops its own sender, so every stop seen below belongs to
+    # the displacement rather than to a blocking question.
+    core.send(
+        requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
+        message="a report", behavior="[TRUTHFUL-REPORT]",
     )
-    assert result["displaced"] == "[QUERY]", f"expected displaced == '[QUERY]', got {result!r}"
 
     stop_calls = [c for c in stub.calls if c[0] == "stop_remote_execution"]
     assert len(stop_calls) == 1, f"expected exactly one stop_remote_execution call, got {stub.calls!r}"
@@ -1245,10 +1252,10 @@ def test_interrupt_partner_displaces_working_task_and_stops_remote(core, world):
     )
 
     displaced_row = core.db.read_one(
-        "SELECT * FROM message_queue WHERE partner_id = ? AND behavior = '[QUERY]'",
+        "SELECT * FROM message_queue WHERE partner_id = ? AND behavior = '[RESEARCH]'",
         (world["worker"]["id"],),
     )
-    assert displaced_row is not None, "the displaced [QUERY] must still be in the queue"
+    assert displaced_row is not None, "the displaced [RESEARCH] must still be in the queue"
     assert displaced_row["in_process"] == 1, (
         f"the displaced task must be marked in_process=1, got {displaced_row['in_process']}"
     )
@@ -1257,66 +1264,39 @@ def test_interrupt_partner_displaces_working_task_and_stops_remote(core, world):
     )
 
     working_after = core.working_task(partner_id=world["worker"]["id"])
-    assert working_after is not None and working_after["behavior"] == "[IDLE]", (
-        f"expected [IDLE] to hold the working slot, got {working_after!r}"
+    assert working_after is not None and working_after["behavior"] == "[TRUTHFUL-REPORT]", (
+        f"expected the report to hold the working slot, got {working_after!r}"
     )
 
-    # A later arrival of ANY label displaces the [IDLE] hold, and the [IDLE]
-    # is discarded rather than requeued. [TRUTHFUL-REPORT] (priority 1) is
-    # used here rather than [ERROR]: [ERROR] shares [QUERY]'s priority (2),
-    # and the paused [QUERY] sitting in the queue from the displacement above
-    # would then tie with it on priority, which is a separate tie-break
-    # question this test is not about. [TRUTHFUL-REPORT]'s priority (1) is
-    # strictly higher than the paused [QUERY]'s (2), so it is unambiguously
-    # the head either way -- and it could NEVER win against an actual working
-    # [IDLE] (priority 0) under the normal "strictly higher priority"
-    # comparison, so its delivery here is squarely evidence of the holding
-    # bypass, not of ordinary priority ordering.
+
+def test_an_equal_priority_arrival_does_not_displace_and_does_not_stop_the_remote(core, world):
+    """The counterpart: a tie leaves the working task alone.
+
+    This is the rule that keeps two callers at the same priority from
+    ping-ponging a partner between them -- and it is why the stop is not
+    issued.
+    """
+    core.handshake(requester_uuid=world["orch"]["uuid"], partner_title="lit-review")
+    stub = set_ext(core, "science_")
     core.send(
         requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-        message="a report", behavior="[TRUTHFUL-REPORT]",
+        message="do work", behavior="[RESEARCH]",
     )
-    working_final = core.working_task(partner_id=world["worker"]["id"])
-    assert working_final is not None and working_final["behavior"] == "[TRUTHFUL-REPORT]", (
-        f"expected [TRUTHFUL-REPORT] to displace the [IDLE] hold, got {working_final!r}"
-    )
-    idle_row = core.db.read_one(
-        "SELECT * FROM message_queue WHERE partner_id = ? AND behavior = '[IDLE]'",
-        (world["worker"]["id"],),
-    )
-    assert idle_row is None, f"a displaced [IDLE] must never be requeued, found {idle_row!r}"
-
-    query_still_queued = core.db.read_one(
-        "SELECT * FROM message_queue WHERE partner_id = ? AND behavior = '[QUERY]'",
-        (world["worker"]["id"],),
-    )
-    assert query_still_queued is not None and query_still_queued["in_process"] == 1, (
-        f"the original displaced [QUERY] must remain queued and paused, got {query_still_queued!r}"
+    # A second [RESEARCH] ties with the first on priority. The label's cap of
+    # two is what makes the second admissible at all.
+    core.send(
+        requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
+        message="more work", behavior="[RESEARCH]",
     )
 
-
-def test_interrupt_partner_rejects_different_project(core, world):
-    before = queue_count(core.db, world["worker"]["id"])
-    with pytest.raises(Rejected) as exc:
-        core.interrupt_partner(
-            requester_uuid=world["code_partner"]["uuid"], partner_title="lit-review", reason="x"
-        )
-    assert exc.value.code == "different_project", f"expected different_project, got {exc.value.code!r}"
-    after = queue_count(core.db, world["worker"]["id"])
-    assert after == before, "a refused interrupt must not queue anything"
-
-
-def test_interrupt_partner_rejects_not_executable(core):
-    pid = mk_project(core, title="Notebook", source_prefix="nlm_", system_id="n-int1")
-    project = {"id": pid, "source_prefix": "nlm_"}
-    caller = mk_partner(core, project, title="notebook-caller", remote_id="r-caller")
-    target = mk_partner(core, project, title="notebook-source", remote_id="r-source")
-    before = queue_count(core.db, target["id"])
-    with pytest.raises(Rejected) as exc:
-        core.interrupt_partner(requester_uuid=caller["uuid"], partner_title="notebook-source", reason="stop")
-    assert exc.value.code == "not_executable", f"expected not_executable, got {exc.value.code!r}"
-    after = queue_count(core.db, target["id"])
-    assert after == before, "a refused interrupt must not queue anything"
+    stop_calls = [c for c in stub.calls if c[0] == "stop_remote_execution"]
+    assert stop_calls == [], (
+        f"an equal-priority arrival must never stop the remote, got {stop_calls!r}"
+    )
+    working = core.working_task(partner_id=world["worker"]["id"])
+    assert working is not None and working["body"] == "do work", (
+        f"the working task must be untouched by a tie, got {working!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1626,12 +1606,11 @@ def test_report_back_has_no_handshake_requirement(core, pair):
 
 
 def test_report_back_refuses_delegation_and_holds_but_carries_every_report(core, world):
-    """`report_back` carries reports; it never carries delegation or a hold.
+    """`report_back` carries reports; it never carries delegation.
 
     `[RESEARCH]` is delegated work, and admitting it here would bypass the
     hierarchy rule `send` enforces -- anything holding a `MessagingCore` could
-    land research in a superior's queue through the back door. `[IDLE]` is a
-    hold, which has no meaning in a Caller's queue.
+    land research in a superior's queue through the back door.
 
     The other four are all reachable in practice, and two of them are cases the
     Partner cannot report itself: an `[ERROR]` when it stops on a permission it
@@ -1640,7 +1619,7 @@ def test_report_back_refuses_delegation_and_holds_but_carries_every_report(core,
     """
     worker, caller = world["worker"], world["orch"]
 
-    for behavior in ("[RESEARCH]", "[IDLE]"):
+    for behavior in ("[RESEARCH]",):
         with pytest.raises(Rejected) as exc:
             core.report_back(to_partner_id=caller["id"], from_partner_id=worker["id"],
                              behavior=behavior, body="x")
@@ -1841,7 +1820,14 @@ def test_a_partner_on_an_uncancellable_remote_can_still_be_displaced(core, db, m
     assert [(r["behavior"], r["in_process"]) for r in paused] == [("[RESEARCH]", 1)], (
         "the displaced task must be queued and marked paused"
     )
-    assert core.uncancelled_displacements == [(worker["id"], "[RESEARCH]", "[QUERY]")], (
+    # Two stops were attempted against this uncancellable remote and both were
+    # refused, so both are recorded. The first belongs to the CALLER: sending a
+    # [QUERY] stops the asker, and the asker here holds no working task, hence
+    # the None. The second is the displacement this test is about.
+    assert core.uncancelled_displacements == [
+        (caller["id"], None, "[QUERY]"),
+        (worker["id"], "[RESEARCH]", "[QUERY]"),
+    ], (
         "a displacement that could not stop the previous turn must be recorded, because "
         "two turns are now live against one remote"
     )

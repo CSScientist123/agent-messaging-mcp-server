@@ -13,7 +13,7 @@ erDiagram
 
     LABEL_CAPS {
         string behavior PK "the six labels"
-        int priority "0 IDLE .. 4 RESEARCH, lower wins"
+        int priority "1 TRUTHFUL-REPORT .. 4 RESEARCH, lower wins"
         int max_outstanding "3 QUERY, 2 RESEARCH, else NULL"
         int stored "1 for QUERY/TRUTHFUL-REPORT/MESSAGE-RESPONSE"
         string reply_behavior FK "NULL is what ends an exchange"
@@ -90,6 +90,7 @@ erDiagram
         int message_id FK "set only for stored labels"
         int summary_phase "1 = a displaced [RESEARCH] summary; still owes its Caller"
         string origin_behavior FK "label admitted under, when it differs from behavior"
+        int awaiting_resolution "1 = an agent's own displaced, unanswered question"
         string enqueued_at "start time is on the in-memory slot, not here"
     }
 

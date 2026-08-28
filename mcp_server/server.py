@@ -539,12 +539,18 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             queried_partner_title: The exact title of the message's recipient.
             message: The message body.
             behavior: One of "[RESEARCH]", "[QUERY]", "[ERROR]",
-                "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]". [IDLE] is not
-                accepted here -- no tool sends it. It is how the Polling
-                Server parks a Partner that is waiting on an answer (or how a
-                human intervenes); stopping a Partner mid-turn is never an
-                agent's decision, and sending one directly would stop a
-                partner without stopping its remote.
+                "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]".
+
+                Two of these stop the agent that sends them. A "[QUERY]" or an
+                "[ERROR]" says the sender cannot continue without an answer,
+                so its remote is stopped, whatever it was working on is paused
+                back into its own queue, and the question takes its working
+                slot until the answer arrives. An agent already waiting on one
+                is refused a second: it is stopped, and asking again while
+                stopped is not something it can act on. Nothing else here
+                stops anyone -- stopping a Partner mid-turn is never a
+                decision an agent makes about ANOTHER agent, only about
+                itself.
         """
         try:
             result = core.send(

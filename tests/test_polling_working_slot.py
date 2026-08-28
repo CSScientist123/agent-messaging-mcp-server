@@ -413,34 +413,40 @@ def test_termination_delivered_truthful_report_produces_nothing_back(db, stub, c
 
 
 # ---------------------------------------------------------------------------
-# 8. An [IDLE] hold.
+# 8. An agent waiting on its own question.
 # ---------------------------------------------------------------------------
 
 
-def test_idle_hold_is_not_polled_and_does_not_retire(db, stub, core, server):
+def test_a_waiting_agent_is_not_polled_and_does_not_retire(db, stub, core, server):
+    """The agent asked something and is stopped until it is answered.
+
+    There is nothing to poll for -- it is not running -- and nothing to report.
+    Retiring would be wrong too: the queue holds the work its question
+    displaced, and the answer that clears it arrives as an ordinary message.
+    """
     caller, worker = make_pair(core)
-    core.interrupt_partner(requester_uuid=caller["uuid"], partner_title=worker["title"], reason="hold")
+    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+              message="which dataset?", behavior="[QUERY]")
     working = core.working_task(partner_id=worker["id"])
-    assert working is not None and working["behavior"] == "[IDLE]", (
-        f"setup failed: expected [IDLE] to occupy the working slot, got: {working}"
+    assert working is not None and working.get("awaiting_resolution"), (
+        f"setup failed: expected the question to occupy the slot, got: {working}"
     )
-    stub.calls.clear()  # forget the delivery from the interruption itself
+    stub.calls.clear()
 
     idle = server.drain_once(partner_id=worker["id"])
 
-    assert idle is False, "an [IDLE] hold must not report idle (the queue may hold displaced work)"
+    assert idle is False, (
+        "a waiting agent must not report idle -- the queue may hold displaced work"
+    )
     poll_calls = [c for c in stub.calls if c[0] == "poll_completion"]
-    assert poll_calls == [], f"drain_once must never poll an [IDLE] hold for completion, got: {poll_calls}"
-    assert queued_behaviors(db, caller["id"]) == [], "an [IDLE] hold must push nothing back"
-    working_after = core.working_task(partner_id=worker["id"])
-    assert working_after is not None and working_after["behavior"] == "[IDLE]", (
-        f"the [IDLE] hold must remain in the working slot untouched, got: {working_after}"
+    assert poll_calls == [], (
+        f"a stopped agent must not be polled for completion; got {poll_calls}"
     )
 
 
-# ---------------------------------------------------------------------------
-# 9. A remote whose poll_completion raises NeedsRemote.
-# ---------------------------------------------------------------------------
+def poll_completion(self, *, partner_id_in_remote: str) -> bool:
+        self._record("poll_completion", partner_id_in_remote=partner_id_in_remote)
+        raise NeedsRemote("poll_completion", "this stub never supports polling for completion.")
 
 
 class _NoCompletionCheckExtension(StubExtension):
@@ -591,15 +597,18 @@ def test_drain_once_with_no_registered_extension_loses_nothing(db, stub, core):
     caller, worker = make_pair(core)
     core.send(
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-        message="first", behavior="[QUERY]",
+        message="first", behavior="[MESSAGE-RESPONSE]",
     )
-    # A second [QUERY] from the same caller has the same priority as the one
-    # already occupying the working slot, so it stays queued rather than
-    # being delivered -- exactly the "still waiting" state a no_extension
-    # failure must not be allowed to lose.
+    # A second message of the same label ties with the one already occupying
+    # the working slot, so it stays queued rather than being delivered --
+    # exactly the "still waiting" state a no_extension failure must not lose.
+    #
+    # [MESSAGE-RESPONSE] rather than [QUERY], because sending a [QUERY] would
+    # stop the CALLER: an agent that asks a blocking question is interrupted
+    # and cannot ask a second one until it is answered.
     core.send(
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-        message="second", behavior="[QUERY]",
+        message="second", behavior="[MESSAGE-RESPONSE]",
     )
 
     before_queue = db.read(
