@@ -1,5 +1,8 @@
 %% 07-handshake-legality.mmd
 %% Decision tree for MessagingCore.handshake(requester -> target). Order follows core.py.
+%% Three branches run BEFORE the orchestrator gate, and each is there because one of its
+%% participants can hold no orchestrator role at all -- a code_ partner and an Antigravity
+%% conversation never do, so a rule about roles could never be satisfied by them.
 flowchart TD
     START(["handshake(requester, target)"])
 
@@ -7,7 +10,7 @@ flowchart TD
     START --> SELF
     SELF -->|yes| R_SELF["Rejected: self_handshake"]
 
-    TGTNLM{"target's source is nlm_?"}
+    TGTNLM{"target's source needs\nno handshake? (nlm_)"}
     SELF -->|no| TGTNLM
     TGTNLM -->|yes| R_NLM["Rejected: handshake_not_needed\nnlm_ needs NO handshake --\nmessage it directly"]
 
@@ -15,33 +18,51 @@ flowchart TD
     TGTNLM -->|no| CODEEITHER
 
     CODEEITHER -->|yes| CODEBRIDGE{"is the OTHER side a science_\nbridge-scientist?"}
-    CODEBRIDGE -->|no| R_CODE["Rejected: code_handshakes_bridge_only\nClaude code has exactly one\nlegal counterpart"]
-    CODEBRIDGE -->|yes| CODESINGLE{"does that bridge already hold\na DIFFERENT code_ handshake?"}
-    CODESINGLE -->|yes| R_CODESINGLE["Rejected: bridge_single_code_partner\ntwo would make 'the Caller'\nambiguous for every message"]
-    CODESINGLE -->|no| OK_CODE(["Handshake created.\nNote: no orchestrator role was\nrequired -- code_ holds none,\nand that exemption is why this\nbranch comes first"])
+    CODEBRIDGE -->|no| R_CODE["Rejected: code_handshakes_bridge_only\nClaude Code has exactly one\nlegal counterpart"]
+    CODEBRIDGE -->|yes| CODESINGLE{"does that BRIDGE already hold\na DIFFERENT code_ handshake?"}
+    CODESINGLE -->|yes| R_CODESINGLE["Rejected: bridge_single_code_partner\ntwo would make 'the Caller'\nambiguous for every message.\nNote the direction: a BRIDGE holds at\nmost one code_ partner, not the reverse"]
+    CODESINGLE -->|no| FALL_CODE["branch passes -- code_involved.\nNo orchestrator role was required:\ncode_ holds none, and that exemption\nis why this branch comes first"]
+
+    GEMPAIR{"gemini_ -> gemini_?\n(one Antigravity conversation\ninheriting from another)"}
+    CODEEITHER -->|no| GEMPAIR
+
+    GEMPAIR -->|yes| GEMSAME{"same Project?"}
+    GEMSAME -->|yes| R_GG["Rejected: no_handshake_between_gemini\ntwo conversations under one\ngemini-orchestrator are PEERS --\nthere is nothing for one to inherit"]
+    GEMSAME -->|no| GEMEXT{"is there a project_extension\nrow linking the two Projects?"}
+    GEMEXT -->|no| R_GPROJ["Rejected: different_project\nnext_call: have the gemini-orchestrator\nextend_project the two first"]
+    GEMEXT -->|yes| GEMINHERITED{"is the target ALREADY inherited\nfrom by another gemini_ partner?"}
+    GEMINHERITED -->|yes| R_INHERITED["Rejected: gemini_already_inherited\na lineage is a LINE, not a fork, so\n'which conversation succeeds this one'\nhas exactly ONE answer"]
+    GEMINHERITED -->|no| FALL_GEM["branch passes -- extended = True.\nNO role is required of either side:\na gemini_ partner holds none and\nnever will, so the same-role rule\nbelow could never be satisfied"]
 
     REQORCH{"requester has an\norchestrator_type?"}
-    CODEEITHER -->|no| REQORCH
+    GEMPAIR -->|no| REQORCH
     REQORCH -->|no| R_NOORCH["Rejected: requester_not_orchestrator"]
 
-    SAMESRC{"same source on both sides,\nAND different Project?"}
+    SAMESRC{"NOT a gemini_ pair,\nsame source on both sides,\nAND different Project?"}
     REQORCH -->|yes| SAMESRC
 
     SAMESRC -->|yes| EXTLINK{"is there a project_extension\nrow linking the two?"}
     EXTLINK -->|no| R_PROJ["Rejected: different_project"]
     EXTLINK -->|yes| SAMEROLE{"do BOTH hold the SAME\norchestrator role?"}
     SAMEROLE -->|no| R_ROLE["Rejected: cross_project_requires_same_role\nan extension branches an effort sideways.\nIt is not a second chain of command, so a\ngemini-orchestrator cannot inherit from a\nproject-orchestrator across one"]
-    SAMEROLE -->|yes| OK_EXT(["Handshake created.\nThe role-pair rules below are about\nwho directs whom inside ONE Project\nand say nothing about two peers.\nGrants NOTHING within one Project --\nthose ids are equal, so this branch\nis unreachable for them"])
+    SAMEROLE -->|yes| FALL_EXT["branch passes -- extended = True.\nGrants NOTHING within one Project --\nthose ids are equal, so this branch\nis unreachable for them"]
 
     DUP{"a handshake already exists\nrequester -> target?"}
     SAMESRC -->|no| DUP
-    DUP -->|yes| R_DUP["Rejected: duplicate_handshake"]
+    FALL_CODE --> DUP
+    FALL_GEM --> DUP
+    FALL_EXT --> DUP
+    DUP -->|yes| R_DUP["Rejected: duplicate_handshake\nEVERY branch above passes through here --\nnone of them returns early, so a repeat\ncode_ or inheritance handshake is refused\nhere rather than created"]
 
-    PAIR{"what pair of sources?"}
-    DUP -->|no| PAIR
+    GS{"gemini_ -> science_?"}
+    DUP -->|no| GS
+    GS -->|yes| R_GS["Rejected: gemini_to_science_illegal\nunreachable through the tools -- a gemini_\nrequester holds no role, so it is refused at\nrequester_not_orchestrator first. Kept as\ndefence against a role written straight\ninto the database"]
 
-    PAIR -->|"gemini_ -> gemini_"| R_GG["Rejected: no_handshake_between_gemini"]
-    PAIR -->|"gemini_ -> science_"| R_GS["Rejected: gemini_to_science_illegal"]
+    PAIR{"which branch passed?"}
+    GS -->|no| PAIR
+
+    PAIR -->|"extended (gemini pair or\ncross-extension): pass"| OK_EXT(["Handshake created"])
+    PAIR -->|"code_involved: pass"| OK_CODE(["Handshake created"])
 
     PAIR -->|"science_ -> science_"| ISBRIDGE{"is the requester a\nbridge-scientist?"}
     ISBRIDGE -->|yes| BRIDGETGT{"is the target the\nproject-orchestrator?"}
@@ -54,9 +75,16 @@ flowchart TD
     PAIR -->|"science_ -> gemini_\n(cross-Project by construction)"| GEMORCH{"requester is the\ngemini-orchestrator?"}
     GEMORCH -->|no| R_GEMORCH["Rejected: requires_gemini_orchestrator"]
     GEMORCH -->|yes| SINGLEMASTER{"is this gemini_ target already\nhandshaken from a DIFFERENT\nscience_ partner?"}
-    SINGLEMASTER -->|yes| R_SINGLE["Rejected: gemini_single_science_source\na gemini_ partner serves\nonly ONE science_ master"]
+    SINGLEMASTER -->|yes| R_SINGLE["Rejected: gemini_single_science_source\na gemini_ partner serves only ONE\nscience_ master. Scoped to science_\nsources specifically, so an inheritance\nhandshake from another gemini_ partner\ncan coexist with the orchestrator's"]
     SINGLEMASTER -->|no| BUDGETGRANT{"does requester hold a\nbudget_grants row?"}
     BUDGETGRANT -->|no| R_NOBUDGET["Rejected: no_gemini_budget"]
     BUDGETGRANT -->|yes| BUDGETUSED{"used gemini_ handshakes\n>= budget_count?"}
     BUDGETUSED -->|yes| R_BUDGET["Rejected: gemini_budget_exceeded"]
     BUDGETUSED -->|no| OK_SG(["Handshake created"])
+
+    INSERT["INSERT INTO handshakes.\nA UNIQUE violation here raises\nduplicate_handshake a second time --\nthe check above is not a lock, and two\ncallers can race past it together"]
+    OK_EXT --> INSERT
+    OK_CODE --> INSERT
+    OK_BRIDGE --> INSERT
+    OK_SS --> INSERT
+    OK_SG --> INSERT

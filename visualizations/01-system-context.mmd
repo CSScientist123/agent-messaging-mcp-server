@@ -1,25 +1,27 @@
 %% 01-system-context.mmd
 %% Three MCP servers, one shared SQLite DB, the Polling Server, and the three remotes.
 %% Claude Code is a "code_" partner with exactly one legal counterpart: a
-%% bridge-scientist Claude Science session, and at most one of them.
+%% bridge-scientist Claude Science session. The cardinality runs the OTHER way --
+%% a bridge-scientist holds at most one code_ partner; nothing stops one code_
+%% partner handshaking bridges in two different science projects.
 flowchart TB
 
     subgraph AGENTS["Calling agents (MCP clients)"]
         NLMAGENT["Agent talking to\nNotebookLM notebooks"]
         SCIAGENT["Agent talking to\nClaude Science partners"]
         GEMAGENT["Agent talking to\nAntigravity partners"]
-        CODE["Claude Code\n(a 'code_' partner, local,\nhandshakes ONE bridge-scientist)"]
+        CODE["Claude Code\n(a 'code_' partner, local, no adapter\nand no server of its own -- it acts as\na requester against the science server)"]
     end
 
     subgraph SERVERS["MCP servers -- one FastMCP process per adapter"]
-        MCPNLM["messaging-notebooklm\nMCP server\n(embeds MessagingCore)"]
-        MCPSCI["messaging-science\nMCP server\n(embeds MessagingCore)"]
-        MCPGEM["messaging-antigravity\nMCP server\n(embeds MessagingCore)"]
+        MCPNLM["messaging-nlm\nMCP server\n(embeds MessagingCore\n+ its OWN PollingServer)"]
+        MCPSCI["messaging-science\nMCP server\n(embeds MessagingCore\n+ its OWN PollingServer)"]
+        MCPGEM["messaging-gemini\nMCP server\n(embeds MessagingCore\n+ its OWN PollingServer)"]
     end
 
     DB[("shared SQLite database\n(schema/schema.sql, WAL mode)")]
 
-    POLL["Polling Server\n(one drain thread per Partner;\nadvances the queue, waits on\nthe remote, reports back)"]
+    POLL["Polling Server -- NOT a shared process.\nOne instance INSIDE each MCP server above,\nholding exactly ONE extension: its own source.\nIt declines to drain any partner of another source.\n\nOne drain thread per Partner (advances the queue,\nwaits on the remote, reports back), plus ONE\nsupervisor thread scanning for partners of its own\nsources that have work and no live thread."]
 
     NLMREMOTE{{"NotebookLM\n(nlm_ CLI)"}}
     SCIREMOTE{{"Claude Science\n(science_ HTTP API)"}}
@@ -37,9 +39,16 @@ flowchart TB
     POLL -->|"advances message_queue,\nreports back into the Caller's,\nregisters drain_threads"| DB
 
     POLL -->|"deliver_message /\npoll_completion /\nread_remote_result"| NLMREMOTE
-    POLL -->|"deliver_message /\nstop_remote_execution /\npoll_completion"| SCIREMOTE
-    POLL -->|"deliver_message / stop /\npoll_completion /\nget+add+delete_permissions"| GEMREMOTE
+    POLL -->|"deliver_message /\nstop_remote_execution /\npoll_completion /\nread_remote_result"| SCIREMOTE
+    POLL -->|"deliver_message / stop /\npoll_completion /\nread_remote_result"| GEMREMOTE
 
-    MCPNLM -.->|"notify_partner_push\n(arms a drain thread)"| POLL
-    MCPSCI -.->|"notify_partner_push\n(arms a drain thread)"| POLL
-    MCPGEM -.->|"notify_partner_push\n(arms a drain thread)"| POLL
+    MCPNLM -.->|"verify_* on create,\ndeliver_message via send"| NLMREMOTE
+    MCPSCI -.->|"verify_* on create, deliver_message\nvia send, stop_remote_execution on a\ndisplacement AND on a blocking sender"| SCIREMOTE
+    MCPGEM -.->|"verify_* on create, deliver_message via send,\nget + add + delete_permissions -- these three are\ncalled by MessagingCore in THIS process, never by\nthe Polling Server"| GEMREMOTE
+
+    MCPNLM -.->|"notify_partner_push"| POLL
+    MCPSCI -.->|"notify_partner_push"| POLL
+    MCPGEM -.->|"notify_partner_push"| POLL
+
+    ARM["A push is only ONE of the ways a drain thread is armed,\nand not the usual one: send arms its target directly\n(best-effort), a completion arms the Caller it replied to,\nand the supervisor arms everything else on an interval.\nThat last one is what closes the cross-process gap."]
+    POLL -.-> ARM

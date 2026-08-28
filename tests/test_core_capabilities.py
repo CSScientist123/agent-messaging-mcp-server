@@ -4,7 +4,7 @@ messaging model.
 The old model this file used to encode -- forward/backward queues, causal roles
 (role="opens"/"continues"), polling_tasks, open_issues, resume_partner -- is gone. There is
 ONE priority queue per partner (`message_queue`), and every message, `send`,
-`interrupt_partner`, and the drain thread's own promotions all go through it via `advance`.
+and the drain thread's own promotions all go through it via `advance`.
 This file is rewritten from scratch against `messaging_core/core.py`, which is the sole
 authority for every code and every ordering claim below -- not `docs/`, which describes the
 old model and is being rewritten separately.

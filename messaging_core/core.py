@@ -2324,13 +2324,18 @@ class MessagingCore:
                 # while still executing the first interleaves them.
                 #
                 # A remote that CANNOT be cancelled is a different matter from
-                # one whose cancellation failed. Claude Science has no usable
-                # interrupt at all -- its only route needs an execution id no
-                # other call returns -- so `stop_remote_execution` refuses by
-                # design, every time. Treating that refusal as an error would
-                # mean no science_ Partner could ever be displaced, and the
-                # refusal would propagate to whoever called `send` after their
-                # message was already committed.
+                # one whose cancellation failed. A NotebookLM partner never
+                # executes, so `stop_remote_execution` refuses by design, every
+                # time. Treating that refusal as an error would mean such a
+                # Partner could never be displaced, and the refusal would
+                # propagate to whoever called `send` after their message was
+                # already committed.
+                #
+                # Claude Science used to be the example here, on the grounds
+                # that its only interrupt route needed an execution id no other
+                # call returns. That is no longer true: the adapter now posts to
+                # /api/frames/{id}/cancel, which takes the frame id and nothing
+                # else. A science_ Partner is genuinely stopped.
                 #
                 # So a designed refusal is recorded and the swap proceeds. The
                 # consequence is real and worth naming: the old turn keeps

@@ -13,12 +13,12 @@ flowchart TB
     PROJ -->|"hosts (project_id FK)"| PART_B
 
     CALLERTITLE["Caller supplies a TITLE\n(human-readable, free-form,\ncarries no type information)"]
-    RESOLVE{{"_resolve_live_partner_by_title(title)\n-- the ONLY place a title is looked up"}}
-    UUID["Partner.uuid\n(the identity minted at create_partner,\nreturned exactly once)"]
+    RESOLVE{{"_resolve_live_partner_by_title(title)\n-- the only place a title resolves to a\nlive Partner IDENTITY. Other title lookups\nexist (duplicate checks, archive, search),\nbut none of them yields an identity"}}
+    UUID["Partner.uuid\n(minted at create_partner, or supplied\nby the caller; returned exactly once)"]
 
     CALLERTITLE -->|"boundary lookup"| RESOLVE
     RESOLVE -->|"resolves to"| UUID
-    UUID -->|"identifies everywhere\ninternally (requester_uuid,\nforeign keys use partners.id)"| STORED[("Everything stored --\nmessages, message_queue,\nhandshakes, partner_paths,\ndrain_threads -- references\npartners.id, never a title")]
+    UUID -->|"identifies everywhere\ninternally (requester_uuid,\nforeign keys use partners.id)"| STORED[("Everything stored --\nmessages, message_queue, handshakes,\npartner_paths, budget_grants,\ndrain_threads -- references\npartners.id, never a title")]
 
     CROSSSRC{{"Cross-source handshake?\n(e.g. science_ -> gemini_)"}}
     PROJ -->|"one source_prefix per Project\nis the single authority"| CROSSSRC
@@ -26,4 +26,4 @@ flowchart TB
 
     SAMESRC{{"Same-source pair?\n(e.g. science_ -> science_)"}}
     PROJ --> SAMESRC
-    SAMESRC -->|"same source_prefix CAN mean\nsame OR different Project --\nso this is where 'same Project'\nis actually enforced"| SAMEPROJRULE["'Both partners must belong\nto the same Project' rule\napplies ONLY within a source --\nand is lifted only by a\nproject_extension row, and then\nonly between identical roles"]
+    SAMESRC -->|"same source_prefix CAN mean\nsame OR different Project --\nso this is where 'same Project'\nis actually enforced"| SAMEPROJRULE["'Both partners must belong to the same\nProject' applies ONLY within a source, and only\nto NON-gemini pairs. Lifted by a project_extension\nrow, then only between identical roles.\n\nA gemini_ -> gemini_ pair INVERTS it: the same\nProject is refused outright (two conversations\nunder one orchestrator are peers), an extension\nrow is required, and NO role match applies --\nneither side holds a role. But a conversation\nmay be inherited from only ONCE."]

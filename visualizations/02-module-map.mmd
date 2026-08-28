@@ -1,18 +1,21 @@
 %% 02-module-map.mmd
 %% Package dependency direction. An arrow means "imports" / "depends on".
-%% messaging_core is the dependency floor; nothing it contains imports upward.
+%% The floor is extension/base.py plus the leaf modules of messaging_core.
+%% core.py sits ABOVE extension/base.py -- it imports it (see the edge below).
 flowchart BT
 
     subgraph CORE["messaging_core package"]
         CFG["config.py\n(env, db path)"]
         ERR["errors.py\n(Rejected, NeedsRemote)"]
-        LBL["labels.py\n(the six labels; every other\nper-label fact is in label_caps)"]
+        LBL["labels.py\n(the five labels + BLOCKING_BEHAVIORS;\nevery other per-label fact is in label_caps)"]
         RESP["responses.py\n(ok / rejected / nothing_new)"]
         DB["db.py\n(Database: writer thread + readers)"]
-        CORELOGIC["core.py\n(MessagingCore: the 15 capabilities)"]
+        SLOTS["slots.py\n(WorkingSlots: the in-memory\nworking slot, never persisted)"]
+        TMPL["templates.py\n(the prompts a remote actually\nreceives -- and the ones it does not)"]
+        CORELOGIC["core.py\n(MessagingCore: 23 public methods --\n17 capabilities with an MCP tool, plus\n6 queue-machinery methods with none)"]
     end
 
-    EXT["extension/base.py\n(RemoteExtension ABC,\nNonExecutingExtension,\nStubExtension)"]
+    EXT["extension/base.py\n(RemoteExtension ABC,\nNonExecutingExtension,\nStubExtension, RemoteFailure)"]
 
     subgraph ADAPTERS["adapters package (one per remote)"]
         NLMAD["adapters/notebooklm/adapter.py\n(NotebookLMExtension)"]
@@ -21,7 +24,7 @@ flowchart BT
         REG["adapters/registry.py\n(build_extension:\nsource_prefix -> concrete adapter)"]
     end
 
-    POLLING["polling/server.py\n(PollingServer: state machine\n+ drain threads)"]
+    POLLING["polling/server.py\n(PollingServer: drain threads +\nsupervisor. Deliberately NO state\nmachine -- the queue and the slot\nalready say where a task is)"]
     MCPSRV["mcp_server/server.py\n(build_server: FastMCP tool surface)"]
     MCPCFG["mcp_server/config.py\n(env wiring; delegates to\nadapters/registry.py by default,\nStubExtension only if\nMESSAGING_MCP_STUB is set)"]
 
@@ -30,14 +33,15 @@ flowchart BT
     CORELOGIC -->|imports| DB
     CORELOGIC -->|imports| ERR
     CORELOGIC -->|imports| LBL
-    CORELOGIC -->|"imports (type only)"| EXT
+    CORELOGIC -->|"imports RemoteExtension for typing,\nand RemoteFailure -- caught at RUNTIME"| EXT
+    CORELOGIC -->|imports| SLOTS
+    CORELOGIC -->|imports| TMPL
 
     EXT -->|imports| ERR
 
     NLMAD -->|subclasses| EXT
     SCIAD -->|subclasses| EXT
     GEMAD -->|subclasses| EXT
-    NLMAD -->|imports| ERR
     SCIAD -->|imports| ERR
     GEMAD -->|imports| ERR
 
@@ -45,21 +49,24 @@ flowchart BT
     REG -->|imports| SCIAD
     REG -->|imports| GEMAD
     REG -->|imports| EXT
+    REG -->|imports| ERR
 
-    POLLING -->|imports| DB
+    POLLING -->|"imports AND constructs\n(one per source)"| CORELOGIC
     POLLING -->|imports| ERR
-    POLLING -->|imports| LBL
     POLLING -->|imports| RESP
+    POLLING -.->|"receives a Database by injection --\nit does NOT import db.py"| DB
     POLLING -->|"imports (type only)"| EXT
 
     MCPSRV -->|imports| CORELOGIC
     MCPSRV -->|imports| RESP
     MCPSRV -->|imports| ERR
     MCPSRV -->|imports| POLLING
+    MCPSRV -->|"imports RemoteFailure --\ncaught in every tool handler"| EXT
 
     MCPCFG -->|imports| CORELOGIC
     MCPCFG -->|imports| DB
     MCPCFG -->|"imports (StubExtension,\nescape hatch only)"| EXT
     MCPCFG -->|"imports (default path)"| REG
+    MCPCFG -->|"imports and constructs\n(function-local import)"| POLLING
 
     %% Dependency direction key: lower boxes are depended upon by higher ones.

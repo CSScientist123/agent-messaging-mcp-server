@@ -18,7 +18,14 @@ flowchart LR
 
     SENDER --> CAP
 
-    Q[("message_queue -- ONE per Partner\n\nreading the head is TWO questions:\n1. which LABEL -- priority, then a label with\n   unpaused work over one entirely paused,\n   then arrival\n2. which ROW of it -- paused first, then arrival")]
+    BLOCK{{"is the label [QUERY] or [ERROR]?\n(labels.BLOCKING_BEHAVIORS)"}}
+    SENDER --> BLOCK
+    BLOCK -->|no| NOSTOP["the sender keeps working"]
+    BLOCK -->|"yes, and it is already waiting"| R_WAIT["Rejected('already_awaiting_an_answer')\nit is stopped; it could not act on\nthe answer to a second question"]
+    BLOCK -->|yes| AWAIT["_await_answer(): stop the SENDER's remote,\nrequeue ITS working task paused,\nand put the question in ITS OWN slot\n\nNo queue row backs it. Nothing is\nrendered or delivered for it."]
+    AWAIT --> SLOT
+
+    Q[("message_queue -- ONE per Partner\n\nreading the head is TWO questions, and\nawaiting_resolution leads BOTH of them:\n1. which LABEL -- a displaced WAIT first, then\n   priority, then a label with unpaused work over\n   one entirely paused, then earliest FRESH\n   arrival, then earliest arrival\n2. which ROW of it -- a WAIT first, then paused,\n   then arrival, then row id")]
     OK --> Q
 
     PRIO["label_caps.priority -- lower wins\n\n1  [TRUTHFUL-REPORT]    summarize without contamination\n2  [QUERY] = [ERROR]    both stop the SENDER; an unanswered\n                     question is the blocker\n3  [MESSAGE-RESPONSE]   the answer that unblocks\n4  [RESEARCH]           delegated work, the patient kind"]
@@ -26,11 +33,14 @@ flowchart LR
     Q -.->|"ordered by"| PRIO
 
     SLOT["WORKING SLOT\nin memory, never in SQLite\n(messaging_core/slots.py)"]
-    Q -->|"advance(): head promoted\nonly if it STRICTLY beats\nthe working task"| SLOT
-    SLOT -->|"displaced: marked in_process=1\nand pushed back"| Q
+    Q -->|"advance(): promoted when the slot is\nEMPTY, or when it STRICTLY beats\nthe working task"| SLOT
+    SLOT -->|"displaced: pushed back with in_process=1,\nand carrying summary_phase, origin_behavior\nand awaiting_resolution -- a marker dropped\nhere is a fact nothing can reconstruct"| Q
 
     TIE["in_process is a tie-break WITHIN one label,\nnot a global override -- which is why the head\nneeds two statements, not one ORDER BY.\n\n[QUERY] and [ERROR] SHARE a priority. While the\ntie-break was global, a paused [QUERY] beat a fresh\n[ERROR], and the Caller's correction was never\ndelivered to the Partner it was correcting."]
     Q -.-> TIE
+
+    ANSWER["While the slot holds a WAIT, advance looks the\n[MESSAGE-RESPONSE] up BY LABEL, not from the head.\n\nIt sits at priority 3, below [QUERY]/[ERROR] at 2\nand [TRUTHFUL-REPORT] at 1 -- so an agent whose\npaused work carries one of those has a head that is\nNEVER the answer, and a head read would return None\nforever. Priority orders WORK; the message that ends\na wait is not work.\n\nIts row is consumed WITHOUT being promoted, the\nquestion is discarded, and the response is folded\ninto whatever the queue holds next."]
+    SLOT -.-> ANSWER
 
     EQ["EQUAL priority does NOT displace.\nAn arriving [QUERY] never interrupts\na [QUERY] being answered, or two callers\nping-pong a partner and neither is answered."]
     SLOT -.-> EQ

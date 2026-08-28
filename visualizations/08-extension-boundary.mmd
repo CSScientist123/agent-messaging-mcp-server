@@ -19,12 +19,12 @@ flowchart TB
         L11["extend_project"]
     end
 
-    subgraph REMOTE["Capabilities that NEED a remote (call self._extension_for(...))"]
+    subgraph REMOTE["The SIX capabilities that need a remote (call self._extension_for(...)),\nplus advance, which is queue machinery rather than a capability"]
         direction LR
         CP["create_project\n-> verify_project_system_id"]
         CPART["create_partner\n-> verify_partner_id_in_remote"]
         SEND["send\n-> advance -> deliver_message\n(a blocking label also stops the SENDER)"]
-        ADV["advance\n-> stop_remote_execution\n(only when displacing)"]
+        ADV["advance (NOT a capability -- no MCP tool;\ncalled by send and by the drain thread)\n-> deliver_message on every promotion\n-> stop_remote_execution only when displacing"]
         GETP["get_permissions"]
         ADDP["add_permissions"]
         DELP["delete_permissions"]
@@ -52,6 +52,7 @@ flowchart TB
     CPART -.-> M2
     SEND -.-> M3
     ADV -.-> M4
+    ADV -.-> M3
     GETP -.-> M8
     ADDP -.-> M8
     DELP -.-> M8
@@ -60,7 +61,7 @@ flowchart TB
     NLM -->|implements| M2
     NLM -->|implements| M3
     NLM -->|"overrides (always True --\na query is synchronous)"| M6
-    NLM -->|"implements for real\n(only remote that needs it)"| M7
+    NLM -->|"implements for real\n(reads the notebook's answer back)"| M7
     NLM -.->|"inherits clean refusal\n(never executes)"| M4
     NLM -.->|"inherits refusal --\nno filesystem grant exists"| M8
 
@@ -69,7 +70,7 @@ flowchart TB
     SCI -->|implements| M3
     SCI -->|implements| M4
     SCI -->|implements| M6
-    SCI -.->|"NeedsRemote default\n(reports via its own actions)"| M7
+    SCI -->|"implements for real\nGET /frames/{id}/messages, dropping\n_harness_notice and returning the\ntrailing run of assistant messages"| M7
     SCI -.->|"inherits refusal -- a frame has\nNO per-frame path concept, and a\nfabricated 'granted' here would send\nwork that stops on a prompt"| M8
 
     GEM -->|implements| M1
@@ -77,7 +78,7 @@ flowchart TB
     GEM -->|implements| M3
     GEM -->|implements| M4
     GEM -->|implements| M6
-    GEM -.->|"NeedsRemote default\n(reports via its own actions)"| M7
+    GEM -->|"implements for real\ntmux pane capture anchored on the\ndelivered echo -- returns '' rather\nthan fabricating when it is absent"| M7
     GEM -->|"THE ONLY REAL IMPLEMENTATION, verified live.\nReads ~/.gemini/config/projects/<id>.json at\npermissionGrants.permissionGrants.allow -- NOT\nprojectResources, which stays empty.\nWrites through the /permissions TUI over tmux\n(three screens, two Enters), then the caller\nverifies against that same file."| M8
 
     ABSENT["There is NO method anywhere above that\nanswers a permission prompt, in any adapter.\nEnforcement by absence: a rule with no method\ncannot be circumvented by an agent that finds\ncircumventing easier.\n\nThere is also no resume. Correcting the grant\nand sending again IS the resumption."]

@@ -14,15 +14,15 @@ stateDiagram-v2
 
     Queued --> Working : advance() -- slot empty,<br/>or this head STRICTLY beats<br/>the working task
 
-    Working --> Paused : displaced by a higher-priority<br/>arrival. stop_remote_execution first,<br/>THEN the swap -- a stop that fails<br/>leaves everything as it was
+    Working --> Paused : displaced by a higher-priority<br/>arrival. stop_remote_execution first,<br/>THEN the swap -- a stop that fails<br/>UNEXPECTEDLY leaves everything as it was.<br/>A remote that refuses BY DESIGN is recorded<br/>on uncancelled_displacements and the swap<br/>proceeds anyway.<br/><br/>Also reached by a FAILED DELIVERY:<br/>_requeue puts the task back, paused.
 
-    Paused --> Working : advance() picks it before other tasks<br/>OF ITS OWN LABEL, and never before a<br/>different one -- [QUERY] and [ERROR] share<br/>a priority, so a global tie-break would have<br/>a paused [QUERY] beat a fresh [ERROR] and the<br/>Caller\'s correction would never arrive.<br/>Prompt is one line:<br/>"Resume your previous [RESEARCH]."
+    Paused --> Working : advance() picks it before other tasks<br/>OF ITS OWN LABEL, and never before a<br/>different one -- [QUERY] and [ERROR] share<br/>a priority, so a global tie-break would have<br/>a paused [QUERY] beat a fresh [ERROR] and the<br/>Caller\'s correction would never arrive.<br/><br/>EXCEPT a paused WAIT: awaiting_resolution is<br/>read AHEAD of priority, so it outranks every<br/>other row in this agent\'s queue, across labels.<br/><br/>The prompt depends on what resumed --<br/>a plain pause: "Resume your previous [RESEARCH].";<br/>a summary phase: the full report request again;<br/>a wait: NOTHING is rendered or delivered.
 
     Working --> Summary : the work finished and the label<br/>was [RESEARCH] -- it owes a summary,<br/>and the summary is a SECOND exchange<br/>in the SAME slot, not a queued message
 
     Summary --> [*] : summary pushed to the Caller<br/>as [TRUTHFUL-REPORT]
 
-    Working --> [*] : label_caps.reply_behavior:<br/>[QUERY] -> [MESSAGE-RESPONSE] to the Caller,<br/>everything else -> NOTHING
+    Working --> [*] : label_caps.reply_behavior:<br/>[QUERY] -> [MESSAGE-RESPONSE],<br/>[ERROR] -> [MESSAGE-RESPONSE],<br/>[TRUTHFUL-REPORT] and [MESSAGE-RESPONSE] -> NOTHING.<br/>([RESEARCH] -> [TRUTHFUL-REPORT], but by way of<br/>the summary phase above, never from here.)
 
     note right of Working
         A slot can also hold a WAIT: the agent's
@@ -38,6 +38,20 @@ stateDiagram-v2
         outrank everything else in that agent's
         queue and re-enter the wait rather than
         come back as work it already asked.
+
+        An agent already waiting is refused a
+        second question, already_awaiting_an_answer.
+
+        The wait ends only on a [MESSAGE-RESPONSE],
+        which advance looks up BY LABEL rather than
+        from the head -- the answer sits at priority
+        3, so a head read would find higher-priority
+        paused work and deadlock forever. Its row is
+        consumed without being promoted, and folded
+        into what comes next in one of three shapes:
+        the next job quoted in full, the agent's own
+        paused work named by label, or the response
+        alone when the queue is empty.
     end note
 
     note left of Summary

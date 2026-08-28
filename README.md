@@ -67,7 +67,7 @@ carrying it replies with — is a row in `label_caps`, not a branch in code.
 | `polling/server.py` | One drain thread per Partner. Polls remotes so no agent has to |
 | `mcp_server/` | The MCP tool surface |
 | `docs/` | Architecture, reference, lifecycle, runbook, invariants |
-| `visualizations/` | Ten mermaid sources |
+| `visualizations/` | Ten mermaid sources and their rendered PNGs (`./render-diagrams.sh`) |
 | `tests/` | Unit, boundary, adapter and schema suites, plus a mutation pass |
 
 ## Documentation

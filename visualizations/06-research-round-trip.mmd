@@ -14,18 +14,32 @@ sequenceDiagram
     CORE->>CORE: advance(): queue head vs working slot
     Note over CORE: slot empty, so [RESEARCH] is promoted<br/>and its row LEAVES the queue
 
-    CORE->>B: deliver_message(research_dispatch prompt)<br/>request + references + CONFIGURED PATHS
+    CORE->>B: deliver_message(research_dispatch prompt)<br/>request + CONFIGURED PATHS + identity block
     Note over CORE,B: the path list comes from partner_paths.<br/>A conversation not told what it may touch reaches<br/>outside its grant and raises a prompt -- and a<br/>prompt is an error here, not a question
 
     loop drain thread
         PS->>B: poll_completion()?
         B-->>PS: not yet
     end
+
+    opt B cannot finish on its own -- research_dispatch TELLS it to do this
+        Note over B: "If you find you are missing context that only the<br/>Caller holds, do not guess - message back a [QUERY] and idle."<br/>The identity block ships in this prompt for that reason alone.
+        B->>CORE: send([QUERY] or [ERROR], to A)
+        CORE->>B: stop_remote_execution -- the ASKER is stopped
+        CORE->>Q: its [RESEARCH] is requeued in_process=1
+        CORE->>CORE: the question takes B's OWN slot<br/>(no queue row, nothing delivered)
+        Note over CORE,B: a second question now is refused<br/>already_awaiting_an_answer. Only a [TRUTHFUL-REPORT]<br/>can take the slot from a waiting agent, and the wait<br/>returns carrying awaiting_resolution = 1.
+        CORE->>A: the question lands in A's queue,<br/>displacing whatever A was doing unless it ties or outranks
+        A->>CORE: send([MESSAGE-RESPONSE])
+        CORE->>CORE: answer found BY LABEL, its row consumed<br/>without promotion, the question discarded
+        CORE->>B: ONE prompt: the response + "Resume your work on: [RESEARCH]"
+    end
+
     B-->>PS: finished
 
     Note over PS,CORE: PHASE 2 -- the summary, and it is NOT a queued message
     PS->>CORE: begin_summary_phase(partner_id)
-    CORE->>CORE: SAME slot: behavior becomes [TRUTHFUL-REPORT],<br/>effective priority raised 4 -> 1,<br/>body stays the ORIGINAL request
+    CORE->>CORE: SAME slot: behavior becomes [TRUTHFUL-REPORT],<br/>effective priority raised 4 -> 1,<br/>body stays the ORIGINAL request,<br/>summary_phase = True (step 21 depends on it),<br/>origin_behavior = [RESEARCH] (so it still counts<br/>against A's cap of 2 while the summary is written)
     Note over CORE: raised to 1, which BLOCKS the queue: every arriving<br/>message waits, because advance displaces only on a strictly<br/>lower number and nothing has one.<br/><br/>The counterfactual is why: a summary written while traffic<br/>WAS reaching the same context would summarize the traffic.
     PS->>B: deliver_message(truthful_report_request prompt)<br/>original request quoted back verbatim
 
@@ -38,7 +52,7 @@ sequenceDiagram
     B-->>PS: summary text
 
     PS->>CORE: release(partner_id) -- slot emptied
-    PS->>CORE: report_back(to=A, [TRUTHFUL-REPORT], summary)<br/>label_caps.reply_behavior said so
+    PS->>CORE: report_back(to=A, [TRUTHFUL-REPORT], summary)<br/>the summary_phase MARKER said so -- by now the task<br/>reads [TRUTHFUL-REPORT], whose reply_behavior is NULL<br/>and so cannot be what asks for this
     CORE->>A: pushed into A's OWN queue
     PS->>PS: ensure A has a drain thread
     Note over A: A reads it with read() -- [TRUTHFUL-REPORT] is<br/>one of the three stored labels

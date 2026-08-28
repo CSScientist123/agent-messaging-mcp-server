@@ -8,7 +8,7 @@ flowchart TB
         RCALL["Database.read(sql) / read_one(sql)"]
     end
 
-    QUEUE[["job queue\n(thread-safe, one item per write)"]]
+    QUEUE[["job queue (thread-safe)\none (fn, future, is_write) item per job:\nevery write, plus :memory: READS,\nplus a _STOP sentinel from close()"]]
     WCALL -->|"enqueues fn,\nblocks on a Future"| QUEUE
 
     WRITER["the ONE writer thread\n(messaging-db-writer)"]
@@ -25,8 +25,10 @@ flowchart TB
 
     DECISION -->|"YES -- :memory:"| MEMROUTE["routed through the SAME\njob queue as writes\n(is_write=False)"]
     MEMROUTE -->|"dequeued by"| WRITER
+    MEMROUTE -.->|"PRAGMA query_only = ON around the call,\nOFF in a finally -- the ONLY read-only\nenforcement here, since this is the writer's\nown connection and there is no mode=ro fd"| WRITER
 
     COMMIT --> DISKDB
+    COMMIT -.->|":memory: commits go here --\nsame BEGIN IMMEDIATE, same COMMIT"| MEMDB
     WRITER -->|":memory: case only --\nthe ONE shared connection\n(no second connection possible)"| MEMDB[("in-memory SQLite database\n(single connection, owned\nby the writer thread)")]
 
     ROLLBACK -.-> DISKDB

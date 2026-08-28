@@ -44,7 +44,10 @@ def read(path: str) -> str:
 
 DOCS = {name: read(f"docs/{name}") for name in os.listdir("docs") if name.endswith(".md")}
 ALL_DOCS = "\n".join(DOCS.values())
-MMD = {name: read(f"visualizations/{name}") for name in os.listdir("visualizations")}
+# .mmd only -- visualizations/ also holds the rendered .png for each source, and
+# reading a binary as text manufactures label-shaped tokens out of image bytes.
+MMD = {name: read(f"visualizations/{name}")
+       for name in os.listdir("visualizations") if name.endswith(".mmd")}
 ALL_MMD = "\n".join(MMD.values())
 
 db = sqlite3.connect(":memory:")
@@ -84,6 +87,64 @@ for t in sorted(real_tables):
 
 for trig in sorted(real_triggers):
     check(trig in ALL_DOCS, "schema/triggers", f"trigger {trig!r} is documented nowhere")
+    check(trig in er, "mmd/triggers", f"trigger {trig!r} is not named in the ER diagram")
+
+# ------------------------------------------------------------------ diagrams
+# Until this block existed, `ALL_MMD` was computed and never read: nine of the
+# ten diagrams were mechanically unchecked, and the ER diagram was checked only
+# for its column lists. A diagram is a claim about the code exactly as much as a
+# sentence is, and it rots the same way -- silently, and worse, because a picture
+# reads as authoritative. The `[IDLE]` removal is what proved it: five diagrams
+# needed editing and nothing would have failed if they had been missed.
+#
+# Every check below is a COVERAGE check -- "the code's facts all appear" -- rather
+# than a validity check over free text. A blanket "every identifier in a diagram
+# must exist" was tried and abandoned: Mermaid node syntax and `\n` escapes
+# manufacture tokens like `nlabel_caps` and `npoll_completion`, and column names
+# collide with everything. Coverage in this direction has no such false positives.
+
+# 1. Every label a diagram names is a live one. This is what would have caught
+#    `[IDLE]` in five files. The pattern is deliberately narrow -- a bracketed
+#    all-caps token -- which across all ten diagrams matches labels and nothing
+#    else.
+live_labels = {r["behavior"] for r in db.execute("SELECT behavior FROM label_caps")}
+for name, text in sorted(MMD.items()):
+    for token in sorted(set(re.findall(r"\[[A-Z][A-Z-]*\]", text))):
+        check(token in live_labels, f"mmd/labels/{name}",
+              f"names {token}, which is not a row in label_caps")
+
+# 2. The handshake decision tree draws every branch handshake can actually take.
+#    Both directions matter: a missing branch is a rule nobody can see, and a
+#    drawn branch the code cannot raise is a rule that does not exist. Word
+#    boundaries, because `no_handshake` is a substring of
+#    `no_handshake_between_gemini`.
+_core_src = read("messaging_core/core.py")
+_hs = next(n for n in ast.parse(_core_src).body
+           if isinstance(n, ast.ClassDef) and n.name == "MessagingCore")
+_hs_fn = next(n for n in _hs.body if isinstance(n, ast.FunctionDef) and n.name == "handshake")
+handshake_codes = set(re.findall(r'Rejected\(\s*\n?\s*"([a-z_]+)"',
+                                 ast.get_source_segment(_core_src, _hs_fn)))
+tree7 = MMD["07-handshake-legality.mmd"]
+_all_core_codes = set(re.findall(r'Rejected\(\s*\n?\s*"([a-z_]+)"', _core_src))
+drawn7 = {c for c in _all_core_codes if re.search(rf"\b{re.escape(c)}\b", tree7)}
+for code in sorted(handshake_codes - drawn7):
+    check(False, "mmd/handshake-branches",
+          f"handshake can raise {code!r}, and 07 draws no branch for it")
+for code in sorted(drawn7 - handshake_codes):
+    check(False, "mmd/handshake-branches",
+          f"07 draws {code!r}, which handshake cannot raise")
+
+# 3. The extension-boundary diagram names every method of the interface it is
+#    about. A method added to RemoteExtension and not drawn here is a hole in the
+#    one picture of that boundary.
+_ext_tree = ast.parse(read("extension/base.py"))
+_remote = next(n for n in _ext_tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "RemoteExtension")
+tree8 = MMD["08-extension-boundary.mmd"]
+for m in sorted(n.name for n in _remote.body
+                if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")):
+    check(m in tree8, "mmd/extension-coverage",
+          f"RemoteExtension.{m} is not drawn in 08-extension-boundary")
 
 # ------------------------------------------------------------------ seed data
 caps = {r["behavior"]: r for r in db.execute("SELECT * FROM label_caps")}
@@ -233,15 +294,37 @@ tmpl = {n.name for n in ast.parse(read("messaging_core/templates.py")).body
 for fn in sorted(tmpl):
     check(fn in ALL_DOCS, "templates", f"template {fn}() is documented nowhere")
 
+# 4. A rendered image that disagrees with its source is worse than no image: it
+#    reads as authoritative and it is wrong, and nobody re-reads the .mmd to
+#    check. So a .png older than its .mmd is a failure with a named fix.
+#
+#    Skipped when the .png is absent rather than failed -- git does not preserve
+#    mtimes, so a fresh clone has every image looking stale, and a check that
+#    cries wolf on every clone is a check people learn to ignore. The same
+#    reasoning as the vault block below, which skips when the vault is not
+#    mounted.
+for _mmd in sorted(MMD):
+    _src = os.path.join("visualizations", _mmd)
+    _png = _src[:-4] + ".png"
+    if not os.path.exists(_png):
+        continue
+    check(os.path.getmtime(_png) >= os.path.getmtime(_src), "mmd/rendered",
+          f"{_mmd} is newer than its .png -- run ./render-diagrams.sh")
+
 # ------------------------------------------------------------ dead references
 GONE = ["forward_queue", "backward_queue", "polling_tasks", "open_issues",
         "resume_partner", "resume_remote_execution", "CausalRole", "queue_for",
-        "max_queue", "notify_targets", "no_remote_permission_removal"]
+        "max_queue", "notify_targets", "no_remote_permission_removal",
+        # Removed with the [IDLE] rewrite. A deleted capability that a diagram
+        # still draws is the exact drift this whole block exists to catch, and
+        # until now the sweep never looked at a diagram.
+        "interrupt_partner", "idle_interruption", "INTERRUPT_BEHAVIOR",
+        "idle_not_sendable", "_RAISES_UPWARD", "_require_executable"]
 for name in GONE:
     live = name in read("messaging_core/core.py") or name in read("schema/schema.sql")
     if live:
         continue
-    for doc_name, text in DOCS.items():
+    for doc_name, text in {**DOCS, **MMD}.items():
         hits = [ln for ln in text.splitlines() if name in ln]
         # A line that explicitly frames it as removed/historical is fine.
         stale = [ln for ln in hits if not re.search(
