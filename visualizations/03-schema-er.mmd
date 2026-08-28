@@ -122,6 +122,7 @@ erDiagram
     PARTNERS ||--o{ MESSAGE_QUEUE : "waits for (partner_id)"
     PARTNERS ||--o{ MESSAGE_QUEUE : "pushed by (caller_id)"
     LABEL_CAPS ||--o{ MESSAGE_QUEUE : "prioritises and caps (behavior)"
+    LABEL_CAPS ||--o{ MESSAGE_QUEUE : "admitted under (origin_behavior);<br/>a summary phase runs as [TRUTHFUL-REPORT]<br/>but still counts against the [RESEARCH] cap"
     LABEL_CAPS ||--o{ MESSAGES : "decides storage (behavior)"
     MESSAGES |o--o{ MESSAGE_QUEUE : "persisted copy (message_id)"
 

@@ -113,7 +113,26 @@ for name, text in sorted(MMD.items()):
         check(token in live_labels, f"mmd/labels/{name}",
               f"names {token}, which is not a row in label_caps")
 
-# 2. The handshake decision tree draws every branch handshake can actually take.
+# 2. The ER diagram draws an edge for every foreign key the schema declares.
+#    The column and entity checks above compare SETS -- they see that a column
+#    exists, never that the relationship it participates in is drawn. That blind
+#    spot is real: `message_queue` has TWO foreign keys into `label_caps`
+#    (`behavior` and `origin_behavior`) and for a long time only the first was
+#    drawn, so the diagram showed a summary phase's cap accounting as unconnected
+#    to the table that actually decides it. A full diagram audit missed it,
+#    because nothing compared PRAGMA foreign_key_list against the drawn edges.
+_er_edges = re.findall(r'^\s+([A-Z_]+)\s+\|[|o]--o[|{]\s+([A-Z_]+)\s*:\s*"([^"]+)"',
+                       er, re.M)
+for _t in sorted(real_tables):
+    for _fk in db.execute(f"PRAGMA foreign_key_list({_t})"):
+        _parent, _from = _fk[2], _fk[3]
+        _drawn = any(a == _parent.upper() and b == _t.upper() and _from in label
+                     for a, b, label in _er_edges)
+        check(_drawn, "mmd/er-foreign-keys",
+              f"{_t}.{_from} -> {_parent} is a foreign key with no edge on the ER "
+              f"diagram naming that column")
+
+# 3. The handshake decision tree draws every branch handshake can actually take.
 #    Both directions matter: a missing branch is a rule nobody can see, and a
 #    drawn branch the code cannot raise is a rule that does not exist. Word
 #    boundaries, because `no_handshake` is a substring of
@@ -134,7 +153,7 @@ for code in sorted(drawn7 - handshake_codes):
     check(False, "mmd/handshake-branches",
           f"07 draws {code!r}, which handshake cannot raise")
 
-# 3. The extension-boundary diagram names every method of the interface it is
+# 4. The extension-boundary diagram names every method of the interface it is
 #    about. A method added to RemoteExtension and not drawn here is a hole in the
 #    one picture of that boundary.
 _ext_tree = ast.parse(read("extension/base.py"))
@@ -294,7 +313,7 @@ tmpl = {n.name for n in ast.parse(read("messaging_core/templates.py")).body
 for fn in sorted(tmpl):
     check(fn in ALL_DOCS, "templates", f"template {fn}() is documented nowhere")
 
-# 4. A semicolon in a state-diagram transition label silently splits it.
+# 5. A semicolon in a state-diagram transition label silently splits it.
 #    `A --> B : text ; more` is not one label -- `;` is a statement separator, so
 #    "more" becomes a free-floating state with no edges. Mermaid does not warn:
 #    it renders happily and produces a diagram with phantom nodes in it, which is
@@ -311,7 +330,7 @@ for _name, _text in sorted(MMD.items()):
                   "a ';' in a state transition label splits it into phantom "
                   f"states: {_line.strip()[:80]}")
 
-# 5. A rendered image that disagrees with its source is worse than no image: it
+# 6. A rendered image that disagrees with its source is worse than no image: it
 #    reads as authoritative and it is wrong, and nobody re-reads the .mmd to
 #    check. So a .png older than its .mmd is a failure with a named fix.
 #
