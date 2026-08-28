@@ -204,7 +204,7 @@ to a worker holds a slot too, and an orchestrator that stopped itself every time
 worker anything would halt everything it was driving.
 
 On the receiving side nothing new is needed. The `[QUERY]` or `[ERROR]` arrives at priority
-2 and displaces whatever the Caller was doing — that displacement *is* the interruption. The
+2 and goes to the front of everything below it, displacing a running task unless that task ties or outranks it — that displacement *is* the interruption. The
 Caller resolves it and answers; the `[MESSAGE-RESPONSE]` lands in the Partner's queue and
 displaces the hold, because anything displaces a hold. The paused work resumes behind it.
 Nothing has to remember to release anything.

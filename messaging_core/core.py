@@ -825,9 +825,12 @@ class MessagingCore:
                 continue
             # `[ERROR]` is uncapped and `stored = 0` in `label_caps` -- no cap
             # to check, no `messages` row to create, so `message_id` is left
-            # NULL rather than run through `_admit`. At priority 2 this
-            # displaces whatever the Caller is doing on its own; that IS the
-            # interruption, and no separate mechanism is needed to deliver it.
+            # NULL rather than run through `_admit`. At priority 2 it goes to
+            # the front of everything below it and displaces a running task
+            # unless that task outranks it or ties -- displacement needs a
+            # STRICTLY lower priority number, so a Caller mid-`[QUERY]` or
+            # mid-summary finishes that first. That is still the interruption;
+            # no separate mechanism is needed to deliver it.
             conn.execute(
                 "INSERT INTO message_queue (partner_id, caller_id, behavior, body) "
                 "VALUES (?, ?, '[ERROR]', ?)",

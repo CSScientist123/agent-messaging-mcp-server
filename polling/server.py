@@ -291,12 +291,16 @@ class PollingServer:
     def _deregister(self, partner_id: int) -> None:
         """Remove this Partner's `drain_threads` row, and forget the thread.
 
-        The row exists so that a push arriving while a thread is already
-        running does not spawn a second one. Once the thread has no work left
-        and exits, the row is a claim that a thread is running when none is --
-        and the next push would read it, believe a thread already has the
-        work, and spawn nothing. That is a liveness bug rather than a cosmetic
-        one: the message sits in the queue and nothing ever picks it up.
+        Be precise about what this row does, because it is easy to assume it
+        does more. NO arming path reads it: `_ensure_thread` and `scan_once`
+        de-duplicate against `self._drain_threads`, the in-process dict of live
+        threads. The only reader is `start()`.
+
+        So a row left behind by a retired thread does not strand a message --
+        it makes the next `start()` spawn a thread for a Partner with nothing
+        to do, which discovers as much and retires again. Deleting it here
+        keeps the registry meaning what it says: these Partners had a thread
+        when this process was last running.
 
         Deliberately NOT called on shutdown. `stop()` signals threads for a
         process that is going away with work possibly still queued, and the
@@ -573,8 +577,15 @@ class PollingServer:
         released, the Partner's remote is stopped so it is not left sitting on
         the prompt, and an `[ERROR]` naming the conversation and the missing
         permission is pushed into the Caller's queue -- where, at priority 2, it
-        displaces whatever the Caller was doing. That displacement IS the
+        goes to the front of everything below it and displaces a task already
+        running unless that task outranks it or ties. That displacement IS the
         interruption; no separate mechanism is needed.
+
+        Note the tie: displacement needs a STRICTLY lower priority number, so a
+        Caller already working a `[QUERY]`, another `[ERROR]`, or a summary
+        finishes that first and takes this next. It is the front of the queue,
+        not an unconditional pre-emption, and describing it as the latter would
+        promise a latency this does not provide.
         """
         released = core.release(partner_id=partner_id)
         caller_id = (released or task)["caller_id"]
