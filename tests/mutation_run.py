@@ -63,6 +63,21 @@ LOCK = REPO / ".mutation_running"
 #: (label, file, find, replace, the invariant it breaks)
 MUTANTS: list[tuple[str, str, str, str, str]] = [
     (
+        "claude-science-cannot-be-cancelled", "adapters/claude_science/adapter.py",
+        '        path = f"/api/frames/{partner_id_in_remote}/cancel"',
+        '        raise Rejected("no_remote_cancel", "no cancel") or (\n'
+        '            f"/api/frames/{partner_id_in_remote}/cancel")',
+        "Claude Science goes back to refusing every cancel, so a displaced frame keeps "
+        "running while the new instruction is delivered and the agent sees both",
+    ),
+    (
+        "a-failed-cancel-is-swallowed", "adapters/claude_science/adapter.py",
+        '        self._require_ok("POST", path, status, payload, ok=(200, 201, 202, 204))',
+        "        pass",
+        "a cancel that failed on the remote reports success, so a second instruction is "
+        "delivered to an agent the caller believes has stopped",
+    ),
+    (
         "inheritance-unreachable-by-agents", "mcp_server/server.py",
         '                other_project_title=other_project_title or None,',
         "",

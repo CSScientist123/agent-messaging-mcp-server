@@ -42,13 +42,13 @@ Reading a result means fetching the frame's messages and taking the trailing run
 
 Messages flagged as harness notices are dropped first. Those are Claude Science's own runtime context injection — skill-discovery dumps, memory recall blocks — not either side of the conversation actually speaking. Returning one as the result hands the caller the application's bookkeeping in place of its answer.
 
-Now the interesting part: **Claude Science has no usable interrupt.** The only route needs an execution identifier that no other call returns. So the adapter refuses to stop a turn, by design, every single time.
+Stopping a turn is one route: `POST` to the frame's cancel endpoint, which takes the frame id and nothing else. It is what the UI's own stop button calls, and it genuinely stops the agent — an approved, running shell command never reaches its completion marker.
 
-That refusal ripples. Displacement stops the remote before the swap. If a designed refusal counted as a failure, no Claude Science partner could ever be displaced at all — and the refusal would propagate back to whoever called `send`, after their message was already committed.
+It is worth being precise about *what* it stops, because the granularity is not obvious. It ends the agent's **turn**, not everything the turn started. A compute kernel the agent kicked off keeps running. For this system's purposes that is the right line: displacement needs the agent to stop reading and acting on the old instruction before the new one arrives, and it does.
 
-So the system distinguishes **"this remote has no cancel"** from **"the cancel failed."** The first is a fact about the remote: recorded, and the swap proceeds. The second is an error and stops the swap.
+That precision matters more than it sounds, because the system still has to handle remotes that genuinely cannot be stopped — NotebookLM never executes anything, so there is no turn to end. Displacement stops the remote before the swap, and if a designed refusal counted as a failure, no partner on such a remote could ever be displaced at all.
 
-Proceeding has a real consequence and the system does not pretend otherwise: the old turn keeps running while the new one is delivered, and the agent sees both. That is the honest behaviour for a remote with no cancel. Refusing to displace anything on it would be a worse system pretending to be a safer one — and because the occurrence is recorded rather than merely tolerated, an operator can find out it happened.
+So the system distinguishes **"this remote has no cancel"** from **"the cancel failed."** The first is a fact about the remote: recorded, and the swap proceeds. The second is an error and stops the swap. Proceeding has a real consequence and the system does not pretend otherwise: the old turn keeps running while the new one is delivered, and the agent sees both. Refusing to displace anything on such a remote would be a worse system pretending to be a safer one.
 
 The adapter also caches which project each frame belongs to, because every post needs it. That cache is populated when a partner is verified — which happens at creation, in whichever process did the creating. After a restart it is empty.
 

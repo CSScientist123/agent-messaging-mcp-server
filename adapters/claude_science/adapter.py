@@ -403,30 +403,38 @@ class ClaudeScienceExtension(RemoteExtension):
         return intent_id
 
     def stop_remote_execution(self, *, partner_id_in_remote: str, reason: str) -> None:
-        """No real, confirmed way to cancel a running frame exists.
+        """`POST /api/frames/{id}/cancel` -- the route the UI's own stop button calls.
 
-        The real API's only interrupt route,
-        `POST /frames/{id}/executions/{execId}/interrupt`, needs an
-        execution id this adapter (and, per the ground truth, Claude
-        Science's own MCP server) has no way to obtain -- server.py never
-        calls it, and its own message_session docstring says outright that
-        Claude Science's API exposes no way to cancel a queued message or a
-        running turn, telling its own caller to cancel it in the Claude
-        Science UI instead. The previously guessed `POST
-        /api/frames/{id}/cancel` appears nowhere in the ground truth's route
-        table. Raising here, rather than calling a route that would most
-        likely 404 silently in a caller's eyes, is the honest answer.
+        Confirmed live by driving the Claude Science UI and watching the
+        network: pressing stop mid-turn issues exactly this POST, returns 200,
+        and the frame reports "This session was cancelled." A `sleep 25` that
+        had been approved and started never printed its completion marker, so
+        the turn is genuinely stopped rather than merely marked.
+
+        It takes the frame id and NOTHING else. That matters, because the
+        interrupt route this adapter used to reach for --
+        `POST /frames/{id}/executions/{execId}/interrupt` -- needs an execution
+        id no other call returns, and finding none, the adapter concluded no
+        cancel existed and refused every time. The conclusion followed from
+        looking at the wrong route.
+
+        **What it stops, precisely.** The AGENT'S TURN, not everything the turn
+        started. A compute kernel the agent kicked off keeps running -- the UI
+        still showed "1 running" for its own reasons after the cancel landed.
+        For this system's purposes that is the right granularity: displacement
+        needs the agent to stop reading and acting on the old instruction
+        before the new one arrives, and it does.
         """
-        raise Rejected(
-            "no_remote_cancel",
-            f"Claude Science has no confirmed API for cancelling frame "
-            f"{partner_id_in_remote!r} (reason given: {reason!r}). Its own MCP "
-            f"server's documentation says the same: cancel it by hand in the "
-            f"Claude Science UI.",
-            next_call="Cancel the frame in the Claude Science UI, then use "
-            "deliver_message to continue it -- POST /api/request transparently "
-            "reactivates a cancelled frame.",
-        )
+        path = f"/api/frames/{partner_id_in_remote}/cancel"
+        status, payload = self._request("POST", path)
+        # 404 means the frame is gone, and a frame that does not exist is not
+        # running -- which is the outcome asked for. Anything else is a real
+        # failure and must not be swallowed into a silent no-op, because the
+        # caller is about to deliver a second instruction to an agent it
+        # believes has stopped.
+        if status == 404:
+            return
+        self._require_ok("POST", path, status, payload, ok=(200, 201, 202, 204))
 
     def poll_completion(self, *, partner_id_in_remote: str) -> bool:
         """`frames.getTraceShallow` -- `GET /frames/{id}/trace-shallow`, per

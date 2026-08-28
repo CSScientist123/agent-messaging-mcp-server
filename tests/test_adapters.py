@@ -71,6 +71,7 @@ import pytest
 import adapters.antigravity.adapter as antigravity_adapter
 from adapters.antigravity.adapter import AntigravityExtension
 from adapters.claude_science.adapter import (
+    ClaudeScienceHTTPError,
     ClaudeScienceExtension,
     ClaudeScienceProjectIdUnknown,
 )
@@ -385,11 +386,55 @@ def test_claude_science_deliver_message_without_prior_verify_raises_named_error(
         ext.deliver_message(partner_id_in_remote="frame-unregistered", behavior="[QUERY]", body="hi")
 
 
-def test_claude_science_stop_remote_execution_refuses():
+def test_claude_science_stop_remote_execution_cancels_the_frame(monkeypatch):
+    """The route the UI's own stop button calls, confirmed live.
+
+    It takes the frame id and nothing else — which is the whole point. The
+    interrupt route this adapter used to look for needs an execution id no
+    other call returns, and finding none, it concluded no cancel existed.
+    """
+    captured: dict = {}
+
+    def fake_urlopen(request):
+        captured["request"] = request
+        return _FakeHTTPResponse(200, {"ok": True})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     ext = ClaudeScienceExtension(base_url="http://127.0.0.1:8000")
-    with pytest.raises(Rejected) as exc_info:
-        ext.stop_remote_execution(partner_id_in_remote="frame-1", reason="testing")
-    assert exc_info.value.code == "no_remote_cancel"
+
+    ext.stop_remote_execution(partner_id_in_remote="frame-1", reason="displaced")
+
+    assert captured["request"].full_url.endswith("/api/frames/frame-1/cancel")
+    assert captured["request"].get_method() == "POST"
+
+
+def test_claude_science_stop_treats_a_missing_frame_as_stopped(monkeypatch):
+    """A frame that does not exist is not running, which is what was asked for."""
+    def fake_urlopen(request):
+        # A POST fetches a CSRF token first; only the cancel itself 404s.
+        if "/cancel" not in request.full_url:
+            return _FakeHTTPResponse(200, {"csrfToken": "t"})
+        raise _http_error(request.full_url, 404)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    ext = ClaudeScienceExtension(base_url="http://127.0.0.1:8000")
+
+    ext.stop_remote_execution(partner_id_in_remote="gone", reason="displaced")
+
+
+def test_claude_science_stop_does_not_swallow_a_real_failure(monkeypatch):
+    """The caller is about to deliver a second instruction to an agent it
+    believes has stopped. A silent no-op here interleaves the two."""
+    def fake_urlopen(request):
+        if "/cancel" not in request.full_url:
+            return _FakeHTTPResponse(200, {"csrfToken": "t"})
+        raise _http_error(request.full_url, 500)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    ext = ClaudeScienceExtension(base_url="http://127.0.0.1:8000")
+
+    with pytest.raises(ClaudeScienceHTTPError):
+        ext.stop_remote_execution(partner_id_in_remote="frame-1", reason="displaced")
 
 
 def test_claude_science_refuses_all_permission_operations_and_touches_nothing(monkeypatch):

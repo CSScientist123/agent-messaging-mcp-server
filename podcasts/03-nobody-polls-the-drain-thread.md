@@ -122,9 +122,9 @@ That record is one of three the system keeps and can report: what a drain loop s
 
 Displacement stops the remote before the swap. But not every remote *can* be stopped.
 
-Claude Science has no usable interrupt — its only route needs an execution identifier no other call returns. So the extension refuses, by design, every time.
+NotebookLM is the clear case: it never executes anything, so there is no turn to stop, and an attempt to stop one is refused as a rule about what that kind of remote is.
 
-Treating that refusal as an error would mean no Claude Science partner could ever be displaced, and the refusal would propagate all the way back to whoever called `send`, after their message was already committed.
+Treating such a refusal as an error would mean no partner on that remote could ever be displaced, and the refusal would propagate all the way back to whoever called `send`, after their message was already committed.
 
 So a **designed refusal** is told apart from a **failed cancellation**. The first is a fact about the remote: recorded, and the swap proceeds. The second is an error and stops the swap.
 

@@ -466,17 +466,31 @@ and confirming it is there before pressing a key that deletes without asking.
 at the base class's `not_path_configurable` refusal there rather than being implemented
 against an invented endpoint.
 
-**`stop_remote_execution` for Claude Science needs an execution id its API never surfaces.**
-The interrupt route exists but requires an `execId` that no other route returns. Claude
-Science's own MCP server never calls it and instructs its caller to cancel by hand in the UI,
-which an agent cannot do. The adapter raises `no_remote_cancel`.
+**`stop_remote_execution` for Claude Science is implemented, and the gap it used to be is
+worth remembering as a method error.** The interrupt route
+`POST /frames/{id}/executions/{execId}/interrupt` does need an `execId` no other route
+returns — so, finding none, the adapter concluded no cancel existed and refused every time.
+It was looking at the wrong route. `POST /api/frames/{id}/cancel` takes the frame id and
+nothing else, and is what the UI's own stop button calls: confirmed by driving the UI and
+watching the network, where it returns 200 and an approved, running `sleep 25` never printed
+its completion marker.
+
+Precisely what it stops: the agent's **turn**, not everything the turn started. A compute
+kernel the agent kicked off keeps running. That is the right granularity here — displacement
+needs the agent to stop reading and acting on the old instruction before the new one arrives.
 
 **Antigravity's interrupt sends `Escape`, and this is now verified rather than inferred.** A
 busy turn went idle 2 seconds after it, with the pane reading `Interrupted - What should
 Antigravity CLI do instead?`. The absence of a better mechanism is also confirmed: `index.js`
 sends `Escape` only from `escapePicker` and `agy_dismiss`, neither of which cancels a turn.
 
-**Nothing on this list is now an unverified keystroke.** Both the `/permissions` sequence and
-the interrupt were driven against a live session and are pinned by tests. What remains here is
-a genuine capability gap -- Claude Science cannot be cancelled at all -- rather than an
-assumption waiting to be checked.
+**Nothing on this list is now an unverified keystroke.** The `/permissions` sequence, the
+Antigravity interrupt, and the Claude Science cancel were each driven against a live system
+and are pinned by tests.
+
+The Claude Science entry is the one worth drawing a lesson from, because the reasoning that
+produced it was sound and the conclusion was still wrong. A route was searched for, one
+plausible candidate was found, it needed an identifier nothing supplied, and the absence was
+recorded as a property of the remote. What was actually absent was the *right route* from the
+material being searched. "This cannot be done" is a much stronger claim than "I could not find
+how", and only one of them was justified.
