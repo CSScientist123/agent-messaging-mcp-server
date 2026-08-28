@@ -204,3 +204,45 @@ def test_one_conversation_still_serves_only_one_science_master(core, world):
         core.handshake(requester_uuid=go2["uuid"], partner_title=world["first"]["title"])
 
     assert exc_info.value.code == "gemini_single_science_source"
+
+
+def test_the_two_project_form_is_reachable_from_the_tool_surface(core, world):
+    """A rule an agent cannot invoke is a rule that does not exist for agents.
+
+    The whole inheritance flow depends on a `project_extension` row between two
+    gemini_ projects, and only the two-project form of `extend_project` can
+    create one. If the tool exposes only the one-project form, the capability
+    is reachable from the library and unreachable from anything an agent can
+    call -- which is the same as absent.
+    """
+    import asyncio
+
+    from mcp_server.server import build_server
+
+    server = build_server(name="messaging-test", core=core)
+    tool = next(t for t in asyncio.run(server.list_tools()) if t.name == "extend_project")
+
+    assert "other_project_title" in tool.inputSchema["properties"], (
+        "the two-project form must be callable by an agent; the tool takes "
+        f"{sorted(tool.inputSchema['properties'])}"
+    )
+
+
+def test_a_gemini_orchestrator_links_two_gemini_projects_through_the_tool(core, world):
+    """End to end through the surface an agent actually uses."""
+    import asyncio
+
+    from mcp_server.server import build_server
+
+    server = build_server(name="messaging-test", core=core)
+    result = asyncio.run(server.call_tool("extend_project", {
+        "requester_uuid": world["go"]["uuid"],
+        "project_title": _project_title(core, world["gem_b"]),
+        "other_project_title": _project_title(core, world["gem_a"]),
+    }))
+    content = result[0] if isinstance(result, tuple) else result
+    body = "\n".join(b.text for b in content if hasattr(b, "text"))
+
+    assert body.startswith("[ok]"), f"linking two gemini_ projects failed: {body!r}"
+    core.handshake(requester_uuid=world["second"]["uuid"],
+                   partner_title=world["first"]["title"])

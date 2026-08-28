@@ -590,6 +590,17 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
                 )
             return _needs_remote_body(exc)
         except RemoteFailure as exc:
+            if getattr(exc, "already_committed", False):
+                # The remote failed, but the message is queued and `advance`
+                # has put the task back. `_remote_failed_body`'s ordinary
+                # closing line is "send the work again" -- correct when the
+                # send never landed, and a double-send here.
+                return (
+                    f"[remote failed] {exc}\n\n"
+                    f"The {behavior} IS queued for {queried_partner_title!r} and will be "
+                    "delivered once the remote works again -- do NOT send it a second "
+                    "time. Fix whatever is named above; nothing needs re-sending."
+                )
             return _remote_failed_body(exc)
         if polling is not None:
             try:
@@ -638,24 +649,43 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
         return responses.ok(_render_read(result))
 
     @mcp.tool()
-    def extend_project(requester_uuid: str, project_title: str) -> str:
-        """Declare another project an extension of this caller's project.
+    def extend_project(
+        requester_uuid: str, project_title: str, other_project_title: str = "",
+    ) -> str:
+        """Declare two projects extensions of each other.
 
         A project holds a limited number of live partners, and that ceiling is
         deliberate. Research too large for one project therefore needs a
         second project explicitly linked to the first, not a larger ceiling.
-        Once linked, partners under the two may handshake across the boundary
-        -- but only sideways, between two partners holding the SAME
-        orchestrator role. It grants nothing between partners of one project.
+        Once linked, partners under the two may handshake across the boundary.
+
+        Two forms. Leave other_project_title empty to link YOUR OWN project to
+        the named one; that needs project-orchestrator, and the pair may then
+        handshake only sideways, between two partners holding the SAME
+        orchestrator role.
+
+        Give other_project_title to link the two NAMED projects, neither of
+        which need be your own. That is for gemini_ projects and needs
+        gemini-orchestrator, because a gemini_ project can hold no role at all
+        -- so it has no project-orchestrator to extend it, and there is no
+        "your own project" for it to be extended from. Once linked, one
+        Antigravity conversation may handshake another across the boundary,
+        which is how one continues another's work.
+
+        Either form grants nothing between partners of one project.
 
         Args:
-            requester_uuid: The caller's own identity; must hold
-                project-orchestrator.
-            project_title: The exact title of the project to link.
+            requester_uuid: The caller's own identity. Must hold
+                project-orchestrator for the one-project form, or
+                gemini-orchestrator for the two-project form.
+            project_title: The exact title of a project to link.
+            other_project_title: The exact title of the second project, for
+                the two-project form. Leave empty to link your own project.
         """
         try:
             result = core.extend_project(
-                requester_uuid=requester_uuid, project_title=project_title
+                requester_uuid=requester_uuid, project_title=project_title,
+                other_project_title=other_project_title or None,
             )
         except Rejected as exc:
             return _rejected_body(exc)

@@ -38,7 +38,7 @@ Claude Science is the most conventional of the three: a local HTTP API, cookie-a
 
 A project is a project. A partner is a *frame* within it. Delivery posts into the frame. Completion is read from the frame's trace — the status field tells you whether it is running, queued, in progress, streaming, or processing, and anything outside that set means the turn is done.
 
-Reading a result means fetching the frame's messages and taking the trailing run of assistant messages: walking backwards and stopping at the first message that is not the assistant. That run is precisely the answer to the last thing sent, because a single reply can span several messages — tool calls interleaved with prose — before the frame yields back. Anything at or before the last user message belongs to a previous exchange.
+Reading a result means fetching the frame's messages and taking the trailing run of assistant messages: walking backwards and stopping at the first message that is not the assistant — whatever role that turns out to be. That run is precisely the answer to the last thing sent, because a single reply can span several messages — tool calls interleaved with prose — before the frame yields back. Anything at or before that boundary belongs to a previous exchange.
 
 Messages flagged as harness notices are dropped first. Those are Claude Science's own runtime context injection — skill-discovery dumps, memory recall blocks — not either side of the conversation actually speaking. Returning one as the result hands the caller the application's bookkeeping in place of its answer.
 
@@ -76,7 +76,7 @@ Reading state off a rendering fails in three distinct ways, and each has its own
 
 **A session may not be ready to receive at all.** A fresh workspace shows a modal trust dialog before it will accept any input — and the only check available before typing is whether the `tmux` session exists, which succeeds the instant it is created. Type into that dialog and the message goes into a menu. Then every check downstream agrees it worked: the busy wait times out, completion reports finished, and the result harvest returns the application's startup banner as the agent's answer. Nothing errors anywhere.
 
-So delivery waits for the ready footer *before* it types anything, with a budget sized as a cold-start allowance rather than a guess — a cold start behind a trust dialog measured over ninety seconds. If a permission or trust dialog is what is blocking, it raises the approval error instead, which routes it into the path that already exists for one.
+So delivery waits for the ready footer *before* it types anything, with a budget sized as a cold-start allowance rather than a guess. That sizing matters in both directions: a plain cold start in a trusted workspace has been measured at around fifty-five seconds, and one behind a trust dialog at over ninety, so a budget shorter than the boot it waits for would refuse every cold start — the same failure arriving from the other side. If a permission or trust dialog is what is blocking, it raises the approval error instead, which routes it into the path that already exists for one.
 
 **And "not started yet" looks exactly like "already finished."** Both are an absent busy footer. If the model has not produced its first token when the busy wait expires, completion reads the idle pane as *done* — the caller receives an empty body and the slot is released while the agent is still about to answer.
 

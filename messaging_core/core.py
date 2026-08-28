@@ -61,7 +61,7 @@ import sqlite3
 import uuid as uuid_lib
 from typing import Any
 
-from extension.base import RemoteExtension
+from extension.base import RemoteExtension, RemoteFailure
 from messaging_core import templates
 from messaging_core.db import Database
 from messaging_core.errors import NeedsRemote, Rejected
@@ -2148,6 +2148,15 @@ class MessagingCore:
 
         try:
             advanced = self.advance(partner_id=target["id"])
+        except RemoteFailure as exc:
+            # A remote that exists and did not work -- a missing binary, a
+            # refused connection, an HTTP error. Marked for the same reason a
+            # Rejected is: the push above already committed, and `advance` has
+            # already put the task back in the queue. Left unmarked, the tool
+            # layer renders it with "send the work again", and the caller does
+            # -- producing the exact double-send the flag exists to prevent.
+            exc.already_committed = True
+            raise
         except (Rejected, NeedsRemote) as exc:
             # The push above already committed; only what happens next --
             # delivery -- failed. Marking the SAME exception object (not a new

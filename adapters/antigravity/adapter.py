@@ -440,7 +440,7 @@ class AntigravityExtension(RemoteExtension):
             time.sleep(delay)
         return False
 
-    def _await_idle(self, session: str, attempts: int = 60, delay: float = 0.5) -> bool:
+    def _await_idle(self, session: str, attempts: int = 240, delay: float = 0.5) -> bool:
         """Poll the pane until it shows the idle footer. True if it was seen.
 
         Mirrors `_await_busy` above, with two differences. First, this is
@@ -450,7 +450,11 @@ class AntigravityExtension(RemoteExtension):
         ALLOWANCE, not a guess: `_await_busy`'s budget only has to outlast a
         repaint, but a session that has never seen its folder before has to
         clear a startup banner AND a modal trust prompt first, which measured
-        over 90 seconds live. A budget sized like `_await_busy`'s would time
+        over 90 seconds live -- and a plain cold start in a trusted workspace
+        measured around 55. The default here is 120 seconds for that reason:
+        a budget shorter than the boot it is waiting for refuses every cold
+        start, which is the failure this method exists to prevent, arriving
+        from the other side. A budget sized like `_await_busy`'s would time
         out on every cold start, not just a genuinely stuck one.
 
         Raises `Rejected("approval_is_an_error", ...)` the moment a

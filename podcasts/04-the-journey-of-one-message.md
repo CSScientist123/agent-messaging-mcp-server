@@ -34,11 +34,13 @@ Finally, admission itself: a single `INSERT ... SELECT ... WHERE`, with the cap 
 
 The receipt ends with a line telling the agent not to poll for the result. That line is not decoration — an agent that has just been told its message was accepted will otherwise reasonably check back, which is the exact behaviour the whole system exists to make unnecessary.
 
-There is one failure mode here worth naming because it is invisible. Admission commits, and *then* the queue is advanced — and advancing can fail. It might need a remote extension this process does not have. Rendering the prompt can fail. Delivery can fail.
+There is one failure mode here worth naming because it is invisible. Admission commits, and *then* the queue is advanced — and advancing can fail in three ways. A rule can refuse it. The process can turn out to have no extension for the target's source. Or the remote itself can fail — a missing binary, a refused connection, an HTTP error.
 
-If that failure were reported the way an ordinary refusal is, the caller would be told nothing changed. It would retry. And the retry would double-send, burning its cap on work the system already accepted.
+If any of those were reported the way an ordinary refusal is, the caller would be told nothing changed. It would retry. And the retry would double-send, burning its cap on work the system already accepted.
 
-So a failure raised *after* admission is marked as such, and the response says the message is queued rather than saying nothing happened. The distinction is between "the request was refused" and "the request was accepted and something later went wrong," and a caller needs to act differently on each.
+So a failure raised *after* admission is marked as such, and the response says the message is queued rather than saying nothing happened. The third case is the one that bites hardest, because the ordinary way to report a failed remote ends with "send the work again" — which is exactly right when the send never landed, and a double-send when it did.
+
+The distinction is between "the request was refused" and "the request was accepted and something later went wrong," and a caller needs to act differently on each.
 
 ## Promotion, rendering, delivery
 
@@ -62,13 +64,15 @@ There is a piece of the rendered prompt that exists to solve a problem you would
 
 `send`'s first argument is `requester_uuid` — the calling agent's own identity. A partner running inside a remote has never been told what its own uuid is. It was minted at creation and shown once, to whoever created it, which is not the same as being known by the agent now living in that session.
 
-So the research dispatch and every relay carry an **identity block**: the agent's own title, its own uuid, and the call already filled in with both. Without it, the dispatch's own instruction to "message back a `[QUERY]` if you are missing context" names an action the agent has no credentials to perform.
+So the research dispatch and every relay carry an **identity block**: the agent's own title, its own uuid, and the call already filled in — its uuid as the sender, the caller's title as the recipient. Without it, the dispatch's own instruction to "message back a `[QUERY]` if you are missing context" names an action the agent has no credentials to perform.
 
 The block says something else too, and that half is equally load-bearing in the opposite direction. **Answering is automatic.** Whatever the agent produces in its session is read back and delivered to the caller when the turn ends, whether or not it ever calls `send`. An agent handed only its identity, with no word that delivery already happens, would reasonably use that identity to send its answer — and the caller would receive the same work twice, once harvested and once sent, with no way to tell they were the same.
 
 So the block states that `send` is for the case where the turn is *not* finishing: a question about missing context, or an error saying it is blocked. Then stop and wait.
 
-One template deliberately omits it. A notebook has `can_send = 0` — there is no agent behind it to make that call — and an instruction nothing can follow is worse than no instruction, because it invites the reader to look for a capability that does not exist.
+Three templates carry no identity block, and only one of the three is an argued omission. A summary request and a resume line do not need it — the first is harvested, and the second is one line by design.
+
+The notebook template is the deliberate one. A notebook has `can_send = 0`: there is no agent behind it to make that call. An instruction nothing can follow is worse than no instruction, because it invites the reader to look for a capability that does not exist.
 
 ## Harvesting, and what is kept
 

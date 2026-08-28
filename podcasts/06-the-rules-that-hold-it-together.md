@@ -64,7 +64,9 @@ A notebook needs none — there is no agent to direct.
 
 Claude Code has exactly one legal counterpart, a bridge-scientist, and that bridge may hold exactly one Claude Code partner. A bridge holding two would make "the caller" ambiguous for every message reaching it.
 
-Within Claude Science, only the project-orchestrator may pair two partners. Only the gemini-orchestrator may reach an Antigravity conversation, and its reach is metered by a budget counted live — one unit per outgoing connection to an Antigravity partner. A conversation serves exactly one Claude Science master, so "who directs this" has one answer.
+Within Claude Science there are two legal initiators, and the second is narrow. Ordinarily the project-orchestrator pairs two partners. But a bridge-scientist may also initiate one — toward the project-orchestrator specifically, and nowhere else. That is the bridge doing the only thing it exists to do: wiring the seam it holds into the chain of command above it.
+
+Only the gemini-orchestrator may reach an Antigravity conversation, and its reach is metered by a budget counted live — one unit per outgoing connection to an Antigravity partner. A conversation serves exactly one Claude Science master, so "who directs this" has one answer.
 
 **And a project extension branches sideways, never downward.** A project holds a limited number of live partners, and that ceiling is deliberate: research at scale needs more projects, not a larger ceiling. An extension declares two projects parts of one effort.
 
@@ -98,7 +100,7 @@ Two ways a partner goes away, and they behave differently for a reason that is e
 
 So archiving reports first. Every caller with something queued for that partner, plus the caller of whatever sits in its working slot, receives an `[ERROR]` saying the partner was archived and the work is gone rather than delayed. At priority 2 that goes to the front of everything below it — displacing what the caller is doing unless that ties or outranks it — which is the interruption.
 
-The notice is attributed to the vanishing partner, and that is the only attribution the schema permits. The row survives archiving, so it remains a valid sender — while attributing it to whoever performed the archive would usually name the notice's own recipient as its sender, which the constraint refuses. Note also that the caller told is normally the same agent that called archive, and that is the point rather than a redundancy: within a project only the orchestrator may direct a plain worker, so it is the only caller there is — and an orchestrator archiving a list of titles in bulk is exactly who does not realise one of them had work in flight.
+The notice is attributed to the vanishing partner. The schema would permit any sender other than the recipient, so this is a choice between the two candidates actually available — and only one of them works. The vanishing partner's row survives archiving, so it remains a valid, permanent sender. Attributing it to whoever performed the archive would usually name the notice's own recipient as its sender, which the constraint refuses outright. Note also that the caller told is normally the same agent that called archive, and that is the point rather than a redundancy: within a project only the orchestrator may direct a plain worker, so it is the only caller there is — and an orchestrator archiving a list of titles in bulk is exactly who does not realise one of them had work in flight.
 
 **Deletion** cannot report itself at all, and so it refuses.
 
@@ -118,9 +120,13 @@ Nothing here configures the root logger. A library that does that steals the dec
 
 **The diagnostic report.** Three records the system keeps that nothing else surfaces: what a drain loop swallowed, which displacements went through against a remote that refused to be cancelled, and whatever an adapter collected while closing something.
 
-All three matter for the same reason. **A drain thread failing on every single pass looks exactly like one with nothing to do** — same silence, same absent row. The record is what tells them apart. The report is built field by field so that a broken one degrades to empty rather than taking the others down, because it is reached for when something is already wrong.
+All three matter for the same reason: **swallowing an exception to keep a daemon thread alive is right, and swallowing it without a trace is how a permanently failing thread becomes invisible.** From outside, a thread retrying the same failure forever produces no result, no progress, and no complaint — the same nothing a healthy idle system produces. These records are what tell the two apart, and the warning log is what makes the failure audible at all.
 
-**And a partner's own status** reports how long its current task waited before it started. That number exists only because the enqueue time is carried onto the working slot when the queue row is deleted — a promoted row is gone, so nothing else could reconstruct it afterwards. The two timestamps are written in the same format deliberately, so that subtracting them is arithmetic rather than a parsing problem discovered at the worst moment.
+The report is built field by field so that a broken one degrades to empty rather than taking the others down, because it is reached for when something is already wrong.
+
+**And a partner's own status** computes how long its current task waited before it started. That number can exist at all only because the enqueue time is carried onto the working slot when the queue row is deleted — a promoted row is gone, so nothing else could reconstruct it afterwards. The two timestamps are written in the same format deliberately, so that subtracting them is arithmetic rather than a parsing problem discovered at the worst moment.
+
+Worth knowing precisely: the capability returns it, and the rendered status an agent reads does not yet show it. The measurement is available to anything calling the library; an agent asking about itself currently sees what it is working on and when that started, not how long it waited first.
 
 Status is first-person only. An agent asks about itself. It learns its own queue broken down by label — because a depth of four says nothing useful while "three delegated tasks and one question" says what the partner is about to do next and why — its own working task, its own relationships by title, and its own budget. It learns nothing about anyone else's queue, role, or identity.
 

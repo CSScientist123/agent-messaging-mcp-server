@@ -1879,3 +1879,47 @@ def test_a_cancel_that_genuinely_fails_still_stops_the_displacement(core, db, mo
     assert slot["behavior"] == "[RESEARCH]", (
         "a failed cancel must leave the working task where it was"
     )
+
+
+def test_a_remote_failure_after_admission_is_marked_as_committed(core, pair):
+    """Tests the MARKING, not the rendering of it.
+
+    `send` commits the queue row and then advances. When the remote itself
+    fails there — a missing binary, a refused connection, an HTTP error —
+    `advance` puts the task back and the exception propagates. Unmarked, the
+    tool layer renders it with its ordinary closing line, "send the work
+    again", and the caller does: a double-send of work the system is already
+    holding.
+
+    A test that sets the flag by hand and checks the wording would pass with
+    the marking deleted. This one raises through the real path.
+    """
+    from extension.base import RemoteFailure
+
+    class FailingStub(StubExtension):
+        def deliver_message(self, *, partner_id_in_remote, behavior, body):
+            raise RemoteFailure("the nlm binary was not found on PATH")
+
+    core.extension = FailingStub(source_prefix="science_")
+    # The relationship is written directly: this test is about what `send` does
+    # AFTER admission, and `handshake`'s own rules are covered elsewhere.
+    core.db.write(lambda c: c.execute(
+        "INSERT INTO handshakes(from_partner, to_partner) VALUES (?, ?)",
+        (pair["caller1"]["id"], pair["target"]["id"]),
+    ))
+
+    with pytest.raises(RemoteFailure) as exc_info:
+        core.send(
+            requester_uuid=pair["caller1"]["uuid"],
+            queried_partner_title=pair["target"]["title"],
+            message="what is x?", behavior="[QUERY]",
+        )
+
+    assert getattr(exc_info.value, "already_committed", False) is True, (
+        "a remote failure raised after the queue row committed must say so, or the "
+        "caller is told to send again and double-sends"
+    )
+    row = core.db.read_one(
+        "SELECT behavior FROM message_queue WHERE partner_id = ?", (pair["target"]["id"],)
+    )
+    assert row is not None, "the message really is queued, which is why the flag matters"

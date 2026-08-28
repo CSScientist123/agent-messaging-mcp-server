@@ -63,6 +63,24 @@ LOCK = REPO / ".mutation_running"
 #: (label, file, find, replace, the invariant it breaks)
 MUTANTS: list[tuple[str, str, str, str, str]] = [
     (
+        "inheritance-unreachable-by-agents", "mcp_server/server.py",
+        '                other_project_title=other_project_title or None,',
+        "",
+        "the extend_project tool drops the two-project form, so the project_extension "
+        "row inheritance depends on can only be created from the library and no agent "
+        "can ever link two gemini_ projects",
+    ),
+    (
+        "a-failed-remote-invites-a-double-send", "messaging_core/core.py",
+        "            exc.already_committed = True\n"
+        "            raise\n"
+        "        except (Rejected, NeedsRemote) as exc:",
+        "            raise\n"
+        "        except (Rejected, NeedsRemote) as exc:",
+        "a RemoteFailure after admission escapes unmarked, so send renders it with "
+        "'send the work again' while the task is already back in the queue",
+    ),
+    (
         "an-error-ends-the-exchange", "schema/schema.sql",
         "    ('[ERROR]',            2, NULL, 0, '[MESSAGE-RESPONSE]'),",
         "    ('[ERROR]',            2, NULL, 0, NULL),",

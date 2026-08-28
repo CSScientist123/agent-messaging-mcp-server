@@ -469,3 +469,49 @@ def test_send_body_ends_with_anti_poll_line(db):
 
     assert "[rejected]" not in body
     assert body.rstrip().endswith(ANTI_POLL)
+
+
+def test_send_does_not_invite_a_resend_when_the_remote_failed_after_admission(monkeypatch, db):
+    """`_remote_failed_body` ordinarily closes with "send the work again".
+
+    That is right when the send never landed. When admission already committed
+    and `advance` has put the task back in the queue, it is an instruction to
+    double-send — and a failed remote is the ordinary shape of a missing binary
+    or a refused connection, not an exotic case.
+    """
+    core2 = MessagingCore(db, ext("science_"))
+    srv = build_server(name="messaging-test", core=core2)
+
+    committed = RemoteFailure("tmux is not installed")
+    committed.already_committed = True
+    monkeypatch.setattr(core2, "send", _raise(committed))
+
+    body = call(srv, "send", {
+        "requester_uuid": "u-1", "queried_partner_title": "bob",
+        "message": "hi", "behavior": "[QUERY]",
+    })
+
+    assert body.startswith("[remote failed]")
+    assert "tmux is not installed" in body
+    assert "queued" in body.lower(), (
+        f"the caller must be told the message is queued: {body!r}"
+    )
+    assert "again" not in body.lower().split("queued")[0], (
+        f"nothing before that should invite a resend: {body!r}"
+    )
+
+
+def test_a_remote_failure_before_admission_still_says_to_send_again(monkeypatch, db):
+    """The ordinary case is unchanged: nothing landed, so re-sending is right."""
+    core2 = MessagingCore(db, ext("science_"))
+    srv = build_server(name="messaging-test", core=core2)
+
+    monkeypatch.setattr(core2, "send", _raise(RemoteFailure("tmux is not installed")))
+
+    body = call(srv, "send", {
+        "requester_uuid": "u-1", "queried_partner_title": "bob",
+        "message": "hi", "behavior": "[QUERY]",
+    })
+
+    assert body.startswith("[remote failed]")
+    assert "again" in body.lower()
