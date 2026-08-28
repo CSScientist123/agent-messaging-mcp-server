@@ -33,8 +33,11 @@ flowchart LR
     Q -.->|"ordered by"| PRIO
 
     SLOT["WORKING SLOT\nin memory, never in SQLite\n(messaging_core/slots.py)"]
-    Q -->|"advance(): promoted when the slot is\nEMPTY, or when it STRICTLY beats\nthe working task"| SLOT
-    SLOT -->|"displaced: pushed back with in_process=1,\nand carrying summary_phase, origin_behavior\nand awaiting_resolution -- a marker dropped\nhere is a fact nothing can reconstruct"| Q
+    Q -->|"advance(): promoted"| SLOT
+    SLOT -->|"displaced: pushed back"| Q
+
+    SWAP["THE SWAP, both directions.\n\nPromoted when the slot is EMPTY, or when the head\nSTRICTLY beats the working task.\n\nDisplaced with in_process=1, and carrying\nsummary_phase, origin_behavior AND\nawaiting_resolution -- a marker dropped here is a\nfact nothing downstream can reconstruct."]
+    SLOT -.-> SWAP
 
     TIE["in_process is a tie-break WITHIN one label,\nnot a global override -- which is why the head\nneeds two statements, not one ORDER BY.\n\n[QUERY] and [ERROR] SHARE a priority. While the\ntie-break was global, a paused [QUERY] beat a fresh\n[ERROR], and the Caller's correction was never\ndelivered to the Partner it was correcting."]
     Q -.-> TIE

@@ -294,7 +294,24 @@ tmpl = {n.name for n in ast.parse(read("messaging_core/templates.py")).body
 for fn in sorted(tmpl):
     check(fn in ALL_DOCS, "templates", f"template {fn}() is documented nowhere")
 
-# 4. A rendered image that disagrees with its source is worse than no image: it
+# 4. A semicolon in a state-diagram transition label silently splits it.
+#    `A --> B : text ; more` is not one label -- `;` is a statement separator, so
+#    "more" becomes a free-floating state with no edges. Mermaid does not warn:
+#    it renders happily and produces a diagram with phantom nodes in it, which is
+#    exactly what happened to 05-working-slot on the first attempt here. A clean
+#    render is NOT proof a diagram is right, so this is checked rather than
+#    eyeballed. Bracketed and quoted labels are safe, which is why this looks
+#    only at the `:` transition form.
+for _name, _text in sorted(MMD.items()):
+    if "stateDiagram" not in _text:
+        continue
+    for _line in _text.splitlines():
+        if "-->" in _line and ":" in _line.split("-->", 1)[1] and ";" in _line:
+            check(False, f"mmd/state-label/{_name}",
+                  "a ';' in a state transition label splits it into phantom "
+                  f"states: {_line.strip()[:80]}")
+
+# 5. A rendered image that disagrees with its source is worse than no image: it
 #    reads as authoritative and it is wrong, and nobody re-reads the .mmd to
 #    check. So a .png older than its .mmd is a failure with a named fix.
 #

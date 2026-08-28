@@ -120,3 +120,54 @@ references resolve without editing them, and the diagrams are something a person
 can actually look at. `mmd/rendered` is what stops the image becoming a third
 drifting surface; it skips when a `.png` is absent, because git does not preserve
 mtimes and a check that cries wolf on every clone is one people learn to ignore.
+
+---
+
+## Addendum — the surface I missed, and a defect I introduced
+
+Reported by the user, correctly: the vault still showed `[IDLE]`.
+
+### A third surface
+
+`/mnt/c/Data/Books/Brains/polling-mechanism/Attachments/` holds its own rendered
+PNG of all ten diagrams, at ~3× the resolution of the repo's, and **that is where
+they are actually read** — the repo's `visualizations/*.png` only exists because
+`docs/` links to it. Every one of them was dated Aug 27, before the `[IDLE]`
+removal. `Attachments/05-working-slot.png` still showed "An `[IDLE]` here is a
+HOLD", `send() / interrupt_partner()`, and "the reply for four of the six labels
+is NOTHING".
+
+I had rendered one surface and called the job done. `render-diagrams.sh` now
+renders **both**, every time, from one loop — the repo at scale 1, the vault at
+scale 3, the vault skipped silently when not mounted. Rendering one and not the
+other is precisely how this happened, so the fix is that it is no longer possible
+to do that by accident.
+
+### A defect I introduced, caught only by looking
+
+The first corrected render of `05-working-slot` had four phantom nodes floating
+free of the diagram: `; a`, `summary`, `the full report request again`,
+`NOTHING is rendered or delivered.`
+
+I had written a state-transition label containing semicolons. In a Mermaid
+`stateDiagram`, `;` is a **statement separator** — `A --> B : text ; more` is not
+one label, it is a transition plus a free-floating state called "more". Mermaid
+does not warn. It exits 0 and renders a diagram with nonsense in it.
+
+**So "it renders" is not proof a diagram is correct**, which invalidates part of
+how the first pass verified itself. Two things now cover it:
+
+- `mmd/state-label` fails on a `;` in any state-transition label. Verified to
+  fail by name — and it immediately caught a real regression when a stray
+  `git checkout` reverted the fix mid-session.
+- An orphan-node sweep across every flowchart, run manually this pass: the only
+  unconnected nodes are `L1`–`L11` in `08`, the LOCAL-ONLY capabilities, which
+  are unconnected *by design* because they never touch an extension. Not encoded
+  as a check, because the legitimate exception would need an allowlist that would
+  itself rot.
+
+Every diagram was then re-examined: `05`, `04`, `06`, `07` and `02` read at full
+resolution, the rest covered by the orphan sweep and the text checks. One further
+fix in `04`, where two long labels on edges between the same pair of nodes
+overlapped and occluded each other — the facts moved into a note with room for
+them.

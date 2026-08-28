@@ -65,3 +65,34 @@ check that a diagram's prose *explains* them correctly, that an arrow points the
 right way, or that branch ordering matches control flow — the `07` ordering
 defect would not have been caught by any of these checks, only by the read. That
 limit is stated in the script's own MANUAL section, which is where it belongs.
+
+---
+
+## Addendum — a seventh check, and the assumption it invalidates
+
+**`mmd/state-label`** (187 checks total). A `;` in a Mermaid state-transition
+label is a statement separator, so the label silently splits and the remainder
+becomes a free-floating state. Mermaid exits 0 and renders it.
+
+This matters beyond the one bug: the first pass treated a clean render as proof
+that a diagram was structurally sound. It is not. A diagram can render perfectly
+and contain phantom nodes.
+
+| Check | Break applied | Failure observed |
+|---|---|---|
+| `mmd/state-label` | appended `; stray` to a transition in `05` | `a ';' in a state transition label splits it into phantom states` |
+
+It then caught a real regression unprompted: a `git checkout` intended to undo the
+deliberate break also reverted the genuine fix, and the check failed on the next
+run rather than letting the broken label reach a commit.
+
+**Orphan-node sweep** — run manually over all seven flowcharts. Only `L1`–`L11`
+in `08-extension-boundary` are unconnected, and correctly so: they are the
+LOCAL-ONLY capabilities, whose whole point is that no edge reaches an extension.
+Deliberately not encoded as a check — the legitimate exception needs an allowlist,
+and an allowlist of intentional orphans is a thing that rots.
+
+**Visual verification.** `05`, `04`, `06`, `07`, `02` read at full resolution
+after rendering. This is the only method that catches layout collisions, and it
+found one: two long edge labels in `04` occluding each other between the same
+pair of nodes.
