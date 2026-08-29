@@ -160,33 +160,37 @@ When a task is displaced, the remote is stopped **before** the queue is touched.
 
 And if delivery fails after the row has already been removed, the task is put **back**, marked paused, and the error propagates. From the queue's point of view it is a task that started and stopped, which is exactly what paused means. Silently dropping it is the one outcome nothing downstream could detect.
 
-## The other thing a slot can hold
+## The other thing that happens to a slot
 
-Almost everything in the slot got there by being promoted out of the queue. There is one exception, and it is the closest thing this system has to a hold — except that it is not a separate concept at all.
+Almost everything in the slot got there by being promoted out of the queue. There is one thing that takes a slot *away*, and it happens to an agent because of something it did itself.
 
-When an agent sends a `[QUERY]` or an `[ERROR]`, that act stops **the agent that sent it.** Its remote is stopped, whatever it was working on is pushed back into its own queue marked paused, and the question it just asked takes its working slot.
+When an agent sends a **request** — a `[RESEARCH]`, an `[ERROR]` or a `[QUERY]` — that act interrupts **the agent that sent it**. Its remote is stopped, whatever it was working on is pushed back into its own queue marked paused, and its working slot is emptied. Its drain thread is stopped, and the row claiming that thread exists is deleted.
 
-That task is synthetic. It has no `message_queue` row and, ordinarily, never gets one. It exists so that the slot is *occupied* — without it, the next `advance` would find an empty slot, promote the very work just paused, and hand it straight back to an agent that has already said it cannot continue.
+Notice who that happens to. Not the recipient — the recipient just finds a job in its queue and drains it in priority order like anything else. Interruption is never a decision one agent makes about another. There is no capability anywhere that stops somebody else. It is something you do to yourself by asking.
 
-The elegance is in what is **not** here. There is no hold label, no priority zero, and no rule saying "anything displaces this." The question defends the slot at the priority it already has: `[QUERY]` and `[ERROR]` sit at 2, and they are never raised. That single fact makes an unanswered question a blocker, because only `[TRUTHFUL-REPORT]` at 1 is strictly lower — everything else queues behind it under the ordinary rule.
+The reasoning is the same for all three labels. An agent that sends a request has handed work away and is waiting on the outcome. Continuing would mean producing work it will have to redo the moment the answer changes what it knows.
 
-Compare that with a hold at priority 0. A hold that outranks everything can never be displaced by priority, so it needs a *second*, contradicting rule to ever leave — and a second rule about the same slot is a second chance to disagree with the first. The question needs no second rule. It leaves when it is answered.
+And nothing takes the emptied slot. **An interrupted agent holds nothing at all.** That is worth dwelling on, because the obvious alternative — parking a placeholder task there to mark the state — is exactly what the design refuses. A placeholder is a row a reader could mistake for work, and one that every count, every cap and every prompt would then have to exclude by hand.
 
-**Nothing is sent to the remote for a wait.** The slot is taken, and no prompt is rendered or delivered. Handing a deliberately stopped agent a paragraph gives it something to act on when the entire point is that it should be doing nothing until it hears back.
+So the state is the *absence* of a task. Which raises the question the design has to answer: how do you tell an interrupted agent from one that is simply between two tasks? Both have an empty slot.
 
-And an agent already waiting cannot ask again. A second question is refused outright — it is stopped, so it could not act on the answer to the first, let alone the second.
+The answer is a column: `partners.interrupted`. It is not redundant with the emptiness — it is what makes the emptiness legible. Between two ordinary tasks the drain thread is still running and should promote the next row. Interrupted, there is no thread and nothing should be promoted. The slot looks identical in both; the flag is the difference.
 
-## When the one thing that outranks a wait arrives
+## What ends it
 
-A `[TRUTHFUL-REPORT]` *is* strictly lower than 2, so a summary really can take the slot from an agent waiting on its own question. This is the one case where the synthetic task becomes a real row, and the column that makes it work is worth naming: `awaiting_resolution`.
+A **response** — and the split between a request and a response is not a new list to maintain. It is exactly `reply_behavior IS NULL`. A label that expects an answer is a request. A label that *is* an answer is a response. `[MESSAGE-RESPONSE]` and `[TRUTHFUL-REPORT]`, the two that terminate exchanges, are the two that restart agents.
 
-The requeued question carries that flag, and it earns its place twice.
+The response takes the empty slot, clears the flag, and a drain thread is armed again. It is delivered as an ordinary message with no special prompt, because there is nothing to fold it into — the slot it lands in is empty by construction.
 
-It makes the row **outrank everything else in that agent's queue** — it is read first, ahead of priority. So when the summary finishes, what resumes is the wait, not some job the agent still cannot do.
+Two details in how that response is chosen, and each closes a different failure that a simpler rule walks straight into.
 
-And it makes the resumed row **re-enter the wait** rather than be delivered. Without the flag, the question would come back indistinguishable from an ordinary `[QUERY]` that a caller had sent — and the agent would be handed, as work, the question it asked.
+**It is chosen by label, not taken from the queue head.** The tempting version is "if the head is a response, promote it". But a response does not necessarily outrank what is queued — `[MESSAGE-RESPONSE]` sits at 2, so an agent holding a `[TRUTHFUL-REPORT]` at 1 has a head that is *not* the answer, however long the answer has been sitting there. Reading the head would find that work, refuse to displace an equal-or-better slot, and return nothing on every pass forever: an agent waiting for an answer that had already arrived.
 
-It also quietly qualifies something said earlier in this note. At most one row per label is ever paused, which is what lets the resume prompt be a single line. That remains true of *work* rows; a wait carries a label too and can share one with a paused task. It never collides, because a wait is never rendered, and so is never what a resume prompt names.
+**And it must be fresh.** This one is subtler and it is the more interesting of the two. Interrupting pushes the agent's own working task back into its own queue. So if that task happened to carry a response label — an agent interrupted while working a `[MESSAGE-RESPONSE]` — the queue now holds a response row. A rule that accepted *any* response would fire on the agent's own pushed-back work. The act of interrupting would supply the very thing that undoes it, and the agent would restart itself on the next pass.
+
+Only a response that genuinely *arrived* counts, which is why the lookup is scoped to unpaused rows.
+
+While interrupted, a request arriving is admitted and left in the queue. It waits, and it is drained after the restart in priority order like everything else.
 
 ---
 

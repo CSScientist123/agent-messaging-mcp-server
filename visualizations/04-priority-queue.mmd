@@ -18,14 +18,13 @@ flowchart LR
 
     SENDER --> CAP
 
-    BLOCK{{"is the label [QUERY] or [ERROR]?\n(labels.BLOCKING_BEHAVIORS)"}}
+    BLOCK{{"is it a REQUEST?\n[RESEARCH] [ERROR] [QUERY]\n(labels.REQUEST_BEHAVIORS)"}}
     SENDER --> BLOCK
     BLOCK -->|no| NOSTOP["the sender keeps working"]
-    BLOCK -->|"yes, and it is already waiting"| R_WAIT["Rejected('already_awaiting_an_answer')\nit is stopped; it could not act on\nthe answer to a second question"]
-    BLOCK -->|yes| AWAIT["_await_answer(): stop the SENDER's remote,\nrequeue ITS working task paused,\nand put the question in ITS OWN slot\n\nNo queue row backs it. Nothing is\nrendered or delivered for it."]
+    BLOCK -->|yes| AWAIT["interrupt(): stop the SENDER's remote,\nrequeue ITS working task paused,\nEMPTY its slot, set partners.interrupted,\nand stop + deregister its drain thread\n\nNothing takes the slot. The recipient is\nnot disturbed at all."]
     AWAIT --> SLOT
 
-    Q[("message_queue -- ONE per Partner\n\nreading the head is TWO questions, and\nawaiting_resolution leads BOTH of them:\n1. which LABEL -- a displaced WAIT first, then\n   priority, then a label with unpaused work over\n   one entirely paused, then earliest FRESH\n   arrival, then earliest arrival\n2. which ROW of it -- a WAIT first, then paused,\n   then arrival, then row id")]
+    Q[("message_queue -- ONE per Partner\n\nreading the head is TWO questions:\n1. which LABEL -- priority, then a label with\n   unpaused work over one entirely paused, then\n   earliest FRESH arrival, then earliest arrival\n2. which ROW of it -- paused first, then\n   arrival, then row id")]
     OK --> Q
 
     PRIO["label_caps.priority -- lower wins\n\n1  [TRUTHFUL-REPORT]    summarize without contamination\n2  [QUERY] = [ERROR]    both stop the SENDER; an unanswered\n                     question is the blocker\n3  [MESSAGE-RESPONSE]   the answer that unblocks\n4  [RESEARCH]           delegated work, the patient kind"]
@@ -36,13 +35,13 @@ flowchart LR
     Q -->|"advance(): promoted"| SLOT
     SLOT -->|"displaced: pushed back"| Q
 
-    SWAP["THE SWAP, both directions.\n\nPromoted when the slot is EMPTY, or when the head\nSTRICTLY beats the working task.\n\nDisplaced with in_process=1, and carrying\nsummary_phase, origin_behavior AND\nawaiting_resolution -- a marker dropped here is a\nfact nothing downstream can reconstruct."]
+    SWAP["THE SWAP, both directions.\n\nPromoted when the slot is EMPTY, or when the head\nSTRICTLY beats the working task.\n\nDisplaced with in_process=1, carrying summary_phase\nand origin_behavior -- a marker dropped here is a\nfact nothing downstream can reconstruct."]
     SLOT -.-> SWAP
 
     TIE["in_process is a tie-break WITHIN one label,\nnot a global override -- which is why the head\nneeds two statements, not one ORDER BY.\n\n[QUERY] and [ERROR] SHARE a priority. While the\ntie-break was global, a paused [QUERY] beat a fresh\n[ERROR], and the Caller's correction was never\ndelivered to the Partner it was correcting."]
     Q -.-> TIE
 
-    ANSWER["While the slot holds a WAIT, advance looks the\n[MESSAGE-RESPONSE] up BY LABEL, not from the head.\n\nIt sits at priority 3, below [QUERY]/[ERROR] at 2\nand [TRUTHFUL-REPORT] at 1 -- so an agent whose\npaused work carries one of those has a head that is\nNEVER the answer, and a head read would return None\nforever. Priority orders WORK; the message that ends\na wait is not work.\n\nIts row is consumed WITHOUT being promoted, the\nquestion is discarded, and the response is folded\ninto whatever the queue holds next."]
+    ANSWER["While partners.interrupted is set, advance promotes\nONLY a FRESH response, selected BY LABEL.\n\nBy label, because a response need not outrank what is\nqueued -- [MESSAGE-RESPONSE] is 2, so an agent holding\na [TRUTHFUL-REPORT] has a head that is NEVER the answer,\nand a head read would return None forever.\n\nFRESH, because interrupting pushes the agent OWN task\nback -- if that task was a response, accepting a paused\none would make interrupting self-undoing."]
     SLOT -.-> ANSWER
 
     EQ["EQUAL priority does NOT displace.\nAn arriving [QUERY] never interrupts\na [QUERY] being answered, or two callers\nping-pong a partner and neither is answered."]

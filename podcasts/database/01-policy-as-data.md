@@ -331,16 +331,24 @@ label at the top starve everything else? — is answered by when it occurs: a
 `[TRUTHFUL-REPORT]` is only ever produced *after* a `[RESEARCH]` has already been
 drained. Nothing waits behind it that was not already waiting.
 
-**`[QUERY]` and `[ERROR]` share rank 2, and that shared rank is the entire
-interruption mechanism.** An agent that *sends* one is stopped: its work is pushed
-back paused, and the question it asked takes its own working slot. Nothing below
-rank 2 can reach it while it waits. There is no separate hold label — **the
-question is the hold.** Only a summary, at 1, outranks a waiting agent, which is
-the one interruption worth allowing.
+**`[MESSAGE-RESPONSE]` is second, and its position is load-bearing.** It is not
+merely an answer arriving; it is what **restarts an interrupted agent**, taking the
+empty slot and clearing the flag. Rank it below the requests and an agent could sit
+interrupted with its restart signal queued behind fresh work it cannot act on.
 
-That tie is also the source of the subtlest bug in the queue's history, and note 3
-tells that story properly. Hold the fact for now: two labels deliberately share a
-priority.
+**`[ERROR]` outranks `[QUERY]`, and that ordering is a claim about causation.** An
+`[ERROR]` is normally a permission that was missing before the work started. Letting
+a `[QUERY]` run first means querying against a grant nobody has fixed yet — so the
+correction goes first, and then the asking.
+
+Read the five ranks as a single sentence: **answers before asks, and among the asks,
+the one that unblocks before the one that merely wants to know.**
+
+Note what the table no longer does. No two labels share a rank. That is worth saying
+because the queue's ordering rules are still written to survive a tie — note 3 tells
+that story — and the reason is not superstition: a tie is a thing a later deployment
+can introduce with a single edit to this table, and the rules that protect against it
+cost nothing to keep.
 
 ### Rule two — `max_outstanding` caps work in flight
 

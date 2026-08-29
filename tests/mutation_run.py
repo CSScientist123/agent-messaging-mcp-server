@@ -97,56 +97,10 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "an-error-ends-the-exchange", "schema/schema.sql",
-        "    ('[ERROR]',            2, NULL, 0, '[MESSAGE-RESPONSE]'),",
-        "    ('[ERROR]',            2, NULL, 0, NULL),",
+        "    ('[ERROR]',            3, NULL, 0, NULL),",
+        "    ('[ERROR]',            3, NULL, 0, '[MESSAGE-RESPONSE]'),",
         "an [ERROR] is delivered, acted on, and the slot frees with nothing sent back, so "
         "a Caller that corrects a blocked Partner never learns the correction landed",
-    ),
-    (
-        "a-wait-is-typed-at-the-agent", "messaging_core/core.py",
-        '            if task.get("awaiting_resolution"):\n'
-        '                # The question came back after a summary displaced it.',
-        '            if False and task.get("awaiting_resolution"):\n'
-        '                # The question came back after a summary displaced it.',
-        "a resumed wait is rendered and delivered, so an agent that is still waiting on its "
-        "own unanswered question is handed that question back as work",
-    ),
-    (
-        "an-asker-does-not-stop-itself", "messaging_core/core.py",
-        "        if behavior in BLOCKING_BEHAVIORS:",
-        "        if False and behavior in BLOCKING_BEHAVIORS:",
-        "an agent that says it cannot continue keeps working, so the next queued message "
-        "reaches an agent blocked on an unanswered question and the two interleave",
-    ),
-    (
-        "a-second-question-while-stopped", "messaging_core/core.py",
-        "        if behavior in BLOCKING_BEHAVIORS and self._already_waiting(requester[\"id\"]):",
-        "        if False and self._already_waiting(requester[\"id\"]):",
-        "a stopped agent may ask again, so two of its questions are unanswered at once and "
-        "the first is requeued as work it can neither do nor drop",
-    ),
-    (
-        "the-answer-is-ordered-by-priority", "messaging_core/core.py",
-        '                answer = self.db.read_one(\n'
-        '                    _HEAD_ROW_SQL, {"pid": partner_id, "behavior": "[MESSAGE-RESPONSE]"}\n'
-        "                )",
-        '                answer = head if head["behavior"] == "[MESSAGE-RESPONSE]" else None',
-        "the answer that ends a wait is taken from the queue head instead of by label, so an "
-        "agent whose paused work carries a lower priority number than [MESSAGE-RESPONSE] "
-        "never sees an answer that has already arrived and waits forever",
-    ),
-    (
-        "a-bare-response-is-the-prompt", "messaging_core/core.py",
-        "                prompt = templates.resolution(\n"
-        "                    asked_behavior=asked,\n"
-        "                    response=resolution_text,\n"
-        "                    next_job=None if task[\"in_process\"] else task[\"body\"],",
-        "                prompt = templates.resolution(\n"
-        "                    asked_behavior=asked,\n"
-        "                    response=resolution_text,\n"
-        "                    next_job=None,",
-        "the next job is dropped from the resolution prompt, so an agent is handed an answer "
-        "and no instruction while the work it should do sits deleted from the queue",
     ),
     (
         "a-lineage-may-fork", "messaging_core/core.py",
@@ -280,13 +234,6 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
         "[ERROR] of equal priority and the correction is never delivered",
     ),
     (
-        "a-wait-spins", "polling/server.py",
-        "                    stop_event.wait(self.hold_interval)",
-        "                    stop_event.wait(max(self.poll_interval / 4, 0.0))",
-        "a waiting agent is polled at four times the poll rate forever, for a partner "
-        "deliberately stopped with nothing to poll",
-    ),
-    (
         "send-claims-nothing-changed-after-committing", "mcp_server/server.py",
         "            if getattr(exc, \"already_committed\", False):",
         "            if False and getattr(exc, \"already_committed\", False):",
@@ -370,15 +317,15 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "priority-inverted", "messaging_core/core.py",
-        "          MIN(c.priority) ASC, MIN(q.in_process) ASC,",
-        "          MIN(c.priority) DESC, MIN(q.in_process) ASC,",
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC,",
+        " ORDER BY MIN(c.priority) DESC, MIN(q.in_process) ASC,",
         "_HEAD_LABEL_SQL picks the LOWEST-priority label last instead of first, so a "
         "[RESEARCH] can win the working slot over a [QUERY] that stops work",
     ),
     (
         "in-process-ignored", "messaging_core/core.py",
-        " ORDER BY q.awaiting_resolution DESC, q.in_process DESC, q.enqueued_at ASC, q.id ASC",
-        " ORDER BY q.awaiting_resolution DESC, q.enqueued_at ASC, q.id ASC",
+        " ORDER BY q.in_process DESC, q.enqueued_at ASC, q.id ASC",
+        " ORDER BY q.enqueued_at ASC, q.id ASC",
         "_HEAD_ROW_SQL drops the paused-first tie-break, so a paused task loses "
         "to a fresh arrival carrying the same label and a partner never resumes "
         "what it was already doing",
@@ -401,11 +348,11 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "displaced-not-paused", "messaging_core/core.py",
-        '                        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",\n'
+        '                        "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",\n'
         "                        (\n"
         "                            partner_id,\n"
         '                            working["caller_id"],',
-        '                        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",\n'
+        '                        "VALUES (?, ?, ?, ?, 0, ?, ?, ?)",\n'
         "                        (\n"
         "                            partner_id,\n"
         '                            working["caller_id"],',
@@ -414,25 +361,10 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
         "prompt is wrong",
     ),
     (
-        "a-displaced-wait-comes-back-as-work", "messaging_core/core.py",
-        "                            int(bool(working.get(\"awaiting_resolution\"))),",
-        "                            0,",
-        "advance()'s _swap drops the awaiting_resolution marker, so a question displaced by "
-        "a summary comes back looking like an ordinary [QUERY] a caller sent and the agent "
-        "is told to answer the question it asked",
-    ),
-    (
-        "a-wait-does-not-outrank-its-own-queue", "messaging_core/core.py",
-        " ORDER BY q.awaiting_resolution DESC, q.in_process DESC, q.enqueued_at ASC, q.id ASC",
-        " ORDER BY q.in_process DESC, q.enqueued_at ASC, q.id ASC",
-        "a displaced question loses to an ordinary paused row of its own label, so the agent "
-        "resumes work it still cannot do and the answer arrives with nothing to resolve",
-    ),
-    (
         "in-process-crosses-labels", "messaging_core/core.py",
-        "          MIN(c.priority) ASC, MIN(q.in_process) ASC,\n"
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC,\n"
         "          MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) ASC,",
-        "          MIN(c.priority) ASC, MIN(q.in_process) DESC,\n"
+        " ORDER BY MIN(c.priority) ASC, MIN(q.in_process) DESC,\n"
         "          MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) DESC,",
         "the paused-vs-fresh tie-break stops being scoped to one label, so a "
         "paused [QUERY] beats a fresh [ERROR] at the same priority and a Caller's "
@@ -451,11 +383,53 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ),
     (
         "drain-row-survives", "polling/server.py",
-        '"DELETE FROM drain_threads WHERE partner_id = ?", (partner_id,)',
-        '"SELECT partner_id FROM drain_threads WHERE partner_id = ?", (partner_id,)',
+        '                "DELETE FROM drain_threads WHERE partner_id = ?", (partner_id,)\n'
+        "            )\n",
+        '                "SELECT partner_id FROM drain_threads WHERE partner_id = ?", (partner_id,)\n'
+        "            )\n",
         "PollingServer._deregister leaves the drain_threads row behind when its "
         "thread retires, so the next push believes a thread is already running "
         "and spawns none -- the queued message is never picked up",
+    ),
+    (
+        "a-request-does-not-stop-its-sender", "messaging_core/core.py",
+        "        if behavior in REQUEST_BEHAVIORS:\n"
+        '            self.interrupt(requester["id"])',
+        "        if False and behavior in REQUEST_BEHAVIORS:\n"
+        '            self.interrupt(requester["id"])',
+        "an agent that dispatches work keeps running, so it is handed the next "
+        "queued message while still holding work it has already delegated",
+    ),
+    (
+        "an-interrupted-agent-is-given-work", "messaging_core/core.py",
+        "            if working is None and self._is_interrupted(partner_id):",
+        "            if False and self._is_interrupted(partner_id):",
+        "a request promotes into an interrupted agent's empty slot, so the "
+        "interruption ends without the response that was supposed to end it",
+    ),
+    (
+        "a-paused-response-restarts-it", "messaging_core/core.py",
+        " WHERE q.partner_id = ? AND q.in_process = 0 AND c.reply_behavior IS NULL ",
+        " WHERE q.partner_id = ? AND c.reply_behavior IS NULL ",
+        "an agent's OWN pushed-back response restarts it, so interrupting is "
+        "self-undoing whenever the interrupted task carried a response label",
+    ),
+    (
+        "the-interrupted-thread-is-left-running", "polling/server.py",
+        '            "DELETE FROM drain_threads WHERE partner_id = ?", (partner_id,)\n'
+        "        ))\n",
+        '            "SELECT partner_id FROM drain_threads WHERE partner_id = ?", (partner_id,)\n'
+        "        ))\n",
+        "an interrupted partner keeps its drain_threads row, so a restart "
+        "believes a thread is already running and spawns none",
+    ),
+    (
+        "a-summary-is-written-over-live-work", "polling/server.py",
+        "            if not core.no_work(partner_id):",
+        "            if False and not core.no_work(partner_id):",
+        "a [TRUTHFUL-REPORT] is requested while the agent still has queued work "
+        "or an unfinished dependent, so the summary describes a situation that "
+        "has already changed",
     ),
     (
         "store-everything", "messaging_core/core.py",

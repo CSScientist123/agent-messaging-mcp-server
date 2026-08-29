@@ -417,32 +417,6 @@ def test_termination_delivered_truthful_report_produces_nothing_back(db, stub, c
 # ---------------------------------------------------------------------------
 
 
-def test_a_waiting_agent_is_not_polled_and_does_not_retire(db, stub, core, server):
-    """The agent asked something and is stopped until it is answered.
-
-    There is nothing to poll for -- it is not running -- and nothing to report.
-    Retiring would be wrong too: the queue holds the work its question
-    displaced, and the answer that clears it arrives as an ordinary message.
-    """
-    caller, worker = make_pair(core)
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
-    working = core.working_task(partner_id=worker["id"])
-    assert working is not None and working.get("awaiting_resolution"), (
-        f"setup failed: expected the question to occupy the slot, got: {working}"
-    )
-    stub.calls.clear()
-
-    idle = server.drain_once(partner_id=worker["id"])
-
-    assert idle is False, (
-        "a waiting agent must not report idle -- the queue may hold displaced work"
-    )
-    poll_calls = [c for c in stub.calls if c[0] == "poll_completion"]
-    assert poll_calls == [], (
-        f"a stopped agent must not be polled for completion; got {poll_calls}"
-    )
-
 
 def poll_completion(self, *, partner_id_in_remote: str) -> bool:
         self._record("poll_completion", partner_id_in_remote=partner_id_in_remote)
@@ -689,8 +663,8 @@ def test_lower_priority_number_wins_across_different_labels(db, stub, core):
     srv.drain_once(partner_id=worker["id"])
 
     promoted = core.working_task(partner_id=worker["id"])
-    assert promoted is not None and promoted["behavior"] == "[ERROR]", (
-        "[ERROR] (priority 2) must be promoted ahead of [MESSAGE-RESPONSE] (priority 3) -- a "
+    assert promoted is not None and promoted["behavior"] == "[MESSAGE-RESPONSE]", (
+        "[MESSAGE-RESPONSE] (priority 2) must be promoted ahead of [ERROR] (priority 3) -- a "
         f"lower priority number is supposed to win; got: {promoted}"
     )
 

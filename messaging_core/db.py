@@ -52,10 +52,15 @@ _STOP = object()
 _ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("message_queue", "summary_phase INTEGER NOT NULL DEFAULT 0 CHECK (summary_phase IN (0, 1))"),
     ("message_queue", "origin_behavior TEXT REFERENCES label_caps(behavior)"),
-    ("message_queue",
-     "awaiting_resolution INTEGER NOT NULL DEFAULT 0 "
-     "CHECK (awaiting_resolution IN (0, 1))"),
+    ("partners",
+     "interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1))"),
 )
+
+# NOTE on `awaiting_resolution`: `message_queue` briefly carried that column, and
+# a database created while it existed still has it. This list is additive only --
+# it never DROPs -- so the column stays there, defaulted to 0, read by nothing.
+# That is harmless, and removing it would need a real migration rather than
+# another entry here.
 
 
 class Database:

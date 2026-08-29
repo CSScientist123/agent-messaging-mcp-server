@@ -1,7 +1,7 @@
 # Three: The queue — `message_queue`, `messages`, and the slot that is not a table
 
 **Have open:** `visualizations/03-schema-er.png`. `MESSAGE_QUEUE` is the largest
-box on the page, lower right. **Its eleven column glosses are this note's section
+box on the page, lower right. **Its ten column glosses are this note's section
 list** — read them top to bottom and you have the outline. Then find its four
 inbound edges: two from `PARTNERS` ("waits for (partner_id)" and "pushed by
 (caller_id)"), two from `LABEL_CAPS` ("prioritises and caps (behavior)" and
@@ -12,7 +12,7 @@ Secondary: `04-priority-queue.png` for the head read and the swap, and
 `05-working-slot.png` for the thing the ER diagram *cannot* draw.
 
 **The claim this note argues:** this table is where the system actually lives, and
-three of its columns exist only because something that is not a row — the working
+its hardest columns exist only because something that is *not* a row — the working
 slot — has to be reconciled with rows.
 
 ---
@@ -30,7 +30,6 @@ CREATE TABLE message_queue (
     message_id   INTEGER REFERENCES messages(id) ON DELETE SET NULL,
     summary_phase   INTEGER NOT NULL DEFAULT 0 CHECK (summary_phase IN (0, 1)),
     origin_behavior TEXT REFERENCES label_caps(behavior),
-    awaiting_resolution INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_resolution IN (0, 1)),
     enqueued_at  TEXT NOT NULL
                  DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     CHECK (caller_id <> partner_id)
@@ -107,20 +106,27 @@ label only**.
 
 ### Why the scoping is load-bearing
 
-`[QUERY]` and `[ERROR]` deliberately share priority 2 (note 1). Now suppose
-`in_process` were a *global* tie-break — paused beats fresh, regardless of label.
+Suppose `in_process` were a *global* tie-break — paused beats fresh, regardless of
+label. And suppose, as an earlier seed had it, that `[QUERY]` and `[ERROR]` shared
+a rank.
 
-A partner is interrupted mid-`[QUERY]`. Its caller, realising what went wrong,
-sends an `[ERROR]` explaining it. Both labels sit at priority 2. The paused
-`[QUERY]` wins the global tie-break, and the partner is handed **"resume your
-previous `[QUERY]`"** instead of the correction it was just sent.
+A partner holds a paused `[QUERY]`. Its caller, realising what went wrong, sends an
+`[ERROR]` explaining it. Same priority. The paused `[QUERY]` wins the global
+tie-break, and the partner is handed **"resume your previous `[QUERY]`"** instead
+of the correction it was just sent.
 
 **The correction is never delivered.** Not dropped, not errored — just permanently
-outranked by the thing it was sent to fix. Every individual step behaves exactly
-as specified.
+outranked by the thing it was sent to fix. Every individual step behaves exactly as
+specified.
 
 That is why reading the head takes **two statements**. One `ORDER BY` cannot say
 "within a label".
+
+**And note that the specific pair is now safe by rank**: `[ERROR]` sits at 3 and
+`[QUERY]` at 4, so a permission fix lands before more querying and this collision
+cannot occur with the shipped data. The scoping is kept anyway, because a tie is
+something a later deployment reintroduces with one edit to `label_caps` — and the
+test suite forces exactly that tie to keep the protection honest.
 
 ### The surprise: `in_process` is never `UPDATE`d
 
@@ -226,40 +232,38 @@ One task, two labels, two different questions answered by two different columns.
 
 ---
 
-## 5. `awaiting_resolution` — a question is not work
+## 5. The column that is NOT here — `interrupted` lives on `partners`
 
-*Trace: "1 = an agent's own displaced, unanswered question".*
+*Trace: look for an interruption marker among `MESSAGE_QUEUE`'s ten columns. There
+is none. Then look at `PARTNERS`, and find `interrupted` under `archived_at`.*
+
+This is worth a section precisely because of where the column is not.
+
+An agent that sends a `[RESEARCH]`, `[ERROR]` or `[QUERY]` is **interrupted**: its
+remote is stopped, its working task is pushed back here marked `in_process`, its
+slot is emptied, and its drain thread is stopped and deregistered. Interruption
+belongs to the **sender** — a recipient just finds a job in its queue.
+
+So where does that state live? Not in `message_queue`, because it is not a
+property of any message. It is a property of the **agent**:
 
 ```sql
-awaiting_resolution INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_resolution IN (0, 1))
+interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1))
 ```
 
-When an agent sends a `[QUERY]` or an `[ERROR]`, that act **stops the sender**.
-Its remote is stopped, whatever it was working on is pushed back paused, and the
-question itself takes its working slot. The question is the hold; there is no
-separate hold label.
+on `partners`. And it has to exist at all because an empty slot is ambiguous. A
+slot is *also* empty between two ordinary tasks, and in that state the drain thread
+is still running and should promote the next row. The emptiness cannot tell those
+apart. The flag can.
 
-That slot task is synthetic — it has no queue row and ordinarily never gets one.
-So when does this column ever get set?
+**Nothing occupies the emptied slot.** No placeholder, no synthetic task marking
+the wait. A placeholder would be a row a reader could mistake for work — and one
+that every count, every cap and every prompt would then have to exclude by hand.
+The design would rather have a boolean on the agent than a lie in the queue.
 
-Only a `[TRUTHFUL-REPORT]` outranks a waiting agent (priority 1 versus 2). So a
-summary can displace a wait, and at that moment the question *becomes* a queue
-row. The marker earns its place twice:
-
-**It makes the row outrank everything else in that agent's queue** — it is read
-*first*, ahead of priority, in both head statements. So when the summary finishes,
-what resumes is the wait, not some job the agent still cannot do.
-
-**It makes the resumed row re-enter the wait rather than be delivered.** Without
-it the question comes back looking like an ordinary `[QUERY]` a caller had sent —
-and the agent is handed, as work, the question it asked.
-
-It also quietly qualifies a property stated elsewhere: *at most one paused row per
-label*. That remains true of **work** rows. A wait carries a label too and can
-share one with a paused task — it never collides, because a wait is never
-rendered, and so is never what a resume prompt names.
-
----
+While the flag is set, `advance` promotes exactly one kind of row: a **fresh
+response**, chosen by label. Section 8 shows why both halves of that — *fresh*, and
+*by label* — are each closing a different failure.
 
 ## 6. `enqueued_at`, and the column that deliberately does not exist
 
@@ -350,7 +354,7 @@ delivered."* That only works because `db.write` wraps the whole closure in one
 ## 8. The pop order — two statements, six keys
 
 *Trace: the `Q` cylinder on `04-priority-queue.png`: "reading the head is TWO
-questions, and awaiting_resolution leads BOTH of them".*
+questions".*
 
 ### Step one — which label runs next
 
@@ -359,45 +363,40 @@ SELECT q.behavior AS behavior
   FROM message_queue q JOIN label_caps c ON c.behavior = q.behavior
  WHERE q.partner_id = :pid
  GROUP BY q.behavior
- ORDER BY MAX(q.awaiting_resolution) DESC,
-          MIN(c.priority) ASC, MIN(q.in_process) ASC,
+ ORDER BY MIN(c.priority) ASC, MIN(q.in_process) ASC,
           MIN(CASE WHEN q.in_process = 0 THEN q.enqueued_at END) ASC,
           MIN(q.enqueued_at) ASC
  LIMIT 1
 ```
 
-Five keys, each earning its place:
+Four keys, each earning its place:
 
-**1. `MAX(awaiting_resolution) DESC`** — a label holding a displaced unanswered
-question wins outright, *above priority*. `MAX` because the question is "does any
-row of this label carry the marker".
+**1. `MIN(c.priority) ASC`** — the label ranking. Lower wins.
 
-**2. `MIN(c.priority) ASC`** — the label ranking. Lower wins.
-
-**3. `MIN(in_process) ASC`** — 0 when the label has any fresh row, 1 when every row
+**2. `MIN(in_process) ASC`** — 0 when the label has any fresh row, 1 when every row
 of it is paused. At equal priority, a label with something new to say beats one
 that only wants resuming. **This is the key that fixes the `[QUERY]`/`[ERROR]`
 bug.**
 
-**4. `MIN(CASE WHEN in_process = 0 THEN enqueued_at END) ASC`** — the earliest
+**3. `MIN(CASE WHEN in_process = 0 THEN enqueued_at END) ASC`** — the earliest
 arrival among *only the label's fresh rows*, and it exists because of a
 second-order version of the same failure. Once a label holds both a paused row and
-a fresh one, key 3 is 0 and ties with a wholly-fresh label. A plain
+a fresh one, key 2 is 0 and ties with a wholly-fresh label. A plain
 `MIN(enqueued_at)` would then fall back to the *oldest* row in the label — which
 is precisely the paused one, since pausing happens to whatever has waited longest.
 The same bug walks back in through the tie-break. The `CASE` maps a paused row to
 NULL so it cannot supply the label's timestamp.
 
-The code explicitly forbids adding `NULLS LAST` here: key 3 already separates "has
+The code explicitly forbids adding `NULLS LAST` here: key 2 already separates "has
 a fresh row" from "has none", so this key is only ever compared between two labels
 that are both non-NULL or both NULL.
 
-**5. `MIN(enqueued_at) ASC`** — the final tie-break.
+**4. `MIN(enqueued_at) ASC`** — the final tie-break.
 
 ### Step two — which row of that label
 
 ```sql
- ORDER BY q.awaiting_resolution DESC, q.in_process DESC, q.enqueued_at ASC, q.id ASC
+ ORDER BY q.in_process DESC, q.enqueued_at ASC, q.id ASC
 ```
 
 **Here `in_process` is `DESC`** — paused *does* win. A partner finishes what it
@@ -413,16 +412,25 @@ resolution, so two rows genuinely can share one.
 
 ### The answer is looked up by label, not taken from the head
 
-One call to `_HEAD_ROW_SQL` deliberately bypasses step one entirely
-(`core.py:2237-2238`): when the slot holds a wait, `advance` looks up
-`[MESSAGE-RESPONSE]` **by label**.
+There is one lookup that bypasses both statements entirely. When
+`partners.interrupted` is set, `advance` does not read the head at all — it calls
+`_fresh_response`, which selects **by label** and requires the row to be
+**unpaused**.
 
-The reason is a deadlock. `[MESSAGE-RESPONSE]` sits at priority 3 — below
-`[QUERY]`/`[ERROR]` at 2 and `[TRUTHFUL-REPORT]` at 1. An agent whose paused work
-carries one of those labels has a queue whose head is *not* the answer, however
-long the answer has been sitting there. Reading the head would find that work,
-refuse to displace an equal-or-better slot, and return `None` on every pass
-forever: the agent waits for an answer that has already arrived.
+Both halves close a different failure, and each is worth stating on its own.
+
+**By label, because taking the head deadlocks.** A response does not necessarily
+outrank what is queued: `[MESSAGE-RESPONSE]` sits at 2, so an agent holding a
+`[TRUTHFUL-REPORT]` at 1 has a head that is *not* the answer, however long the
+answer has been sitting there. Reading the head would find that work, refuse to
+displace an equal-or-better slot, and return `None` on every pass forever — the
+agent waiting for an answer that had already arrived.
+
+**Unpaused, because interrupting requeues the agent's own task.** If that task
+carried a response label, the queue now holds a response row — and a rule accepting
+any response would fire on the agent's own pushed-back work. The act of
+interrupting would supply the very thing that undoes it. Only a response that
+genuinely *arrived* counts.
 
 > Priority orders WORK. It has nothing to say about the one message that ends a
 > wait.
@@ -441,10 +449,11 @@ reaches the query through a join. Grouping by partner and behavior, with
 `in_process` and `enqueued_at` ordered within, is exactly what both statements
 scan.
 
-Note also what the index does *not* cover: `awaiting_resolution`, now the leading
-sort key in both statements. At the scale this runs at — one partner's queue,
-rarely more than a handful of rows — that costs nothing. It is worth knowing it is
-a deliberate non-match rather than an oversight.
+Note also what the index does *not* serve: `_fresh_response`, which filters on
+`in_process = 0` joined against `label_caps.reply_behavior IS NULL`. At the scale
+this runs at — one partner's queue, rarely more than a handful of rows — that costs
+nothing. It is worth knowing it is a deliberate non-match rather than an
+oversight.
 
 ---
 
@@ -469,7 +478,7 @@ queue rather than about who is allowed to talk to whom."*
 **Re-entries.** `_swap` and `_requeue` bypass `_admit` entirely, and that is
 correct: a displaced task was already counted on admission. Re-testing would let
 the cap refuse a task re-entering the queue it is already in. They pay for the
-bypass by carrying `summary_phase`, `origin_behavior` and `awaiting_resolution`
+bypass by carrying `summary_phase` and `origin_behavior`
 forward **by hand** — three columns copied explicitly off the slot, each one a
 fact nothing downstream could reconstruct.
 
@@ -531,7 +540,7 @@ survives a restart when it does not.
 Three dicts guarded by one lock, keyed by `partners.id` (`slots.py:53-56`). A slot
 holds the same shape a queue row is popped into, plus fields no row ever has:
 `priority` (joined in by `_HEAD_ROW_SQL`), `prompt`, `remote_call_id`,
-`started_at`, and `awaiting_resolution` for a wait that was never a row at all.
+and `started_at`.
 
 The argument against persisting it is worth stating fully, because the temptation
 is real — a `working` table would make `status` a single query:

@@ -32,7 +32,9 @@ from messaging_core import responses
 from messaging_core import templates
 from messaging_core.db import Database
 from messaging_core.errors import MessagingError, NeedsRemote, Rejected
-from messaging_core.labels import BEHAVIORS, BLOCKING_BEHAVIORS, validate_behavior
+from messaging_core.labels import (
+    BEHAVIORS, REQUEST_BEHAVIORS, RESPONSE_BEHAVIORS, validate_behavior,
+)
 from messaging_core.slots import WorkingSlots
 
 # A small standalone schema used only by these tests, kept independent of the
@@ -346,13 +348,41 @@ def test_validate_behavior_rejects_case_variant_of_a_real_label():
     assert excinfo.value.code == "unknown_behavior"
 
 
-def test_the_blocking_labels_are_the_two_that_stop_their_sender():
-    # Sending either stops the sender and gives its slot to the question. They
-    # are ordinary labels an agent may send -- there is no separate hold label
-    # any more, so both must be ones validate_behavior accepts.
-    assert set(BLOCKING_BEHAVIORS) == {"[QUERY]", "[ERROR]"}
-    for behavior in BLOCKING_BEHAVIORS:
-        validate_behavior(behavior)  # must not raise
+def test_requests_and_responses_partition_the_five_labels():
+    """The split is a partition, not two overlapping lists.
+
+    Every label is exactly one of the two, because the question each answers --
+    "does sending this stop me?" and "does receiving this restart me?" -- has no
+    third answer.
+    """
+    assert set(REQUEST_BEHAVIORS) == {"[RESEARCH]", "[ERROR]", "[QUERY]"}
+    assert set(RESPONSE_BEHAVIORS) == {"[TRUTHFUL-REPORT]", "[MESSAGE-RESPONSE]"}
+    assert set(REQUEST_BEHAVIORS) | set(RESPONSE_BEHAVIORS) == set(BEHAVIORS)
+    assert not (set(REQUEST_BEHAVIORS) & set(RESPONSE_BEHAVIORS))
+    for behavior in REQUEST_BEHAVIORS + RESPONSE_BEHAVIORS:
+        validate_behavior(behavior)
+
+
+def test_the_split_is_exactly_reply_behavior_is_null():
+    """The partition is not a second authority -- it restates `label_caps`.
+
+    A label that expects an answer is a request; a label that IS an answer is a
+    response. If these ever disagree with the table, the table is right.
+    """
+    import sqlite3
+    from messaging_core.config import schema_path
+    db = sqlite3.connect(":memory:")
+    db.executescript(schema_path().read_text())
+    expects_answer = {r[0] for r in db.execute(
+        "SELECT behavior FROM label_caps WHERE reply_behavior IS NOT NULL")}
+    is_answer = {r[0] for r in db.execute(
+        "SELECT behavior FROM label_caps WHERE reply_behavior IS NULL")}
+    db.close()
+    assert expects_answer == set(REQUEST_BEHAVIORS) - {"[ERROR]"}, (
+        "every request except [ERROR] expects an answer; [ERROR] deliberately "
+        f"replies with nothing, got {expects_answer}"
+    )
+    assert is_answer == set(RESPONSE_BEHAVIORS) | {"[ERROR]"}
 
 
 def test_there_is_no_hold_label():

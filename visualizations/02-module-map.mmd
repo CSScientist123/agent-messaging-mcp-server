@@ -7,7 +7,7 @@ flowchart BT
     subgraph CORE["messaging_core package"]
         CFG["config.py\n(env, db path)"]
         ERR["errors.py\n(Rejected, NeedsRemote)"]
-        LBL["labels.py\n(the five labels + BLOCKING_BEHAVIORS;\nevery other per-label fact is in label_caps)"]
+        LBL["labels.py\n(the five labels, split into REQUEST_ and\nRESPONSE_BEHAVIORS; every other per-label\nfact is in label_caps)"]
         RESP["responses.py\n(ok / rejected / nothing_new)"]
         DB["db.py\n(Database: writer thread + readers)"]
         SLOTS["slots.py\n(WorkingSlots: the in-memory\nworking slot, never persisted)"]

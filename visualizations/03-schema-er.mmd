@@ -12,11 +12,11 @@ erDiagram
     }
 
     LABEL_CAPS {
-        string behavior PK "the five labels"
-        int priority "1 TRUTHFUL-REPORT .. 4 RESEARCH, lower wins"
+        string behavior PK "5 labels; reply_behavior IS NULL splits<br/>requests from responses"
+        int priority "1 TRUTHFUL-REPORT .. 5 RESEARCH, lower wins"
         int max_outstanding "3 QUERY, 2 RESEARCH, else NULL"
         int stored "1 for QUERY/TRUTHFUL-REPORT/MESSAGE-RESPONSE"
-        string reply_behavior FK "NULL is what ends an exchange"
+        string reply_behavior FK "NULL ends an exchange, and marks a RESPONSE"
     }
 
     AGENT_LAYERS {
@@ -48,6 +48,7 @@ erDiagram
         string descr "<= 1200 chars, what this partner is for"
         string orchestrator_type "project-orchestrator / gemini-orchestrator / bridge-scientist"
         string archived_at "NULL = live"
+        int interrupted "1 = stopped after sending a request, awaiting a response"
         string created_at
     }
 
@@ -90,7 +91,6 @@ erDiagram
         int message_id FK "set only for stored labels"
         int summary_phase "1 = a displaced [RESEARCH] summary; still owes its Caller"
         string origin_behavior FK "label admitted under, when it differs from behavior"
-        int awaiting_resolution "1 = an agent's own displaced, unanswered question"
         string enqueued_at "start time is on the in-memory slot, not here"
     }
 

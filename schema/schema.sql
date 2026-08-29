@@ -82,21 +82,33 @@ INSERT INTO agent_layers (source_prefix, orchestrator_type, layer) VALUES
 -- contaminating the context it is summarizing. It is only ever produced after a [RESEARCH]
 -- has been drained, so nothing is starved by it sitting at the top.
 --
--- [QUERY] and [ERROR] come next, sharing a rank: both are issues that stop work, and
--- neither is more urgent than the other. That rank is also the whole interruption
--- mechanism. An agent that SENDS one is stopped, its work pushed back paused, and the
--- question it asked takes its own working slot -- and nothing below that rank can reach it
--- while it waits. There is no separate hold label; the question IS the hold. Only a
--- summary outranks a waiting agent, which is the one interruption worth allowing.
+-- [MESSAGE-RESPONSE] is second: an answer outranks the work that was waiting for it, and
+-- it is also what RESTARTS an interrupted agent, so it must not sit behind fresh requests.
+--
+-- [ERROR] outranks [QUERY] deliberately. An [ERROR] is normally a permission that was
+-- missing before the work started; letting a [QUERY] run first means querying against a
+-- grant nobody has fixed yet. Fix the permission, then keep asking.
+--
+-- The five labels split in two, and the split IS `reply_behavior IS NULL`:
+--
+--   REQUESTS  [RESEARCH] [ERROR] [QUERY]      -- sending one INTERRUPTS ITS SENDER
+--   RESPONSES [MESSAGE-RESPONSE] [TRUTHFUL-REPORT] -- neither interrupts; either restarts
+--
+-- Interruption belongs to the SENDER, never the recipient. A recipient just finds a job in
+-- its queue. An agent that sends a request has said it is handing work away and waiting on
+-- the outcome, so its working task is pushed back paused, its slot is emptied, it is marked
+-- `interrupted`, and its drain thread is stopped and deregistered. Nothing occupies the
+-- slot in the meantime -- an empty slot plus `partners.interrupted` IS the state.
 --
 -- max_outstanding NULL means uncapped. A cap counts the working task as well as queued
 -- ones, so it limits work in flight, not merely work waiting.
 --
 -- reply_behavior is what a Partner sends back when a task carrying this label finishes,
 -- and NULL is the important value in the column: it is what makes the exchange terminate.
--- Three labels expect an answer -- [RESEARCH] is answered with a summary, and [QUERY] and
--- [ERROR] are each answered with a [MESSAGE-RESPONSE], since an agent that asked otherwise
--- has no way to know the answer landed. The other two ARE answers. Without a label whose
+-- Two labels expect an answer -- [RESEARCH] is answered with a summary, and [QUERY] with a
+-- [MESSAGE-RESPONSE]. [ERROR] expects nothing: a reply to it carries nothing the sender
+-- could use, and what actually resumes the work is the drain thread finding the paused row
+-- still marked `in_process`. The other two ARE answers. Without a label whose
 -- reply is nothing, every completed task would produce a message that produced a task that
 -- produced a message, and two agents would talk to each other until one was archived.
 CREATE TABLE label_caps (
@@ -112,10 +124,10 @@ CREATE TABLE label_caps (
 
 INSERT INTO label_caps (behavior, priority, max_outstanding, stored, reply_behavior) VALUES
     ('[TRUTHFUL-REPORT]',  1, NULL, 1, NULL),
-    ('[QUERY]',            2,    3, 1, '[MESSAGE-RESPONSE]'),
-    ('[ERROR]',            2, NULL, 0, '[MESSAGE-RESPONSE]'),
-    ('[MESSAGE-RESPONSE]', 3, NULL, 1, NULL),
-    ('[RESEARCH]',         4,    2, 0, '[TRUTHFUL-REPORT]');
+    ('[MESSAGE-RESPONSE]', 2, NULL, 1, NULL),
+    ('[ERROR]',            3, NULL, 0, NULL),
+    ('[QUERY]',            4,    3, 1, '[MESSAGE-RESPONSE]'),
+    ('[RESEARCH]',         5,    2, 0, '[TRUTHFUL-REPORT]');
 
 CREATE TABLE projects (
     id                INTEGER PRIMARY KEY,
@@ -139,6 +151,17 @@ CREATE TABLE partners (
                    CHECK (orchestrator_type IN
                           ('project-orchestrator', 'gemini-orchestrator', 'bridge-scientist')),
     archived_at    TEXT,
+    -- An agent that sent a request is INTERRUPTED: its working task was pushed
+    -- back paused, its slot emptied, and its drain thread stopped and
+    -- deregistered. An empty slot alone cannot say this -- a slot is also empty
+    -- between two ordinary tasks, and between them the drain thread is still
+    -- running and will promote the next row. This column is the difference, and
+    -- it is what `advance` consults before deciding whether to promote anything.
+    --
+    -- Cleared by a response (a label whose reply_behavior IS NULL) taking the
+    -- empty slot, or by the Polling Server after a Caller corrects the
+    -- permissions that produced an approval [ERROR]. Agents start uninterrupted.
+    interrupted    INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1)),
     created_at     TEXT NOT NULL
                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     -- Server-wide, not per-project, and archived titles stay spent.
@@ -265,12 +288,14 @@ END;
 -- in_process marks a task displaced from the working slot by a higher-priority arrival. It
 -- is paused, not new, and it outranks other queued tasks carrying THE SAME label ONLY.
 --
--- The scoping is load-bearing and cost a real bug to get right. [QUERY] and [ERROR] share a
--- priority deliberately, so a paused task that outranked fresh work at equal priority would
--- beat a different label: a partner interrupted mid [QUERY] would be handed "resume your
--- previous [QUERY]" instead of the [ERROR] its Caller just sent explaining what went wrong.
--- The correction would never be seen. See _HEAD_LABEL_SQL / _HEAD_ROW_SQL in core.py -- the
--- rule needs two statements because one ORDER BY cannot say "within a label".
+-- The scoping is load-bearing and cost a real bug to get right. A paused task that outranked
+-- fresh work of a DIFFERENT label would beat it: a partner holding a paused [QUERY] would be
+-- handed "resume your previous [QUERY]" instead of the higher-ranked [ERROR] its Caller just
+-- sent explaining what went wrong, and the correction would never be seen. [ERROR] now
+-- outranks [QUERY] outright, which makes that specific pair safe -- but the scoping is what
+-- makes EVERY pair safe, including two labels a later deployment gives the same rank. See
+-- _HEAD_LABEL_SQL / _HEAD_ROW_SQL in core.py -- the rule needs two statements because one
+-- ORDER BY cannot say "within a label".
 --
 -- Within a label it is what makes the resume prompt able to be one line: there is never more
 -- than one paused candidate, so "resume your previous [RESEARCH]" has exactly one referent.
@@ -296,14 +321,6 @@ CREATE TABLE message_queue (
     -- against its Caller's [RESEARCH] cap, because it is the same delegated
     -- work under a second instruction.
     origin_behavior TEXT REFERENCES label_caps(behavior),
-    -- Set when this row is an agent's own unanswered question, displaced out of
-    -- its working slot. The question is not work: nothing is delivered for it,
-    -- and it returns to the slot to go on waiting rather than to be run. Only a
-    -- [TRUTHFUL-REPORT] outranks a waiting agent, so this is reachable exactly
-    -- when a summary interrupts one -- and without the marker the question
-    -- would come back looking like an ordinary [QUERY] and be handed to the
-    -- agent as work it has already asked.
-    awaiting_resolution INTEGER NOT NULL DEFAULT 0 CHECK (awaiting_resolution IN (0, 1)),
     -- When the message entered the queue. The other half of the latency measurement --
     -- when it actually started running -- is deliberately NOT a column here: a promoted row
     -- is DELETED, so a `dequeued_at` would only ever be written to a row about to

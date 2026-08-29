@@ -25,19 +25,19 @@ sequenceDiagram
     opt B cannot finish on its own -- research_dispatch TELLS it to do this
         Note over B: "If you find you are missing context that only the<br/>Caller holds, do not guess - message back a [QUERY] and idle."<br/>The identity block ships in this prompt for that reason alone.
         B->>CORE: send([QUERY] or [ERROR], to A)
-        CORE->>B: stop_remote_execution -- the ASKER is stopped
+        CORE->>B: stop_remote_execution -- the SENDER is interrupted
         CORE->>Q: its [RESEARCH] is requeued in_process=1
-        CORE->>CORE: the question takes B's OWN slot<br/>(no queue row, nothing delivered)
-        Note over CORE,B: a second question now is refused<br/>already_awaiting_an_answer. Only a [TRUTHFUL-REPORT]<br/>can take the slot from a waiting agent, and the wait<br/>returns carrying awaiting_resolution = 1.
-        CORE->>A: the question lands in A's queue,<br/>displacing whatever A was doing unless it ties or outranks
-        A->>CORE: send([MESSAGE-RESPONSE])
-        CORE->>CORE: answer found BY LABEL, its row consumed<br/>without promotion, the question discarded
-        CORE->>B: ONE prompt: the response + "Resume your work on: [RESEARCH]"
+        CORE->>CORE: B's slot is EMPTIED and partners.interrupted set<br/>(nothing takes the slot -- no placeholder)
+        PS->>PS: B's drain thread is stopped and its<br/>drain_threads row deleted
+        CORE->>A: the question lands in A's queue like any other<br/>message -- A is NOT interrupted by receiving it
+        A->>CORE: send([MESSAGE-RESPONSE]) -- which interrupts A,<br/>because A is the one now waiting
+        CORE->>B: the response is chosen BY LABEL and must be FRESH,<br/>takes B's empty slot, clears the flag, and a thread is armed
     end
 
     B-->>PS: finished
 
     Note over PS,CORE: PHASE 2 -- the summary, and it is NOT a queued message
+    PS->>CORE: no_work(partner_id)? -- nothing left to drain, nothing it<br/>sent still queued, not interrupted, and every dependent<br/>summarized or itself no-work. NOT no-work means NOT yet:<br/>the task stays in the slot and the next pass asks again.
     PS->>CORE: begin_summary_phase(partner_id)
     CORE->>CORE: SAME slot: behavior becomes [TRUTHFUL-REPORT],<br/>effective priority raised 4 -> 1,<br/>body stays the ORIGINAL request,<br/>summary_phase = True (step 21 depends on it),<br/>origin_behavior = [RESEARCH] (so it still counts<br/>against A's cap of 2 while the summary is written)
     Note over CORE: raised to 1, which BLOCKS the queue: every arriving<br/>message waits, because advance displaces only on a strictly<br/>lower number and nothing has one.<br/><br/>The counterfactual is why: a summary written while traffic<br/>WAS reaching the same context would summarize the traffic.

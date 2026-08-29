@@ -58,12 +58,12 @@ class FlakyStub(StubExtension):
 
 def paused_counts(db: Database, partner_id: int) -> dict[str, int]:
     rows = db.read(
-        # `awaiting_resolution = 0` scopes this to WORK rows. A displaced wait
-        # is also stored paused and carries the label of the question that was
-        # asked, so it can coexist with a paused work row of the same label --
-        # but it is never rendered and so is never what a resume prompt names.
+        # Every paused row is now WORK. There is no second kind: interrupting
+        # pushes the agent's own task back as an ordinary paused row, and
+        # nothing else writes one. The count is unfiltered, and the invariant is
+        # correspondingly stricter than it used to be.
         "SELECT behavior, COUNT(*) AS n FROM message_queue "
-        "WHERE partner_id = ? AND in_process = 1 AND awaiting_resolution = 0 "
+        "WHERE partner_id = ? AND in_process = 1 "
         "GROUP BY behavior",
         (partner_id,),
     )
@@ -78,8 +78,34 @@ def db():
 
 
 @pytest.mark.parametrize("seed", list(range(12)))
-def test_at_most_one_row_per_label_is_ever_paused(db, seed):
-    """The seed IS the bug report: a failure here reproduces exactly."""
+def test_paused_rows_are_never_duplicated_or_emptied(db, seed):
+    """Randomised fuzz over the queue. The seed IS the bug report.
+
+    **This invariant changed with sender-interruption, and the change is real.**
+
+    It used to be "at most one paused row per label", which is what let the
+    resume prompt be a single line -- "resume your previous [RESEARCH]" had
+    exactly one referent. That no longer holds, and it is worth being precise
+    about why rather than quietly weakening the assertion:
+
+    A paused row is now written by three paths, not one. Displacement pauses the
+    incumbent; a failed delivery pauses the task it could not hand over; and
+    **interrupting pauses the sender's own working task**. So an agent can be
+    interrupted with a `[MESSAGE-RESPONSE]` in its slot (paused row one),
+    restarted by a second `[MESSAGE-RESPONSE]` that arrives, and then have that
+    one fail delivery (paused row two). Two paused rows, one label, every step
+    legitimate.
+
+    The consequence is bounded and not a loss: `_HEAD_ROW_SQL` still picks one
+    deterministically (paused first, then arrival, then row id), both bodies
+    survive, and both are eventually delivered. What the agent loses is only
+    that the one-line resume prompt no longer distinguishes them.
+
+    So what is asserted here is what still protects the caller: **no paused row
+    is ever duplicated, and none is ever emptied.** Two paused rows of a label
+    are allowed; two paused rows with the SAME BODY are not, because that would
+    mean one message became two.
+    """
     stub = FlakyStub()
     core = MessagingCore(db, extension=stub)
     caller, worker = make_pair(core)
@@ -97,9 +123,9 @@ def test_at_most_one_row_per_label_is_ever_paused(db, seed):
                     message=f"m{step}", behavior=behavior,
                 )
             elif action == "interrupt":
-                # The interruption is no longer a capability of its own: an
-                # agent is stopped by ASKING something, which is what this does.
-                history.append(f"{step}: worker asks a blocking question")
+                # Interruption belongs to the SENDER, so this stops the worker
+                # by having it send something, not by acting on it.
+                history.append(f"{step}: worker sends a request (interrupting itself)")
                 core.send(
                     requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
                     message=f"blocked at step {step}", behavior=rng.choice(["[QUERY]", "[ERROR]"]),
@@ -118,11 +144,19 @@ def test_at_most_one_row_per_label_is_ever_paused(db, seed):
             # behind, not whether each call succeeded.
             stub.fail_next = False
 
-        counts = paused_counts(db, worker["id"])
-        offenders = {b: n for b, n in counts.items() if n > 1}
-        assert not offenders, (
-            f"seed={seed}: {offenders} -- two paused rows of one label make "
-            "'Resume your previous <label>' ambiguous.\nhistory:\n  "
+        paused = db.read(
+            "SELECT behavior, body FROM message_queue "
+            "WHERE partner_id = ? AND in_process = 1", (worker["id"],)
+        )
+        bodies = [(r["behavior"], r["body"]) for r in paused]
+        dupes = {b for b in bodies if bodies.count(b) > 1}
+        assert not dupes, (
+            f"seed={seed}: {dupes} appears twice among the paused rows -- one "
+            "message became two.\nhistory:\n  " + "\n  ".join(history)
+        )
+        empties = [b for b in bodies if not b[1]]
+        assert not empties, (
+            f"seed={seed}: a paused row lost its body: {empties}\nhistory:\n  "
             + "\n  ".join(history)
         )
 

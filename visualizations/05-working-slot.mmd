@@ -16,7 +16,7 @@ stateDiagram-v2
 
     Working --> Paused : displaced by a higher-priority<br/>arrival. stop_remote_execution first,<br/>THEN the swap -- a stop that fails<br/>UNEXPECTEDLY leaves everything as it was.<br/>A remote that refuses BY DESIGN is recorded<br/>on uncancelled_displacements and the swap<br/>proceeds anyway.<br/><br/>Also reached by a FAILED DELIVERY:<br/>_requeue puts the task back, paused.
 
-    Paused --> Working : advance() picks it before other tasks<br/>OF ITS OWN LABEL, and never before a<br/>different one -- [QUERY] and [ERROR] share<br/>a priority, so a global tie-break would have<br/>a paused [QUERY] beat a fresh [ERROR] and the<br/>Caller\'s correction would never arrive.<br/><br/>EXCEPT a paused WAIT: awaiting_resolution is<br/>read AHEAD of priority, so it outranks every<br/>other row in this agent\'s queue, across labels.<br/><br/>The prompt depends on what resumed --<br/>a plain pause gets one line, "Resume your<br/>previous [RESEARCH]." A summary phase gets<br/>the full report request again. A wait gets<br/>NOTHING rendered and NOTHING delivered.
+    Paused --> Working : advance() picks it before other tasks<br/>OF ITS OWN LABEL, and never before a<br/>different one. No two labels share a rank<br/>today, but the scoping is what makes every<br/>future pair safe.<br/><br/>The prompt depends on what resumed --<br/>a plain pause gets one line, "Resume your<br/>previous [RESEARCH]." A summary phase gets<br/>the full report request again.
 
     Working --> Summary : the work finished and the label<br/>was [RESEARCH] -- it owes a summary,<br/>and the summary is a SECOND exchange<br/>in the SAME slot, not a queued message
 
@@ -25,33 +25,31 @@ stateDiagram-v2
     Working --> [*] : label_caps.reply_behavior:<br/>[QUERY] -> [MESSAGE-RESPONSE],<br/>[ERROR] -> [MESSAGE-RESPONSE],<br/>[TRUTHFUL-REPORT] and [MESSAGE-RESPONSE] -> NOTHING.<br/>([RESEARCH] -> [TRUTHFUL-REPORT], but by way of<br/>the summary phase above, never from here.)
 
     note right of Working
-        A slot can also hold a WAIT: the agent's
-        own unanswered [QUERY] or [ERROR], put
-        there by its own send(). No queue row
-        backs it, nothing is rendered for it, and
-        it is discarded the moment the answer
-        arrives. It holds at its natural priority
-        of 2, so only a [TRUTHFUL-REPORT] can take
-        the slot from it -- and a wait displaced
-        that way goes back to the queue carrying
-        awaiting_resolution = 1, which makes it
-        outrank everything else in that agent's
-        queue and re-enter the wait rather than
-        come back as work it already asked.
+        An INTERRUPTED agent has an EMPTY slot.
+        Sending a REQUEST ([RESEARCH], [ERROR],
+        [QUERY]) interrupts THE SENDER: its remote
+        is stopped, its task is pushed back paused,
+        the slot is emptied, partners.interrupted
+        is set, and its drain thread is stopped and
+        deregistered. The recipient is untouched --
+        it just finds a job in its queue.
 
-        An agent already waiting is refused a
-        second question, already_awaiting_an_answer.
+        Nothing occupies the slot meanwhile. There
+        is no placeholder, because a placeholder is
+        a row a reader could mistake for work.
 
-        The wait ends only on a [MESSAGE-RESPONSE],
-        which advance looks up BY LABEL rather than
-        from the head -- the answer sits at priority
-        3, so a head read would find higher-priority
-        paused work and deadlock forever. Its row is
-        consumed without being promoted, and folded
-        into what comes next in one of three shapes:
-        the next job quoted in full, the agent's own
-        paused work named by label, or the response
-        alone when the queue is empty.
+        The flag is not redundant with the empty
+        slot: a slot is ALSO empty between two
+        ordinary tasks, and there the thread is
+        still running and should promote the next
+        row. The flag is what tells them apart.
+
+        Only a FRESH RESPONSE restarts it --
+        [MESSAGE-RESPONSE] or [TRUTHFUL-REPORT],
+        chosen BY LABEL (a response need not
+        outrank what is queued) and required to be
+        unpaused (else the agent's own pushed-back
+        response would undo the interruption).
     end note
 
     note left of Summary

@@ -108,11 +108,11 @@ def main() -> int:
     tr_pri = db.execute(
         "SELECT priority FROM label_caps WHERE behavior='[TRUTHFUL-REPORT]'").fetchone()[0]
     ok(tr_pri < q_pri,
-       "only a summary outranks an agent waiting on its own [QUERY] or [ERROR]")
+       "a summary outranks a [QUERY] -- it is the top of the table")
     ok(order[-1] == "[RESEARCH]", "[RESEARCH] is lowest -- new work never displaces an issue")
     q, e = (db.execute("SELECT priority FROM label_caps WHERE behavior=?", (b,)).fetchone()[0]
             for b in ("[QUERY]", "[ERROR]"))
-    ok(q == e, "[QUERY] and [ERROR] share a rank -- both stop work, neither is more urgent")
+    ok(e < q, "[ERROR] outranks [QUERY] -- fix the permission before querying against it")
     ok(rejects(db, "INSERT INTO message_queue(partner_id,caller_id,behavior,body)"
                    " VALUES (2,1,'[NOPE]','b')"),
        "an unknown label cannot be queued")
@@ -198,11 +198,12 @@ def main() -> int:
             "SELECT behavior, priority, max_outstanding, stored, reply_behavior FROM label_caps"
         )
     )
-    ok(caps["[TRUTHFUL-REPORT]"][0] < caps["[QUERY]"][0] < caps["[MESSAGE-RESPONSE]"][0]
-       < caps["[RESEARCH]"][0],
-       "[TRUTHFUL-REPORT] outranks [QUERY] outranks [MESSAGE-RESPONSE] outranks [RESEARCH]")
-    ok(caps["[QUERY]"][0] == caps["[ERROR]"][0],
-       "[QUERY] and [ERROR] share a rank -- both stop work, neither is more urgent")
+    ok(caps["[TRUTHFUL-REPORT]"][0] < caps["[MESSAGE-RESPONSE]"][0] < caps["[ERROR]"][0]
+       < caps["[QUERY]"][0] < caps["[RESEARCH]"][0],
+       "[TRUTHFUL-REPORT] > [MESSAGE-RESPONSE] > [ERROR] > [QUERY] > [RESEARCH]")
+    ok(caps["[MESSAGE-RESPONSE]"][0] < caps["[ERROR]"][0],
+       "an answer outranks an error -- a response is what restarts an interrupted agent, "
+       "so it must not sit behind fresh requests")
     ok(caps["[MESSAGE-RESPONSE]"][0] < caps["[RESEARCH]"][0],
        "an answer outranks delegated work -- otherwise a partner never gets unblocked")
     ok(caps["[QUERY]"][1] == 3 and caps["[RESEARCH]"][1] == 2,
@@ -215,14 +216,15 @@ def main() -> int:
                                                    "[MESSAGE-RESPONSE]"},
        "exactly the three answerable labels are stored; transport labels are not")
     ok(caps["[QUERY]"][3] == "[MESSAGE-RESPONSE]"
-       and caps["[ERROR]"][3] == "[MESSAGE-RESPONSE]"
        and caps["[RESEARCH]"][3] == "[TRUTHFUL-REPORT]",
-       "the three labels that ask for something name what comes back")
+       "the two labels that expect an answer name what comes back")
+    ok(caps["[ERROR]"][3] is None,
+       "[ERROR] expects nothing back -- a reply to it carries nothing the sender could use")
     ok(all(caps[b][3] is None for b in ("[TRUTHFUL-REPORT]",
                                         "[MESSAGE-RESPONSE]")),
        "every other label replies with nothing -- that NULL is what terminates an exchange")
-    ok(caps[caps["[ERROR]"][3]][3] is None,
-       "an [ERROR]'s answer itself replies with nothing, so the correction ends in one hop")
+    ok(caps[caps["[QUERY]"][3]][3] is None,
+       "a [QUERY]'s answer itself replies with nothing, so the exchange ends in one hop")
     ok(rejects(db, "UPDATE label_caps SET reply_behavior='[QUERY]' WHERE behavior='[QUERY]'"),
        "a label cannot reply with itself -- that is an exchange with no end")
 

@@ -632,62 +632,6 @@ def test_paused_research_does_not_beat_a_fresh_query(world: World):
     assert bool(working_after["in_process"]) is False
 
 
-def test_a_waiting_agents_own_question_is_never_handed_back_to_it_as_work(world: World):
-    """ATTACK: an agent that asked a blocking question holds its own question
-    in its working slot while it waits. That task is synthetic -- it has no
-    queue row and never gets one. Can it be turned back into work?
-
-    Two routes are tried. First, displacement: a `[TRUTHFUL-REPORT]`
-    outranks the wait, and if the swap requeued the waiting task like an
-    ordinary one, the agent would later be handed its OWN question as though
-    a caller had sent it. Held: the row goes back carrying
-    `awaiting_resolution = 1`, and promoting it re-enters the wait rather
-    than delivering anything.
-
-    Second, delivery: nothing is ever handed to the remote for a wait. The
-    agent was just stopped; typing at it would give it something to act on
-    when the whole point is that it does nothing until it hears back.
-    """
-    world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="bridgeA")
-    world.code.handshake(requester_uuid=world.code_partner["uuid"], partner_title="bridgeA")
-
-    # bridgeA asks its own caller a [QUERY] and is stopped waiting for it.
-    world.sci.send(requester_uuid=world.bridge["uuid"], queried_partner_title="orchA",
-                   message="which path?", behavior="[QUERY]")
-    waiting = world.sci.working_task(partner_id=world.bridge["id"])
-    assert waiting is not None and waiting["awaiting_resolution"], (
-        f"precondition failed: bridgeA should be waiting on its own [QUERY], got {waiting!r}"
-    )
-
-    calls_before = len(world.sci_ext.calls)
-    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="bridgeA",
-                   message="summarise", behavior="[TRUTHFUL-REPORT]")
-    assert world.sci.working_task(partner_id=world.bridge["id"])["behavior"] == "[TRUTHFUL-REPORT]"
-
-    parked = world.db.read(
-        "SELECT * FROM message_queue WHERE partner_id=? AND behavior='[QUERY]'", (world.bridge["id"],)
-    )
-    assert len(parked) == 1 and parked[0]["awaiting_resolution"] == 1, (
-        f"a displaced wait must return to the queue still marked as a wait: "
-        f"{[dict(r) for r in parked]}"
-    )
-
-    # Finish the report; the wait is promoted -- and resumes as a wait.
-    world.sci.release(partner_id=world.bridge["id"])
-    world.sci.advance(partner_id=world.bridge["id"])
-    resumed = world.sci.working_task(partner_id=world.bridge["id"])
-    assert resumed is not None and resumed["awaiting_resolution"], (
-        f"a promoted wait must re-enter the wait, not become work: {resumed!r}"
-    )
-    delivered = [c for c in world.sci_ext.calls[calls_before:]
-                 if c[0] == "deliver_message" and c[1]["partner_id_in_remote"] == "ra-bridge"]
-    assert len(delivered) == 1, (
-        f"exactly one delivery to bridgeA was legitimate (the [TRUTHFUL-REPORT]); "
-        f"a wait must never be delivered: {delivered!r}"
-    )
-
-
-
 
 def test_paused_query_does_not_beat_a_fresh_error_of_equal_priority(world: World):
     """ATTACK (the bug that actually shipped, per the incident report):

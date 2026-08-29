@@ -31,18 +31,20 @@ BEHAVIORS: tuple[str, ...] = (
     "[RESEARCH]",
 )
 
-#: The two labels an agent uses to say it cannot continue on its own -- a
-#: question about what was meant, or a statement that something blocked it.
-#: Sending either stops the sender: its working task is pushed back paused and
-#: the question itself takes the slot until an answer arrives.
+#: The three labels that ASK for something. Sending one interrupts ITS SENDER:
+#: the sender has handed work away and is waiting on the outcome, so its working
+#: task is pushed back paused, its slot is emptied, and its drain thread stops.
+#: Interruption is always the sender's, never the recipient's -- a recipient just
+#: finds a job in its queue.
 #:
-#: Their rank in `label_caps.priority` is the entire interruption mechanism:
-#: nothing below it can reach an agent while it waits. There is no separate
-#: hold label, because the question IS the hold. Only a `[TRUTHFUL-REPORT]`
-#: outranks a waiting agent, which is the one interruption worth allowing --
-#: a summary must not be contaminated by other traffic.
-BLOCKING_BEHAVIORS: tuple[str, ...] = ("[QUERY]", "[ERROR]")
+#: The complement is RESPONSE_BEHAVIORS below, and the split is exactly
+#: `label_caps.reply_behavior IS NULL`: a label that expects an answer is a
+#: request, and a label that IS an answer is a response.
+REQUEST_BEHAVIORS: tuple[str, ...] = ("[RESEARCH]", "[ERROR]", "[QUERY]")
 
+#: The two labels that ARE answers. Neither interrupts its sender, and either one
+#: RESTARTS an interrupted recipient by taking its empty working slot.
+RESPONSE_BEHAVIORS: tuple[str, ...] = ("[TRUTHFUL-REPORT]", "[MESSAGE-RESPONSE]")
 
 def validate_behavior(behavior: str) -> None:
     """Raise Rejected("unknown_behavior", ...) if `behavior` is not a recognized label."""

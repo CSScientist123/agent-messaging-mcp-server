@@ -168,42 +168,79 @@ that produced a message. Two agents would talk to each other until one was archi
 `PollingServer._complete`. A `CHECK` additionally forbids a label replying with itself,
 which is the same infinite exchange written more compactly.
 
-## 8. A blocking question stops the agent that asked it
+## 8. Sending a request interrupts the SENDER
 
-**The rule.** Sending a `[QUERY]` or an `[ERROR]` stops the sender: its remote is stopped,
-whatever it was working on is pushed back into its own queue marked `in_process`, and the
-question takes its working slot. Nothing is rendered or delivered for that slot. An agent
-already waiting is refused a second question with `already_awaiting_an_answer`. The wait ends
-only when a `[MESSAGE-RESPONSE]` reaches the head of that agent's queue; the question is then
-discarded, never requeued.
+**The rule.** Sending a `[RESEARCH]`, `[ERROR]` or `[QUERY]` interrupts the agent
+that sent it: its remote is stopped, its working task is pushed back into its own
+queue marked `in_process`, its working slot is emptied, `partners.interrupted` is
+set, and its drain thread is stopped and deregistered. **The recipient is not
+disturbed at all** — it finds a job in its queue and drains it in priority order.
 
-**Why there is no separate hold label.** The question *is* the hold, and it holds at its own
-natural priority — 2, unraised. Only `[TRUTHFUL-REPORT]` at 1 outranks it, so everything else
-queues behind an unanswered question by ordinary priority rather than by a special case. A
-hold label would need a rule saying anything displaces it, which is a second comparison to
-keep in step with the first.
+**Why the sender and not the recipient.** An agent that sends a request has handed
+work away and is waiting on the outcome. Continuing would mean producing work it
+will have to redo once the answer changes what it knows. Nothing is gained by
+disturbing the recipient, which has simply been given something to do.
 
-**Why nothing is delivered.** The remote was stopped a moment earlier. Handing a stopped
-agent a paragraph gives it something to act on when the entire point is that it does nothing
-until it hears back.
+**Why an empty slot rather than a placeholder.** An interrupted agent holds
+nothing. A placeholder task would be a row a reader could mistake for work, and
+would have to be excluded by hand from every count, every cap and every prompt.
 
-**Where enforced.** Application code: `MessagingCore.send` (`labels.BLOCKING_BEHAVIORS`,
-`_already_waiting`, `_await_answer`) and `MessagingCore.advance`, which consumes the answer
-and folds it into whatever the queue holds next.
+**What breaks without it.** The next queued message reaches an agent still holding
+work it has already delegated, and the two interleave in one context with nothing
+marking where either begins.
 
-## 8a. A displaced question returns to waiting, not to work
+**Where enforced.** Application code: `MessagingCore.send` (`labels.REQUEST_BEHAVIORS`)
+calling `MessagingCore.interrupt`, and `PollingServer.stop_partner_thread` for the
+thread. Covered by the `a-request-does-not-stop-its-sender` and
+`the-interrupted-thread-is-left-running` mutants.
 
-**The rule.** A `[TRUTHFUL-REPORT]` outranks a waiting agent and can take the slot. The
-requeued row carries `awaiting_resolution = 1`; it then outranks every other row in that
-agent's queue, and promoting it re-enters the wait rather than delivering anything.
+## 8a. Only a fresh response restarts an interrupted agent
 
-**What breaks without it.** The question comes back indistinguishable from an ordinary
-`[QUERY]` a caller sent, and the agent is told to answer a question it asked. Or the answer
-arrives to a slot holding unrelated work and has nothing to resolve.
+**The rule.** While `partners.interrupted` is set, `advance` promotes nothing
+except a **response** — a label whose `reply_behavior IS NULL`, which is
+`[MESSAGE-RESPONSE]` and `[TRUTHFUL-REPORT]`. It is selected **by label**, and it
+must be **fresh** (`in_process = 0`).
 
-**Where enforced.** The `awaiting_resolution` column on `message_queue`, written by
-`advance`'s swap and by `_requeue`, and read first in both `_HEAD_LABEL_SQL` and
-`_HEAD_ROW_SQL`.
+**Why by label rather than from the head.** A response does not necessarily
+outrank everything queued: `[MESSAGE-RESPONSE]` is second, so an agent holding a
+`[TRUTHFUL-REPORT]` has a head that is not the answer. Reading the head would find
+that work, refuse to displace, and return `None` on every pass forever — the agent
+waiting for an answer that has already arrived.
+
+**Why fresh and not any response.** Interrupting pushes the agent's own working
+task back into its queue. If that task carried a response label, the queue now
+holds a response row — so the very act of interrupting would supply the thing that
+undoes it, and the agent would restart itself immediately.
+
+**What breaks without either half.** Without the first, a deadlock. Without the
+second, interruption is self-undoing whenever the interrupted task was a response.
+
+**Where enforced.** `MessagingCore._fresh_response`, read by `advance` under the
+partner's slot lock. Covered by `an-interrupted-agent-is-given-work` and
+`a-paused-response-restarts-it`.
+
+## 8b. A summary is only requested once no-work holds
+
+**The rule.** `[TRUTHFUL-REPORT]` is requested only when **no-work** holds for the
+agent: nothing left to drain from its own queue, nothing it sent still queued
+anywhere (`caller_id`), it is not interrupted, and every dependent is either
+summarized or itself no-work. A dependent is nothing for an agent holding no
+orchestrator role, and the partners it has handshaken to for one that does.
+
+**Why.** `[TRUTHFUL-REPORT]` outranks `[MESSAGE-RESPONSE]`. Without the gate an
+orchestrator would summarize over the top of answers still arriving from the very
+workers it is summarizing, and the summary would outrank them — describing a
+situation that had already changed by the time it was written.
+
+**Why it is a wait and not a refusal.** Not finished means not summarized: the
+task stays in the slot and the next drain pass asks again.
+
+**Cycle protection.** The recursion through dependents needs it — handshakes are
+one-way rows, but nothing stops `A → B` and `B → A` both existing. A partner
+already on the stack is treated as satisfied.
+
+**Where enforced.** `MessagingCore.no_work`, called from `PollingServer._complete`
+before `begin_summary_phase`. Covered by `a-summary-is-written-over-live-work`.
 
 ## 9. Delegated work never travels upward
 

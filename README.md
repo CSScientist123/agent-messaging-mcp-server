@@ -38,7 +38,7 @@ python3 tests/test_schema_constraints.py schema/schema.sql    # 63 passed, 0 fai
 
 `MessagingCore` (`messaging_core/core.py`) is a **logic class, not a server** — no port, no
 socket, no process. Three MCP server processes each construct their own instance and expose its
-seventeen capabilities as tools. What makes them behave as one system is not a protocol between
+eighteen capabilities as tools. What makes them behave as one system is not a protocol between
 them: they all point at the same SQLite file. The database *is* the integration layer.
 
 Each Partner has **one priority queue** and one in-memory working slot. Every message is a push;

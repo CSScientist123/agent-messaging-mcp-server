@@ -26,7 +26,7 @@ Every fact below is drawn from the source listed above. Where the source contain
 
 **Handshake.** A one-directional row in `handshakes` (`from_partner` → `to_partner`) that authorizes `send` from the first Partner to the second. `send` requires an existing handshake in that exact direction, except toward an `nlm_` Partner, which needs none. A reply direction is a second, independent row. Which pairings a handshake may legally connect is a fixed set of rules keyed on the two Partners' source prefixes and roles — see the `handshake` capability below.
 
-**Behavior label.** One of five fixed markers a message carries: `[TRUTHFUL-REPORT]`, `[QUERY]`, `[ERROR]`, `[MESSAGE-RESPONSE]`, `[RESEARCH]` (`labels.BEHAVIORS`). Two of them — `[QUERY]` and `[ERROR]`, listed in `labels.BLOCKING_BEHAVIORS` — also stop the agent that sends one, until it is answered. Every per-label fact lives in the `label_caps` table rather than in code: its priority, how many one Caller may have outstanding, whether it is stored in `messages`, and what a finished task carrying it replies with. There is no direction in a label — any party may send any label either way.
+**Behavior label.** One of five fixed markers a message carries: `[TRUTHFUL-REPORT]`, `[QUERY]`, `[ERROR]`, `[MESSAGE-RESPONSE]`, `[RESEARCH]` (`labels.BEHAVIORS`). They split in two, and the split is exactly `reply_behavior IS NULL`: three **requests** (`[RESEARCH]`, `[ERROR]`, `[QUERY]`, in `labels.REQUEST_BEHAVIORS`) interrupt the agent that *sends* one, never the recipient; two **responses** (`[TRUTHFUL-REPORT]`, `[MESSAGE-RESPONSE]`, in `labels.RESPONSE_BEHAVIORS`) interrupt nobody and restart an interrupted recipient. Every per-label fact lives in the `label_caps` table rather than in code: its priority, how many one Caller may have outstanding, whether it is stored in `messages`, and what a finished task carrying it replies with. There is no direction in a label — any party may send any label either way.
 
 **Priority queue.** One `message_queue` per Partner, holding what is waiting. The head is read in two steps: which **label** runs next (lowest `label_caps.priority`, then a label with any unpaused work over one whose rows are all paused, then arrival), and then which **row** of that label (paused first, then arrival). Two steps because `in_process` breaks ties only *within* a label, which one `ORDER BY` cannot say. A row is DELETED when its task is promoted — the queue holds what is waiting, not what is running.
 
@@ -40,7 +40,7 @@ Every fact below is drawn from the source listed above. Where the source contain
 
 ---
 
-## 2. The 17 capabilities
+## 2. The 18 capabilities
 
 Every capability below is a method on `MessagingCore` (`messaging_core/core.py`). Its MCP tool wrapper, in `mcp_server/server.py`, takes the same parameters, catches `Rejected` and `NeedsRemote`, and renders the result as a formatted string (see §5) rather than returning the raw value shown here. Two capabilities — `create_project` and `create_partner` — take no `requester_uuid` at all; they are the only two of the 18 not gated by caller identity, and consequently the only two that can never raise `unknown_requester`.
 
@@ -365,7 +365,7 @@ Pushes a message into another Partner's priority queue, then lets the queue run.
 | `requester_uuid` | `str` | required | — | must name a live partner | Caller's identity; the message's sender. |
 | `queried_partner_title` | `str` | required | — | exact title of a live partner | The message's recipient. |
 | `message` | `str` | required | — | any string | The message body. |
-| `behavior` | `str` | required | — | `"[RESEARCH]"`, `"[QUERY]"`, `"[ERROR]"`, `"[MESSAGE-RESPONSE]"`, `"[TRUTHFUL-REPORT]"` | The behavior label. Every label is sendable. `"[QUERY]"` and `"[ERROR]"` additionally stop the requester — see `already_awaiting_an_answer`. Validated at runtime against `labels.BEHAVIORS`; the MCP tool declares this as a plain `str`, not a `Literal`, so nothing statically prevents an unrecognized value from being attempted. |
+| `behavior` | `str` | required | — | `"[RESEARCH]"`, `"[QUERY]"`, `"[ERROR]"`, `"[MESSAGE-RESPONSE]"`, `"[TRUTHFUL-REPORT]"` | The behavior label. Every label is sendable. The three **requests** — `[RESEARCH]`, `[ERROR]`, `[QUERY]` — interrupt **the requester**, never the recipient. The two **responses** interrupt nobody and restart an interrupted recipient. Validated at runtime against `labels.BEHAVIORS`; the MCP tool declares this as a plain `str`, not a `Literal`, so nothing statically prevents an unrecognized value from being attempted. |
 
 There is deliberately **no** `role` parameter and **no** path parameters. There is one queue, so there is no direction to choose; and permissions are configured in advance by `add_permissions`, because an approval prompt means the grant was already missing when the work started.
 
@@ -378,7 +378,6 @@ There is deliberately **no** `role` parameter and **no** path parameters. There 
 | `unknown_requester` | `requester_uuid` not live. | Re-check the uuid. |
 | `no_such_partner` | `queried_partner_title` names no live partner. | Call `search_partner` to find the exact title. |
 | `unknown_behavior` | `behavior` not one of the five labels. | Use one of the five values. |
-| `already_awaiting_an_answer` | `behavior` is `[QUERY]` or `[ERROR]` and the requester already has an unanswered question of its own. It is stopped until that is answered, so a second question is one it could not act on the answer to. | Wait for the answer. It arrives folded into whatever the queue holds next. |
 | `source_cannot_send` | The requester's source has `can_send = 0` — today, `nlm_`. A notebook has no agent behind it, so nothing there ever decides to speak. | Nothing to do; a NotebookLM Partner is reachable but never a Caller. |
 | `research_not_accepted` | `behavior` is `[RESEARCH]` and the target's source has `accepts_research = 0` — today, `nlm_`. It answers questions about what it holds; it does not go and do things. | Send `[QUERY]` instead. |
 | `research_cannot_flow_upward` | `behavior` is `[RESEARCH]` and the requester's `agent_layers` layer is greater than the target's. Delegated work travels down or sideways; a lower agent handing it up would be reassigning its own director's work. | Use `[QUERY]` to ask, or `[TRUTHFUL-REPORT]` to report back. Every other label travels freely in both directions. |
@@ -387,6 +386,29 @@ There is deliberately **no** `role` parameter and **no** path parameters. There 
 | `over_queue` | This caller already holds `label_caps.max_outstanding` tasks of this label against this partner — **counting the one in the working slot**, which is why the queue can look one short and still refuse. Three for `[QUERY]`, two for `[RESEARCH]`; the other four labels are uncapped and can never raise this. | Wait for one to complete; do not retry immediately. |
 
 **Remote dependency.** Raises `NeedsRemote("deliver_message", ...)` if no extension is configured for the target's `source_prefix`. Admission is fully local and **already committed** by the time this can be raised — a `NeedsRemote` on `send` means the message is genuinely queued even though it was never handed to the remote.
+
+### send_batch
+
+Sends several messages, to several Partners, in one call. Each item carries its own target, body and label.
+
+**Parameters**
+
+| Name | Type | Required | Default | Allowed values | Description |
+|---|---|---|---|---|---|
+| `requester_uuid` | `str` | required | — | must name a live partner | The sender's identity, resolved once for the whole batch. |
+| `items` | `list[dict]` | required | — | each `{"queried_partner_title": str, "message": str, "behavior": str}` | The messages. Targets may all differ. |
+
+**Behavior.** Items are attempted **in order, one at a time**, and an item that fails does not stop the ones after it — its refusal is recorded and the batch continues. That is the point: a cap refusing the third `[RESEARCH]` should not also lose the `[QUERY]` behind it, which has its own cap and its own target.
+
+Every rule `send` applies still applies, per item and unchanged: handshakes, the delegation hierarchy, the source flags, and the `(caller_id, behavior)` cap. Nothing is relaxed because the messages arrived together.
+
+**The sender is interrupted at most once**, however many requests the batch contains — interruption is a property of the sender, not of a message. It happens *after* the whole batch is admitted rather than on the first request: interrupting mid-batch would empty the sender's slot and then keep admitting on behalf of an agent already marked stopped. A batch of only responses interrupts nobody.
+
+**Returns** `dict`: `{"accepted": [...], "refused": [...], "interrupted_sender": int | None}`. Each accepted entry is a `send` receipt plus its `index`; each refusal carries `index`, `code`, `message`, and `already_committed` — so a caller can tell "never landed" from "landed, then the remote failed", per item, which a single aggregate error could not express.
+
+**Rejections.** Only `unknown_requester`, which fails the whole call because nothing can be attempted without a sender. Every per-item failure is reported in `refused` rather than raised.
+
+**Remote dependency.** The same as `send`, once per accepted item.
 
 ### extend_project
 
@@ -538,7 +560,7 @@ Both handshake lists filter out archived counterparts explicitly — an archived
 
 Every code raised by `Rejected(...)` in `messaging_core/core.py`, extracted directly from source.
 
-Codes raised by more than one capability list every raiser. `unknown_requester` is raised by all fifteen capabilities that accept a `requester_uuid` (every capability except `create_project` and `create_partner`, which take none) and is omitted from capability-specific rows below to avoid repeating it fifteen times — see its own row.
+Codes raised by more than one capability list every raiser. `unknown_requester` is raised by all sixteen capabilities that accept a `requester_uuid` (every capability except `create_project` and `create_partner`, which take none) and is omitted from capability-specific rows below to avoid repeating it sixteen times — see its own row.
 
 | Code | Raised by | Remediation |
 |---|---|---|
@@ -550,7 +572,6 @@ Codes raised by more than one capability list every raiser. `unknown_requester` 
 | `cross_project_requires_same_role` | `handshake` | A handshake across a project extension needs both partners to hold the same orchestrator role. |
 | `cross_source_extension` | `extend_project` | Two projects of different sources already handshake without an extension. |
 | `descr_too_long` | `create_partner` | Shorten `descr` to ≤ 1200 characters. |
-| `already_awaiting_an_answer` | `send` | This agent is stopped on its own unanswered `[QUERY]` or `[ERROR]`. Wait for the answer. |
 | `different_project` | `handshake` | Share a project, or link the two with `extend_project`. |
 | `duplicate_handshake` | `handshake` | Skip `handshake`; the direction already exists — call `send`. |
 | `duplicate_partner_title` | `create_partner` | Choose an unused title (server-wide, archived included). |
@@ -714,6 +735,7 @@ Two Projects declared parts of one research effort.
 | `descr` | `TEXT` | `NOT NULL`, `CHECK length <= 1200` |
 | `orchestrator_type` | `TEXT` | `CHECK IN` the three roles, or NULL |
 | `archived_at` | `TEXT` | NULL means live |
+| `interrupted` | `INTEGER` | `NOT NULL DEFAULT 0`, `CHECK IN (0,1)`; this agent sent a request and is stopped awaiting a response |
 | `created_at` | `TEXT` | `NOT NULL DEFAULT` current UTC timestamp |
 
 Indexes: `partners_by_project (project_id) WHERE archived_at IS NULL`; `one_orchestrator_per_project_role (project_id, orchestrator_type) UNIQUE WHERE orchestrator_type IS NOT NULL AND archived_at IS NULL` — a partial unique index, so a concurrent claim race has one winner at the database level rather than in a check-then-act.
@@ -792,14 +814,15 @@ One priority queue per Partner. A row is a QUEUED poll task.
 | `message_id` | `INTEGER` | FK → `messages(id) ON DELETE SET NULL`; set only for stored labels |
 | `summary_phase` | `INTEGER` | `NOT NULL DEFAULT 0`, `CHECK IN (0,1)` — 1 means this row is a displaced `[RESEARCH]` summary phase |
 | `origin_behavior` | `TEXT` | FK → `label_caps(behavior)`; the label the task was admitted under, when it differs from `behavior` |
-| `awaiting_resolution` | `INTEGER` | `NOT NULL DEFAULT 0`, `CHECK IN (0,1)`; this row is an agent's own unanswered question, displaced out of its working slot |
 | `enqueued_at` | `TEXT` | `NOT NULL DEFAULT` current UTC timestamp |
 
 `CHECK (caller_id <> partner_id)`. Index: `message_queue_order (partner_id, behavior, in_process DESC, enqueued_at)`.
 
 `summary_phase` and `origin_behavior` exist because a `[RESEARCH]` task changes label mid-flight without leaving the working slot: `begin_summary_phase` relabels it `[TRUTHFUL-REPORT]` so that nothing can interrupt the summary. If it *is* interrupted, the row that goes back into the queue would otherwise be indistinguishable from a `[TRUTHFUL-REPORT]` an agent sent directly — which owes nothing back, because it already **is** the report. The two columns carry the distinction across the interruption: `summary_phase` says the Caller is still owed a report, and `origin_behavior` says the work still counts against that Caller's `[RESEARCH]` cap.
 
-`awaiting_resolution` exists for the mirror case: a `[TRUTHFUL-REPORT]` is the one thing that outranks an agent waiting on its own question, so a question really can be displaced out of a working slot and into this table. The question is not work. Without the marker it would come back indistinguishable from an ordinary `[QUERY]` a caller had sent, and be handed to the agent as something to answer — a question it asked. The column is read **first** in both `_HEAD_LABEL_SQL` and `_HEAD_ROW_SQL`, so a displaced question outranks everything else in that agent's queue and re-enters the wait rather than being delivered. It is also what scopes the "at most one paused row per label" property to work rows: a wait carries a label too, and can share one with a paused task, but it is never rendered and so is never what a resume prompt names.
+`partners.interrupted` is the state that an empty working slot cannot express. An agent that sends a `[RESEARCH]`, `[ERROR]` or `[QUERY]` is interrupted: its working task is pushed back paused, its slot is emptied, and its drain thread is stopped and deregistered. But a slot is *also* empty between two ordinary tasks, and in that state the thread is still running and should promote the next row — so the emptiness alone is ambiguous and the flag is what distinguishes the two. `advance` consults it before promoting anything, and while it is set the only row that may be promoted is a **fresh response**, selected by label rather than taken from the head.
+
+Both halves of that selection are necessary. Taking the head would deadlock, because a response does not necessarily outrank everything queued — `[MESSAGE-RESPONSE]` is second, so an agent holding a `[TRUTHFUL-REPORT]` has a head that is not the answer. And accepting a *paused* response would make interrupting self-undoing: interrupting pushes the agent's own working task back, so if that task carried a response label the act of interrupting would itself supply the row that undoes it.
 
 The task actually being worked — the working slot — is deliberately **not** in this table. It is held in memory by the Polling Server: it is process state, it changes on every swap, and persisting it would invite a reader to believe it survives a restart when it does not.
 

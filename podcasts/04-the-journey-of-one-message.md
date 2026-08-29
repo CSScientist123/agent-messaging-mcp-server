@@ -126,53 +126,43 @@ It would also be rendered wrong. The general resume path hands back "resume your
 
 So both facts travel on the queue row: that this is a summary phase, and what label the task was admitted under. A resumed summary is re-asked, against the original request the row still carries — which is why the body stays the original request rather than the summarise instruction. Summarising an instruction is not a thing anyone wants.
 
-## When an agent cannot continue on its own
+## Interruption, and who it happens to
 
 There is one more flow, and it is where the system's refusal to add mechanisms shows most clearly.
 
-An agent — any agent — sometimes hits something only another one can resolve: a path it was not granted, a question about what was actually meant. It sends a `[QUERY]` or an `[ERROR]`. **That act stops it.**
+An agent sends a **request** — a `[RESEARCH]` dispatching work, an `[ERROR]` reporting it is blocked, a `[QUERY]` asking for context it lacks. **That act interrupts the sender.** Its remote is stopped, whatever it was working on is pushed back into its own queue marked paused, its working slot is emptied, and its drain thread is stopped and deregistered.
 
-The stopping is the part worth dwelling on. Without it, the next queued message reaches an agent that is blocked on an unanswered question, and the two interleave in one context with nothing marking where either begins. So `send` does three things for a blocking label, in this order: it stops the sender's remote, pushes whatever the sender was working on back into the sender's own queue marked paused, and puts the question itself into the sender's working slot.
+Notice who is stopped. Not the recipient. The recipient finds a job in its queue and drains it in priority order like anything else — it is not disturbed at all. **There is no capability anywhere for one agent to stop another.** Being stopped is something you do to yourself by asking.
 
-There is exactly **one** condition: the label is `[QUERY]` or `[ERROR]`. Not the direction, not whether the sender held work.
+There is exactly one condition: the label is a request. Not the direction, not whether the sender held work.
 
-Direction is worth pausing on, because an earlier shape of this rule stopped only an agent answering *upward*, on the reasoning that a caller dispatching work should keep working. That reasoning does not survive contact with what the labels mean. A caller that sends a `[QUERY]` has said precisely what a partner does when it sends one — *I need this before I go on* — and an orchestrator that keeps driving other work while blocked on an answer is an orchestrator producing work it will have to redo. Whoever asked cannot continue. That is the whole rule.
+Direction is worth pausing on, because an earlier shape of this rule stopped only an agent answering *upward*, on the reasoning that a caller dispatching work should keep going. That does not survive contact with what the labels mean. An orchestrator that keeps driving other work while its workers run is an orchestrator producing work it will have to redo the moment their answers land. Whoever handed work away is waiting on it. That is the whole rule.
 
-An agent with nothing in flight is stopped too, and for a reason that only shows up if you follow the machinery. The wait still has to be *represented*. If the slot were left empty, the very next `advance` would find nothing there, promote whatever is at the head, and hand it to an agent that has just said it cannot proceed.
+An agent with nothing in flight is marked too. There is nothing to push back, but it has still said it is waiting on something, and the next arrival must not be handed to it as though it were free.
 
-**The question is the hold.** There is no separate label, and no priority zero. The question sits in the slot at the natural priority `[QUERY]` and `[ERROR]` already have — 2, never raised — and that alone is enough: only `[TRUTHFUL-REPORT]` at 1 is strictly lower, so everything else queues behind an unanswered question by the ordinary comparison rather than by an exception written for this case.
+**And nothing takes the emptied slot.** An interrupted agent holds nothing at all — no placeholder, no synthetic task marking the state. A placeholder would be a row a reader could mistake for work, and one every count, cap and prompt would then have to exclude by hand.
 
-Nothing is delivered to a stopped asker. Its remote was halted a moment earlier, and typing a paragraph at it hands it something to act on when the entire point is that it acts on nothing until it hears back.
+Which leaves a question the design has to answer: an empty slot also describes an agent simply between two tasks. The difference is a column, `partners.interrupted`. Between tasks the drain thread is still running and should promote the next row; interrupted, there is no thread and nothing should be promoted. The slot looks the same in both. The flag is what tells them apart.
 
-And asking twice is refused. An agent already waiting cannot send a second `[QUERY]` — it is stopped, so it could not act on the first answer, let alone the second.
+## What restarts it
 
-On the receiving side, nothing new was needed. The `[QUERY]` or `[ERROR]` arrives at priority 2 and goes to the front of everything below it, displacing a running task unless that task ties or outranks it. That displacement *is* the interruption on that end; a caller already mid-question or mid-summary finishes that first and takes this next. **There is no capability anywhere for one agent to stop another.** Being stopped is always a consequence: of what arrived, or of what you yourself sent.
+A **response**, and the split is not a second list to keep in step with anything: it is exactly `reply_behavior IS NULL`. A label that expects an answer is a request; a label that *is* an answer is a response. The two that terminate exchanges are the two that restart agents.
 
-## The answer, and why it never travels alone
+The response takes the empty slot, clears the flag, and a thread is armed. It is delivered as an ordinary message — no special prompt, because there is nothing to fold it into. The slot it lands in is empty by construction.
 
-The wait ends when a `[MESSAGE-RESPONSE]` reaches the head of the waiting agent's queue, and `advance` then does something it does for no other label.
+Two details in the selection, each closing a different failure.
 
-It **consumes** the answer's row without promoting it as a task. It discards the question in the slot — asked, answered, and never requeued, because requeuing it would ask again. And then it re-reads the head to find what the agent should actually do next.
+**Chosen by label, not taken from the head.** A response does not necessarily outrank what is queued: `[MESSAGE-RESPONSE]` is second, so an agent holding a `[TRUTHFUL-REPORT]` has a head that is not the answer. Reading the head would find that work, refuse to displace, and return nothing on every pass forever — waiting for an answer that had already arrived.
 
-The reason is a claim about prompts rather than about queues: **a raw response is close to useless to an agent.** Handed only "the 2024 set," an agent is holding a fact and no instruction, and has to guess whether to resume something, wait for more, or start fresh. What it should do next is not a guess — it is already decided and sitting at the head of its own queue. So the two are handed over as one prompt.
+**Required to be fresh.** Interrupting pushes the agent's own working task back into its queue, so an agent interrupted while working a response now has a response row sitting there. A rule accepting any response would fire on that — the act of interrupting would supply the thing that undoes it.
 
-Three shapes, and the difference between them is exactly the difference between the three states the queue can be in:
+## The one route with no response
 
-If the head is **a new job**, the agent is told the resolution came back, given the response, and then told to resume with that new job — quoted in full, because it has not seen it before.
+An approval `[ERROR]` replies with nothing, deliberately: a reply to it would carry nothing the sender could act on.
 
-If the head is **its own paused work**, it is told the resolution came back, given the response, and told to resume work on that label. The body is not restated: the agent never stopped holding it, and restating would hand back a worse copy of something it has not forgotten.
+So when a Partner stops on a permission it does not hold, and the Polling Server reports that upward as an `[ERROR]`, no response will ever come back to restart it. The Caller corrects the permissions, and **that correction is itself the signal** — the Polling Server clears the flag and arms a thread, and the Partner resumes with the work it was already holding still queued.
 
-If the head is **empty**, the resolution is delivered alone. This is the one case where a bare response is right, because there is nothing to attach it to — and the agent goes idle after it.
-
-## The one thing that outranks a wait
-
-A `[TRUTHFUL-REPORT]` is strictly lower than 2, so a summary really can take the slot from an agent waiting on its own question. That is deliberate: the caller owed a report is owed it before the asker's own question is worth anything.
-
-The question survives, and the column that makes it survive is `awaiting_resolution` on the requeued row.
-
-It earns its place twice. It makes the row outrank everything else in that agent's queue — read ahead of priority, not behind it — so when the summary finishes, what resumes is the wait rather than some job the agent still cannot do. And it makes the resumed row re-enter the wait instead of being delivered: without it, the question would come back indistinguishable from an ordinary `[QUERY]` a caller had sent, and the agent would be handed, as work, the question it asked.
-
-Nothing has to remember to release anything. The wait ends because the answer arrived, which is the same mechanism that makes everything else in the queue work.
+Which is why the prompt that Caller receives ends where it does. It says to investigate the permissions and fix them. It does *not* say to message the Partner back, and it does not say to resend the work, because both would duplicate something the system already does.
 
 ## What ends an exchange
 

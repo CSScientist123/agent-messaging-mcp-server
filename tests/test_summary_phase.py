@@ -233,17 +233,22 @@ def test_the_research_cap_counts_a_task_that_is_writing_its_summary(db, stub, co
     caller, worker = make_pair(core)
     suppress_no_op(monkeypatch, server)
 
+    # ONE [RESEARCH], because a summary is only requested once the partner is
+    # no-work -- a second job still queued would defer it, which is the gate's
+    # whole purpose and a different rule from the one under test here.
     core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
               message="investigate x", behavior="[RESEARCH]")
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="investigate y", behavior="[RESEARCH]")
 
-    # The first finishes its work and enters the summary phase, relabelling
-    # the slot. Its Caller still has two [RESEARCH] outstanding.
+    # It finishes its work and enters the summary phase, relabelling the slot.
+    # Its Caller still has one [RESEARCH] outstanding.
     server.drain_once(partner_id=worker["id"])
     working = core.working_task(partner_id=worker["id"])
     assert working is not None and working["behavior"] == "[TRUTHFUL-REPORT]"
 
+    # Cap is 2, and the summary phase is one of them. So a second is admitted
+    # and a third must not be.
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="investigate y", behavior="[RESEARCH]")
     with pytest.raises(Rejected) as exc_info:
         core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
                   message="investigate z", behavior="[RESEARCH]")
@@ -307,3 +312,57 @@ def test_a_directly_sent_truthful_report_is_not_treated_as_a_summary_phase(
         "a directly-sent [TRUTHFUL-REPORT] must not generate a reply; the caller's queue "
         f"holds: {queued_behaviors(db, caller['id'])}"
     )
+
+
+def test_a_summary_is_deferred_while_the_agent_still_has_queued_work(
+    db, stub, core, server, monkeypatch
+):
+    """NO-WORK is the condition to summarize, and this is it blocking.
+
+    `[TRUTHFUL-REPORT]` outranks `[MESSAGE-RESPONSE]`. Without this gate an
+    agent would be asked to summarize while answers were still arriving from
+    underneath it, and the summary would outrank them -- describing a situation
+    that had already changed.
+
+    Not finished means not summarized: the task stays in the slot and the next
+    pass asks again. It is a wait, not a refusal.
+    """
+    caller, worker = make_pair(core)
+    suppress_no_op(monkeypatch, server)
+
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="investigate x", behavior="[RESEARCH]")
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="investigate y", behavior="[RESEARCH]")
+    assert queued_behaviors(db, worker["id"]) == ["[RESEARCH]"], (
+        "setup failed: the second job should be queued behind the first"
+    )
+
+    server.drain_once(partner_id=worker["id"])
+
+    held = core.working_task(partner_id=worker["id"])
+    assert held is not None and held["behavior"] == "[RESEARCH]", (
+        "the summary must be deferred while a second job is still queued; "
+        f"the slot holds {held['behavior'] if held else None}"
+    )
+    assert not held.get("summary_phase"), "and the task must not be relabelled yet"
+
+
+def test_the_summary_happens_once_the_queue_is_finally_empty(
+    db, stub, core, server, monkeypatch
+):
+    """The other half: the gate is a wait, and the wait ends."""
+    caller, worker = make_pair(core)
+    suppress_no_op(monkeypatch, server)
+
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="investigate x", behavior="[RESEARCH]")
+    assert not queued_behaviors(db, worker["id"]), "setup failed: nothing should be queued"
+
+    server.drain_once(partner_id=worker["id"])
+
+    held = core.working_task(partner_id=worker["id"])
+    assert held is not None and held["behavior"] == "[TRUTHFUL-REPORT]", (
+        f"with nothing left to drain the summary should be requested, got {held!r}"
+    )
+    assert held["summary_phase"] is True

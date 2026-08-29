@@ -59,6 +59,25 @@ def put(db: Database, *, partner_id: int, caller_id: int, behavior: str,
     )
 
 
+def tie_error_to_query(db: Database) -> None:
+    """Put `[ERROR]` back on `[QUERY]`'s rank.
+
+    No two seeded labels share a priority any more -- `[ERROR]` was moved above
+    `[QUERY]` deliberately, so a permission fix lands before more querying. That
+    makes the within-label scoping of `in_process` unreachable through the
+    shipped data, and an untested rule is one a later edit silently breaks.
+
+    So these tests force the tie. The schema says exactly why the rule is
+    written to survive it: the scoping "makes EVERY pair safe, including two
+    labels a later deployment gives the same rank".
+    """
+    db.write(lambda conn: conn.execute(
+        "UPDATE label_caps SET priority = "
+        "(SELECT priority FROM label_caps WHERE behavior = '[QUERY]') "
+        "WHERE behavior = '[ERROR]'"
+    ))
+
+
 def test_a_fresh_error_still_wins_when_the_query_label_also_holds_a_fresh_row(db, core, stub):
     """The tie-break that reintroduced the shipped bug.
 
@@ -69,6 +88,7 @@ def test_a_fresh_error_still_wins_when_the_query_label_also_holds_a_fresh_row(db
     is the earliest arrival over ALL its rows, its paused row's age wins the
     label and the `[ERROR]` is never seen.
     """
+    tie_error_to_query(db)
     caller, worker = make_pair(core)
     put(db, partner_id=worker["id"], caller_id=caller["id"], behavior="[QUERY]",
         body="the original question", in_process=1, at="2026-01-01T00:00:00.000Z")
@@ -94,6 +114,7 @@ def test_a_fresh_error_still_wins_when_the_query_label_also_holds_a_fresh_row(db
 
 def test_a_label_that_is_entirely_paused_still_loses_to_one_with_fresh_work(db, core, stub):
     """The original rule, unchanged: a label only waiting to resume ranks last."""
+    tie_error_to_query(db)
     caller, worker = make_pair(core)
     put(db, partner_id=worker["id"], caller_id=caller["id"], behavior="[QUERY]",
         body="the original question", in_process=1, at="2026-01-01T00:00:00.000Z")
@@ -141,3 +162,4 @@ def test_a_higher_priority_label_still_beats_both(db, core, stub):
     assert working is not None and working["behavior"] == "[TRUTHFUL-REPORT]", (
         f"priority 1 must beat priority 2 regardless of arrival; got {working!r}"
     )
+

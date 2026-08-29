@@ -1,25 +1,22 @@
-"""Tests for what happens when an agent cannot continue on its own.
+"""Tests for interruption, and for the restart that ends it.
 
-An agent -- any agent, Caller or Partner -- sometimes hits something only
-another one can resolve: a path it was not granted, a question about what was
-actually meant. It sends a `[QUERY]` or an `[ERROR]`, and that act stops it.
+**Interruption belongs to the SENDER.** An agent that sends a `[RESEARCH]`,
+`[ERROR]` or `[QUERY]` has handed work away and is waiting on the outcome, so it
+stops. The recipient is not disturbed at all -- it finds a job in its queue and
+drains it in priority order like anything else.
 
-There is no separate hold label. The question the agent asked takes its own
-working slot, and it is defended there at its own natural priority -- `[QUERY]`
-and `[ERROR]` are never raised above the 2 they already hold. That is enough to
-make an unanswered question a blocker: only `[TRUTHFUL-REPORT]`, at 1, outranks
-it, and a caller owed a summary outranks the asker's own question by design.
-**The question is the hold.**
+An interrupted agent is exactly three things: an **empty working slot**, the
+**`partners.interrupted` flag**, and **no drain thread**. Nothing occupies the
+slot in the meantime; there is no placeholder task, because a placeholder is a
+row a reader could mistake for work. The flag exists because the empty slot
+alone is ambiguous -- a slot is also empty between two ordinary tasks, and in
+that state the thread is still running and should promote the next row.
 
-A displaced question is not lost. It goes back to the queue still marked
-`awaiting_resolution`, outranks everything else in that agent's queue when the
-summary finishes, and re-enters the wait rather than being handed back as work
-the agent is somehow supposed to do.
-
-What clears it is the answer, not a displacement. When the `[MESSAGE-RESPONSE]`
-arrives, the question is discarded -- never requeued -- and the answer is
-folded into whatever the queue holds next, because a bare response is close to
-useless as a prompt: the agent would be holding a fact and no instruction.
+What ends it is a **response** -- a label whose `reply_behavior IS NULL`, which
+is `[MESSAGE-RESPONSE]` and `[TRUTHFUL-REPORT]`. A response takes the empty slot,
+clears the flag, and the agent runs again. The one route that sends no response
+is an approval `[ERROR]`, which replies with nothing: there the Polling Server
+clears the flag itself once the Caller has corrected the permissions.
 """
 
 from __future__ import annotations
@@ -29,7 +26,6 @@ import pytest
 from extension.base import StubExtension
 from messaging_core.core import MessagingCore
 from messaging_core.db import Database
-from messaging_core.errors import Rejected
 from polling.server import PollingServer
 
 from tests.test_polling_working_slot import (
@@ -68,392 +64,465 @@ def working(core: MessagingCore, partner_id: int):
     return core.working_task(partner_id=partner_id)
 
 
-def last_body(stub) -> str:
-    return deliver_calls(stub)[-1]["body"]
-
-
 # ---------------------------------------------------------------------------
-# 1. Asking a blocking question stops the asker.
+# 1. Sending a request stops the SENDER, and only the sender.
 # ---------------------------------------------------------------------------
 
 
-def test_sending_a_query_stops_the_sender(db, core, stub):
-    """The agent said it cannot continue without this. It cannot continue."""
+@pytest.mark.parametrize("behavior", ["[RESEARCH]", "[QUERY]", "[ERROR]"])
+def test_sending_a_request_interrupts_the_sender(db, core, stub, behavior):
+    """All three requests stop their sender. None of them stops the recipient."""
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="first", behavior="[RESEARCH]")
+    # The caller is interrupted by that first send; clear it so the second send
+    # is observed from a clean state rather than a sticky one.
+    core.restart(caller["id"])
+
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="x", behavior=behavior)
+
+    assert core._is_interrupted(caller["id"]), (
+        f"sending a {behavior} must interrupt the SENDER"
+    )
+    assert working(core, caller["id"]) is None, (
+        "an interrupted agent has an EMPTY slot -- no placeholder task"
+    )
+    assert not core._is_interrupted(worker["id"]), (
+        f"a {behavior} must NOT interrupt its recipient; it just queues a job"
+    )
+
+
+def test_the_recipient_just_finds_a_job_in_its_queue(db, core, stub):
+    """The whole of what a request does to its target."""
     caller, worker = make_pair(core)
     core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
               message="investigate x", behavior="[RESEARCH]")
-    assert working(core, worker["id"])["behavior"] == "[RESEARCH]"
-
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset did you mean?", behavior="[QUERY]")
 
     held = working(core, worker["id"])
-    assert held["behavior"] == "[QUERY]" and held.get("awaiting_resolution"), (
-        f"the question itself must take the slot; got {held}"
+    assert held is not None and held["behavior"] == "[RESEARCH]", (
+        f"the recipient should be working the job, got {held!r}"
     )
-    assert "[RESEARCH]" in queued_behaviors(db, worker["id"]), (
-        "and the work it was doing must be paused, not lost"
-    )
+    assert held["body"] == "investigate x"
 
 
-def test_sending_an_error_stops_the_sender(db, core, stub):
+def test_interrupting_pushes_the_senders_own_work_back_paused(db, core, stub):
+    """What the sender was doing is not lost -- it is requeued `in_process`."""
     caller, worker = make_pair(core)
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="investigate x", behavior="[RESEARCH]")
-
+    # Give the caller something to be working on.
     core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="that path does not exist", behavior="[ERROR]")
-
-    assert working(core, worker["id"])["behavior"] == "[ERROR]"
-
-
-def test_a_caller_asking_downward_is_stopped_too(db, core, stub):
-    """Direction does not matter. Whoever asked cannot continue.
-
-    An earlier shape of this rule only stopped an agent answering upward, on
-    the grounds that a Caller dispatching work should keep working. But a
-    Caller that sends a `[QUERY]` has said the same thing a Partner does when
-    it sends one: I need this before I go on.
-    """
-    caller, worker = make_pair(core)
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="here is the report", behavior="[TRUTHFUL-REPORT]")
+              message="here is a report", behavior="[TRUTHFUL-REPORT]")
     assert working(core, caller["id"])["behavior"] == "[TRUTHFUL-REPORT]"
 
     core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="what is x?", behavior="[QUERY]")
+              message="go", behavior="[RESEARCH]")
 
-    assert working(core, caller["id"])["behavior"] == "[QUERY]", (
-        "a Caller that asks a blocking question is stopped like anyone else"
+    assert working(core, caller["id"]) is None
+    row = db.read_one(
+        "SELECT behavior, in_process, body FROM message_queue "
+        "WHERE partner_id = ? AND behavior = '[TRUTHFUL-REPORT]'", (caller["id"],)
     )
-    assert "[TRUTHFUL-REPORT]" in queued_behaviors(db, caller["id"])
+    assert row is not None, "the sender's working task must be back in its own queue"
+    assert row["in_process"] == 1, f"and marked paused, got {dict(row)}"
+    assert row["body"] == "here is a report", "with its body intact"
 
 
-def test_the_asker_stops_even_with_nothing_in_flight(db, core, stub):
-    """There is no work to protect, but there is still a wait to represent."""
+def test_interrupting_an_idle_agent_is_legal_and_still_marks_it(db, core, stub):
+    """There is nothing to push back, but it has still said it is waiting."""
     caller, worker = make_pair(core)
+    assert working(core, caller["id"]) is None
 
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="a question", behavior="[QUERY]")
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="go", behavior="[RESEARCH]")
 
-    assert working(core, worker["id"])["behavior"] == "[QUERY]"
+    assert core._is_interrupted(caller["id"])
 
 
-def test_nothing_is_delivered_to_a_stopped_asker(db, core, stub):
+def test_nothing_is_delivered_to_an_interrupted_agent(db, core, stub):
     """Its remote was just stopped. A paragraph would give it something to do."""
     caller, worker = make_pair(core)
     before = len(deliver_calls(stub))
 
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="a question", behavior="[QUERY]")
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="go", behavior="[RESEARCH]")
 
-    delivered_to_worker = [
-        c for c in deliver_calls(stub)[before:]
-        if c["partner_id_in_remote"] == worker["remote_id"]
-    ]
-    assert delivered_to_worker == [], f"the stopped agent was sent: {delivered_to_worker}"
+    to_caller = [c for c in deliver_calls(stub)[before:]
+                 if c["partner_id_in_remote"] == caller["remote_id"]]
+    assert to_caller == [], f"the interrupted sender was sent: {to_caller}"
 
 
-def test_only_a_truthful_report_displaces_a_waiting_agent(db, core, stub):
-    """The question is defended at its own natural priority, not a raised one.
-
-    `[QUERY]` and `[ERROR]` sit at priority 2 and are never promoted above it.
-    That is what makes an unanswered question a blocker without inventing a
-    special rule for it: only `[TRUTHFUL-REPORT]`, at 1, outranks the wait, and
-    everything else queues behind it.
-    """
+def test_sending_a_response_does_not_interrupt_the_sender(db, core, stub):
+    """A response is an answer, not an ask. Answering does not stop you."""
     caller, worker = make_pair(core)
     core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="a question", behavior="[QUERY]")
+              message="done", behavior="[TRUTHFUL-REPORT]")
 
-    # Ordinary work does not get through.
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="investigate y", behavior="[RESEARCH]")
-    assert working(core, worker["id"])["behavior"] == "[QUERY]", (
-        "an agent waiting on an answer must not be handed other work"
-    )
-    assert "[RESEARCH]" in queued_behaviors(db, worker["id"])
-
-    # A summary does, because its caller is owed the report before the agent's
-    # own question is worth anything.
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="summarise what you have", behavior="[TRUTHFUL-REPORT]")
-    assert working(core, worker["id"])["behavior"] == "[TRUTHFUL-REPORT]", (
-        "a [TRUTHFUL-REPORT] outranks the wait and must take the slot"
+    assert not core._is_interrupted(worker["id"]), (
+        "sending a response must not interrupt its sender"
     )
 
 
-def test_a_stopped_agent_cannot_ask_a_second_question(db, core, stub):
-    """It is stopped. A second question is one it could not act on the answer to.
+# ---------------------------------------------------------------------------
+# 2. While interrupted, requests queue and nothing runs.
+# ---------------------------------------------------------------------------
 
-    And the queue would not survive it: `_await_answer` pushes the working task
-    back paused, so asking again would requeue the FIRST question as a second
-    paused row of its own label -- two rows one resume line cannot name.
-    """
+
+def test_a_request_arriving_at_an_interrupted_agent_only_queues(db, core, stub):
+    """It is admitted, and it waits. Nothing promotes it until the restart."""
     caller, worker = make_pair(core)
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="go", behavior="[RESEARCH]")
+    assert core._is_interrupted(caller["id"])
+
     core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
               message="which dataset?", behavior="[QUERY]")
 
-    for behavior in ("[QUERY]", "[ERROR]"):
-        with pytest.raises(Rejected) as exc_info:
-            core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-                      message="and another thing", behavior=behavior)
-        assert exc_info.value.code == "already_awaiting_an_answer", (
-            f"a stopped agent sending a {behavior} must be refused "
-            f"already_awaiting_an_answer, got {exc_info.value.code!r}"
-        )
-
-    # Refused, and nothing half-applied: still exactly one question, still the
-    # first one, and the caller's queue is untouched by the two attempts.
-    held = working(core, worker["id"])
-    assert held is not None and held["body"].count("which dataset?") <= 1
-    assert held["behavior"] == "[QUERY]", f"the original wait must be intact, got {held!r}"
-    parked = db.read(
-        "SELECT * FROM message_queue WHERE partner_id = ?", (worker["id"],)
+    assert working(core, caller["id"]) is None, (
+        "an interrupted agent must not be given work by a request"
     )
-    assert parked == [], (
-        f"a refused second question must not requeue the first: {[dict(r) for r in parked]}"
+    assert "[QUERY]" in queued_behaviors(db, caller["id"]), (
+        "but the request is admitted and waiting"
     )
-    assert queued_behaviors(db, caller["id"]).count("[QUERY]") <= 1, (
-        "the refused questions must never reach the agent they were aimed at"
-    )
+    assert core._is_interrupted(caller["id"]), "and it is still interrupted"
 
 
-def test_a_stopped_agent_may_ask_again_once_it_is_answered(db, core, stub):
-    """The refusal is a wait, not a ban."""
+# ---------------------------------------------------------------------------
+# 3. A response restarts it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("behavior", ["[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]"])
+def test_a_response_restarts_an_interrupted_agent(db, core, stub, behavior):
+    """Either response label takes the empty slot and clears the flag."""
     caller, worker = make_pair(core)
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
     core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="the 2024 one", behavior="[MESSAGE-RESPONSE]")
+              message="go", behavior="[RESEARCH]")
+    assert core._is_interrupted(caller["id"])
 
-    result = core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-                       message="and which split?", behavior="[QUERY]")
-    assert result["behavior"] == "[QUERY]", (
-        f"once answered, an agent may ask again; got {result!r}"
+    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+              message="the answer", behavior=behavior)
+
+    held = working(core, caller["id"])
+    assert held is not None and held["behavior"] == behavior, (
+        f"a {behavior} must restart an interrupted agent, got {held!r}"
     )
+    assert not core._is_interrupted(caller["id"]), "and clear the flag"
 
 
-def test_a_displaced_wait_outranks_ordinary_paused_work_of_its_own_label(db, core, stub):
-    """Which row resumes when the summary finishes, and why it is not a coin toss.
-
-    The agent is holding a paused `[QUERY]` it was given as WORK, and a
-    displaced `[QUERY]` of its own that is still unanswered. Both are paused,
-    both carry the same label, so `in_process` and arrival order decide nothing
-    useful -- and the work row arrived first, so plain chronology picks exactly
-    the wrong one.
-
-    `awaiting_resolution` is read ahead of both. The wait resumes, because
-    handing the agent work it still cannot do would also leave the answer, when
-    it arrives, with nothing in the slot to resolve.
-    """
+def test_the_response_is_delivered_as_an_ordinary_message(db, core, stub):
+    """No special prompt. It is relayed like anything else."""
     caller, worker = make_pair(core)
-
-    # 1. The caller gives the worker a [QUERY] as work, and it takes the slot.
     core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="what is X?", behavior="[QUERY]")
-    assert working(core, worker["id"])["body"] == "what is X?"
+              message="go", behavior="[RESEARCH]")
+    before = len(deliver_calls(stub))
 
-    # 2. The worker asks its own question. Its work is pushed back paused and
-    #    the question takes the slot.
     core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
-    assert working(core, worker["id"])["awaiting_resolution"]
-    assert "[QUERY]" in queued_behaviors(db, worker["id"])
-
-    # 3. A summary displaces the wait. Now BOTH [QUERY] rows are in the queue,
-    #    both paused, and the work row is the older of the two.
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="summarise what you have", behavior="[TRUTHFUL-REPORT]")
-    rows = db.read(
-        "SELECT body, in_process, awaiting_resolution FROM message_queue "
-        "WHERE partner_id = ? AND behavior = '[QUERY]' ORDER BY id", (worker["id"],)
-    )
-    assert len(rows) == 2 and all(r["in_process"] == 1 for r in rows), (
-        f"setup failed: expected two paused [QUERY] rows, got {[dict(r) for r in rows]}"
-    )
-    assert rows[0]["awaiting_resolution"] == 0 and rows[1]["awaiting_resolution"] == 1, (
-        "setup failed: the work row must be the OLDER of the two, or chronology alone "
-        f"would pick the wait and this stops isolating the tie-break: {[dict(r) for r in rows]}"
-    )
-
-    # 4. The summary finishes. The wait is what comes back.
-    core.release(partner_id=worker["id"])
-    core.advance(partner_id=worker["id"])
-    resumed = working(core, worker["id"])
-    assert resumed is not None and resumed["awaiting_resolution"], (
-        f"an unanswered question must outrank work of its own label; got {resumed!r}"
-    )
-
-    # 5. And the answer still resolves it, folding in the work that was waiting.
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="the 2024 one", behavior="[MESSAGE-RESPONSE]")
-    body = last_body(stub)
-    assert "Resolution attempt on [QUERY] is returned." in body, body
-    assert "the 2024 one" in body
-    assert "Resume your work on" in body, (
-        f"the paused work is what it goes back to, named by label: {body}"
-    )
-
-
-def test_a_displaced_wait_returns_to_waiting_rather_than_becoming_work(db, core, stub):
-    """The question survives being displaced, and is not handed back as a job.
-
-    Without `awaiting_resolution` on the requeued row, the question would come
-    back looking like an ordinary `[QUERY]` its caller had sent -- and the
-    agent would be told to answer a question it asked.
-    """
-    caller, worker = make_pair(core)
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="a question", behavior="[QUERY]")
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="summarise what you have", behavior="[TRUTHFUL-REPORT]")
-
-    parked = db.read(
-        "SELECT * FROM message_queue WHERE partner_id = ? AND behavior = '[QUERY]'",
-        (worker["id"],),
-    )
-    assert len(parked) == 1 and parked[0]["awaiting_resolution"] == 1, (
-        f"a displaced wait must stay marked as a wait: {[dict(r) for r in parked]}"
-    )
-
-    calls_before = len(stub.calls)
-    core.release(partner_id=worker["id"])
-    core.advance(partner_id=worker["id"])
-    resumed = working(core, worker["id"])
-    assert resumed is not None and resumed["awaiting_resolution"], (
-        f"the promoted wait must re-enter the wait, not become work: {resumed!r}"
-    )
-    assert not [c for c in stub.calls[calls_before:] if c[0] == "deliver_message"], (
-        "nothing is said to an agent that is waiting on its own question"
-    )
-
-    # And the answer still resolves it afterwards.
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
               message="use the 2024 set", behavior="[MESSAGE-RESPONSE]")
-    body = last_body(stub)
-    assert "Resolution attempt on [QUERY] is returned." in body, body
-    assert "use the 2024 set" in body
+
+    to_caller = [c for c in deliver_calls(stub)[before:]
+                 if c["partner_id_in_remote"] == caller["remote_id"]]
+    assert len(to_caller) == 1, f"expected one delivery to the restarted agent: {to_caller}"
+    assert "use the 2024 set" in to_caller[0]["body"]
+
+
+def test_after_the_restart_the_paused_work_resumes(db, core, stub):
+    """The queue drains normally again -- that is what a restart buys."""
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+              message="a report", behavior="[TRUTHFUL-REPORT]")
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="go", behavior="[RESEARCH]")
+    assert core._is_interrupted(caller["id"])
+
+    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+              message="answer", behavior="[MESSAGE-RESPONSE]")
+    assert working(core, caller["id"])["behavior"] == "[MESSAGE-RESPONSE]"
+
+    core.release(partner_id=caller["id"])
+    core.advance(partner_id=caller["id"])
+    resumed = working(core, caller["id"])
+    assert resumed is not None and resumed["behavior"] == "[TRUTHFUL-REPORT]", (
+        f"the paused work must resume after the restart, got {resumed!r}"
+    )
+    assert bool(resumed["in_process"]) is True
+
+
+def test_an_agents_own_paused_response_does_not_restart_it(db, core, stub):
+    """Interrupting must not supply the thing that undoes it.
+
+    Interrupting pushes the agent's working task back into its own queue. If
+    that task carried a response label, the queue now holds a response row --
+    and a restart rule that accepted any response would fire on the agent's own
+    pushed-back work, un-interrupting it immediately.
+
+    Only a response that ARRIVED counts, which is why the lookup is scoped to
+    `in_process = 0`.
+    """
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+              message="a report", behavior="[TRUTHFUL-REPORT]")
+    assert working(core, caller["id"])["behavior"] == "[TRUTHFUL-REPORT]"
+
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="go", behavior="[RESEARCH]")
+
+    paused = db.read_one(
+        "SELECT behavior, in_process FROM message_queue WHERE partner_id = ?",
+        (caller["id"],),
+    )
+    assert paused["behavior"] == "[TRUTHFUL-REPORT]" and paused["in_process"] == 1, (
+        f"setup failed: expected the response paused in its own queue, got {dict(paused)}"
+    )
+
+    assert core.advance(partner_id=caller["id"]) is None, (
+        "a paused response of the agent's own must not restart it"
+    )
+    assert core._is_interrupted(caller["id"])
+    assert working(core, caller["id"]) is None
+
+
+def test_restart_is_a_no_op_on_an_agent_that_is_not_interrupted(db, core, stub):
+    caller, worker = make_pair(core)
+    assert core.restart(caller["id"]) is False
+
+
+def test_restart_clears_the_flag_without_delivering_anything(db, core, stub):
+    """The approval-[ERROR] route: no response is sent, so something else clears it."""
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="go", behavior="[RESEARCH]")
+    before = len(deliver_calls(stub))
+
+    assert core.restart(caller["id"]) is True
+
+    assert not core._is_interrupted(caller["id"])
+    assert len(deliver_calls(stub)) == before, "restart delivers nothing by itself"
 
 
 # ---------------------------------------------------------------------------
-# 2. The answer arrives, and is folded into what comes next.
+# 4. [ERROR] replies with nothing.
 # ---------------------------------------------------------------------------
 
 
-def test_the_answer_alone_is_delivered_when_nothing_is_waiting(db, core, stub):
-    """The one case where a bare response IS the right prompt."""
-    caller, worker = make_pair(core)
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
+def test_an_error_expects_no_reply(db, core, stub):
+    """Changed deliberately: a reply to an [ERROR] carries nothing usable.
 
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="the 2024 one", behavior="[MESSAGE-RESPONSE]")
-
-    body = last_body(stub)
-    assert "Resolution attempt on [QUERY] is returned." in body, body
-    assert "the 2024 one" in body
-    assert "Resume your work" not in body, f"nothing was waiting: {body}"
+    What resumes the work is the drain thread finding the paused row still
+    marked `in_process`, not a message coming back.
+    """
+    assert core.reply_behavior("[ERROR]") is None
 
 
-def test_the_answer_is_concatenated_with_paused_work(db, core, stub):
-    """Resuming names the label only -- the agent never stopped holding the body."""
-    caller, worker = make_pair(core)
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="investigate x", behavior="[RESEARCH]")
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
-
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="the 2024 one", behavior="[MESSAGE-RESPONSE]")
-
-    body = last_body(stub)
-    assert "Resolution attempt on [QUERY] is returned." in body, body
-    assert "the 2024 one" in body
-    assert "Resume your work on: [RESEARCH]" in body, body
-
-
-def test_the_answer_is_concatenated_with_a_new_job(db, core, stub):
-    """A fresh job is restated in full -- the agent has never seen it."""
-    caller, worker = make_pair(core)
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="a brand new assignment", behavior="[RESEARCH]")
-
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="the 2024 one", behavior="[MESSAGE-RESPONSE]")
-
-    body = last_body(stub)
-    assert "Resolution attempt on [QUERY] is returned." in body, body
-    assert "the 2024 one" in body
-    assert "Resume your work with this new job:" in body, body
-    assert "a brand new assignment" in body, body
-
-
-def test_the_question_is_never_requeued(db, core, stub):
-    """It was asked and answered. Requeuing it would ask again."""
-    caller, worker = make_pair(core)
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="the 2024 one", behavior="[MESSAGE-RESPONSE]")
-
-    assert "[QUERY]" not in queued_behaviors(db, worker["id"]), (
-        f"the resolved question came back: {queued_behaviors(db, worker['id'])}"
-    )
-
-
-def test_the_answers_own_row_is_consumed(db, core, stub):
-    """It is folded into the next prompt, not promoted as a task of its own."""
-    caller, worker = make_pair(core)
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="investigate x", behavior="[RESEARCH]")
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
-
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="the 2024 one", behavior="[MESSAGE-RESPONSE]")
-
-    assert "[MESSAGE-RESPONSE]" not in queued_behaviors(db, worker["id"])
-    assert working(core, worker["id"])["behavior"] == "[RESEARCH]", (
-        "the work behind the question is what the agent resumes"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 3. The resolver's side is ordinary.
-# ---------------------------------------------------------------------------
-
-
-def test_the_resolver_just_receives_the_question(db, core, stub, server, monkeypatch):
-    """No special mechanism on the answering side: it is a message in a queue."""
-    caller, worker = make_pair(core)
-    suppress_no_op(monkeypatch, server)
-
-    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-              message="which dataset?", behavior="[QUERY]")
-
-    assert working(core, caller["id"])["behavior"] == "[QUERY]" or \
-        "[QUERY]" in queued_behaviors(db, caller["id"]), (
-        "the question must reach the resolver like any other message"
-    )
-
-
-def test_an_error_is_answered_so_the_sender_knows_it_landed(db, core, stub, server, monkeypatch):
-    caller, worker = make_pair(core)
-    suppress_no_op(monkeypatch, server)
-    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-              message="that path does not exist", behavior="[ERROR]")
-
-    server.drain_once(partner_id=worker["id"])
-
-    assert "[MESSAGE-RESPONSE]" in queued_behaviors(db, caller["id"]) or \
-        working(core, caller["id"]) is not None, (
-        "an [ERROR] must be answered"
-    )
+def test_a_query_is_still_answered(db, core, stub):
+    """[ERROR] losing its reply must not take [QUERY]'s with it."""
+    assert core.reply_behavior("[QUERY]") == "[MESSAGE-RESPONSE]"
 
 
 def test_the_exchange_ends_at_the_answer(db, core, stub):
     """One hop, not an endless correction loop."""
     assert core.reply_behavior("[MESSAGE-RESPONSE]") is None
+    assert core.reply_behavior("[TRUTHFUL-REPORT]") is None
+
+
+# ---------------------------------------------------------------------------
+# 5. The drain thread, and the no-work gate.
+# ---------------------------------------------------------------------------
+
+
+def test_interrupting_deletes_the_drain_threads_row(db, core, stub, server):
+    """An interrupted agent has no thread, and no row claiming it has one.
+
+    A row is a claim that a thread is running. After an interruption none is,
+    and a row left behind would make the restart believe a thread already exists
+    and spawn none -- the queue would sit with nobody draining it.
+    """
+    caller, worker = make_pair(core)
+    server.ensure_partner_thread(partner_id=caller["id"])
+    assert db.read_one(
+        "SELECT 1 AS ok FROM drain_threads WHERE partner_id = ?", (caller["id"],)
+    ) is not None, "setup failed: expected a registered thread"
+
+    server.stop_partner_thread(partner_id=caller["id"])
+
+    assert db.read_one(
+        "SELECT 1 AS ok FROM drain_threads WHERE partner_id = ?", (caller["id"],)
+    ) is None, "the row must be deleted, not left claiming a thread that is gone"
+
+
+def test_restarting_puts_a_thread_back(db, core, stub, server):
+    """The other half: a restart is only real if something drains again."""
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="go", behavior="[RESEARCH]")
+    server.stop_partner_thread(partner_id=caller["id"])
+    assert core._is_interrupted(caller["id"])
+
+    server.restart_partner(partner_id=caller["id"])
+
+    assert not core._is_interrupted(caller["id"])
+    assert db.read_one(
+        "SELECT 1 AS ok FROM drain_threads WHERE partner_id = ?", (caller["id"],)
+    ) is not None, "a restarted partner needs a thread to drain what it accumulated"
+
+
+def test_restart_partner_is_a_no_op_on_a_running_agent(db, core, stub, server):
+    caller, worker = make_pair(core)
+    out = server.restart_partner(partner_id=caller["id"])
+    assert "nothing new" in out.lower() or "not interrupted" in out.lower(), out
+
+
+def test_no_work_is_false_while_the_agent_still_has_queued_work(db, core, stub):
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="a", behavior="[RESEARCH]")
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="b", behavior="[RESEARCH]")
+    assert queued_behaviors(db, worker["id"]), "setup failed: expected a queued job"
+
+    assert core.no_work(worker["id"]) is False, (
+        "an agent with something left to drain is not no-work"
+    )
+
+
+def test_no_work_is_false_while_something_it_sent_is_still_queued(db, core, stub):
+    """Work dispatched but not picked up is work whose result it has not seen."""
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="a", behavior="[RESEARCH]")
+    core.send(requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
+              message="b", behavior="[RESEARCH]")
+
+    assert db.read_one(
+        "SELECT 1 AS ok FROM message_queue WHERE caller_id = ?", (caller["id"],)
+    ) is not None, "setup failed: expected one of the caller's sends still queued"
+    assert core.no_work(caller["id"]) is False
+
+
+def test_an_interrupted_dependent_blocks_its_orchestrators_summary(db, core, stub):
+    """Interrupted means waiting on a response, which means not done."""
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+              message="which dataset?", behavior="[QUERY]")
+    assert core._is_interrupted(worker["id"]), "setup failed"
+
+    assert core.no_work(worker["id"]) is False, (
+        "an interrupted agent is waiting on a response and is not finished"
+    )
+
+
+def test_no_work_survives_a_handshake_cycle(db, core, stub):
+    """A->B and B->A are both legal rows. The recursion must still terminate."""
+    caller, worker = make_pair(core)
+    # `make_pair` already opens caller -> worker. Force the reverse row directly:
+    # the handshake capability would refuse it, but nothing stops a cycle
+    # existing in the table, and `no_work` recurses over exactly this edge.
+    db.write(lambda conn: conn.execute(
+        "INSERT INTO handshakes (from_partner, to_partner) VALUES (?, ?)",
+        (worker["id"], caller["id"]),
+    ))
+    db.write(lambda conn: conn.execute(
+        "UPDATE partners SET orchestrator_type = 'bridge-scientist' WHERE id = ?",
+        (worker["id"],),
+    ))
+
+    # Both are orchestrators pointing at each other, so a naive recursion would
+    # not terminate. It must.
+    assert core.no_work(caller["id"]) is True
+    assert core.no_work(worker["id"]) is True
+
+
+# ---------------------------------------------------------------------------
+# 6. Batch send.
+# ---------------------------------------------------------------------------
+
+
+def test_a_batch_accepts_items_until_a_cap_and_keeps_going(db, core, stub):
+    """A refusal is per item, not per batch.
+
+    The `[RESEARCH]` cap is 2 per (caller, label) against one partner. A third
+    to the SAME partner must be refused -- and the item after it, aimed
+    somewhere else, must still land. A batch that aborted on first failure would
+    make the caller reconstruct which of its messages survived.
+    """
+    caller, worker = make_pair(core)
+    other = core.create_partner(
+        project_id=db.read_one("SELECT project_id FROM partners WHERE id = ?",
+                               (worker["id"],))["project_id"],
+        title="second-worker", partner_id_in_remote="r-second", descr="d",
+    )
+    core.handshake(requester_uuid=caller["uuid"], partner_title="second-worker")
+    core.restart(caller["id"])
+
+    result = core.send_batch(requester_uuid=caller["uuid"], items=[
+        {"queried_partner_title": worker["title"], "message": "a", "behavior": "[RESEARCH]"},
+        {"queried_partner_title": worker["title"], "message": "b", "behavior": "[RESEARCH]"},
+        {"queried_partner_title": worker["title"], "message": "c", "behavior": "[RESEARCH]"},
+        {"queried_partner_title": "second-worker", "message": "d", "behavior": "[RESEARCH]"},
+    ])
+
+    assert [a["index"] for a in result["accepted"]] == [0, 1, 3], (
+        f"the capped item should be the only casualty; accepted {result['accepted']}"
+    )
+    assert [r["index"] for r in result["refused"]] == [2]
+    assert result["refused"][0]["code"] == "over_queue"
+
+
+def test_a_batch_reports_an_unknown_target_per_item(db, core, stub):
+    caller, worker = make_pair(core)
+    core.restart(caller["id"])
+
+    result = core.send_batch(requester_uuid=caller["uuid"], items=[
+        {"queried_partner_title": worker["title"], "message": "a", "behavior": "[RESEARCH]"},
+        {"queried_partner_title": "nobody", "message": "b", "behavior": "[RESEARCH]"},
+    ])
+
+    assert [a["index"] for a in result["accepted"]] == [0]
+    assert result["refused"][0]["code"] == "no_such_partner"
+
+
+def test_a_batch_interrupts_the_sender_exactly_once(db, core, stub):
+    """Interruption is a property of the sender, not of a message."""
+    caller, worker = make_pair(core)
+    core.send(requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
+              message="a report", behavior="[TRUTHFUL-REPORT]")
+    assert working(core, caller["id"]) is not None, "setup failed"
+
+    result = core.send_batch(requester_uuid=caller["uuid"], items=[
+        {"queried_partner_title": worker["title"], "message": "a", "behavior": "[RESEARCH]"},
+        {"queried_partner_title": worker["title"], "message": "b", "behavior": "[RESEARCH]"},
+    ])
+
+    assert result["interrupted_sender"] == caller["id"]
+    assert core._is_interrupted(caller["id"])
+    paused = db.read(
+        "SELECT behavior FROM message_queue WHERE partner_id = ? AND in_process = 1",
+        (caller["id"],),
+    )
+    assert len(paused) == 1, (
+        f"the sender's own task should be pushed back ONCE, not once per item: {paused}"
+    )
+
+
+def test_a_batch_of_only_responses_interrupts_nobody(db, core, stub):
+    caller, worker = make_pair(core)
+
+    result = core.send_batch(requester_uuid=worker["uuid"], items=[
+        {"queried_partner_title": caller["title"], "message": "x",
+         "behavior": "[MESSAGE-RESPONSE]"},
+    ])
+
+    assert result["interrupted_sender"] is None
+    assert not core._is_interrupted(worker["id"])
+
+
+def test_a_malformed_item_is_refused_without_stopping_the_batch(db, core, stub):
+    caller, worker = make_pair(core)
+    core.restart(caller["id"])
+
+    result = core.send_batch(requester_uuid=caller["uuid"], items=[
+        {"queried_partner_title": worker["title"]},  # no message, no behavior
+        {"queried_partner_title": worker["title"], "message": "b", "behavior": "[RESEARCH]"},
+    ])
+
+    assert result["refused"][0]["code"] == "malformed_item"
+    assert [a["index"] for a in result["accepted"]] == [1]

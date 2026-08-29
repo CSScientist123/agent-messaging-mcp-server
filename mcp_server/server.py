@@ -541,16 +541,23 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             behavior: One of "[RESEARCH]", "[QUERY]", "[ERROR]",
                 "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]".
 
-                Two of these stop the agent that sends them. A "[QUERY]" or an
-                "[ERROR]" says the sender cannot continue without an answer,
-                so its remote is stopped, whatever it was working on is paused
-                back into its own queue, and the question takes its working
-                slot until the answer arrives. An agent already waiting on one
-                is refused a second: it is stopped, and asking again while
-                stopped is not something it can act on. Nothing else here
-                stops anyone -- stopping a Partner mid-turn is never a
-                decision an agent makes about ANOTHER agent, only about
-                itself.
+                They split in two, and the split decides what happens to YOU.
+
+                REQUESTS -- "[RESEARCH]", "[ERROR]", "[QUERY]" -- interrupt the
+                sender. Sending one says you have handed work away and are
+                waiting on the outcome, so your remote is stopped, whatever you
+                were working on is pushed back into your own queue paused, and
+                your working slot is left EMPTY. You do nothing further until a
+                response arrives. The recipient is not disturbed at all: it
+                finds a job in its queue and drains it in priority order.
+
+                RESPONSES -- "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]" --
+                interrupt nobody, and a response arriving at an interrupted
+                agent is what RESTARTS it.
+
+                So interruption is always about the sender, never a decision one
+                agent makes about another. There is no capability anywhere that
+                stops someone else.
         """
         try:
             result = core.send(
@@ -611,6 +618,13 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
         if polling is not None:
             try:
                 polling.ensure_partner_thread(partner_id=result["partner_id"])
+                # A request interrupts its SENDER, and an interrupted agent has
+                # no drain thread: its slot is empty and its remote is stopped,
+                # so a thread would poll a halted session. Torn down here rather
+                # than left to retire on its own, so the interruption is one
+                # visible act.
+                if result.get("interrupted_sender"):
+                    polling.stop_partner_thread(partner_id=result["interrupted_sender"])
             except Exception:
                 # Arming is an optimisation, not the guarantee -- the supervisor
                 # picks the row up within one interval either way. A receipt already
@@ -628,6 +642,77 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             f"{result['queue_depth']}). {tail}",
             anti_poll=True,
         )
+
+    @mcp.tool()
+    def send_batch(requester_uuid: str, items: list[dict]) -> str:
+        """Send several messages, to several Partners, in one call.
+
+        Each item is an object with `queried_partner_title`, `message` and
+        `behavior` -- the same three fields `send` takes, one per message. The
+        targets may all differ.
+
+        Items are attempted IN ORDER, one at a time, and **an item that fails
+        does not stop the ones after it.** A cap that refuses your third
+        `[RESEARCH]` should not also lose the `[QUERY]` behind it, which has its
+        own cap and its own target. Every refusal comes back with the item's
+        index and the reason, so you can tell exactly which of five messages did
+        not land and why.
+
+        Every rule `send` applies still applies, per item and unchanged:
+        handshakes, the delegation hierarchy, the source flags, and the
+        per-(caller, label) cap. Nothing is relaxed because the messages arrived
+        together.
+
+        You are interrupted AT MOST ONCE, no matter how many requests the batch
+        contains -- interruption is a property of you, not of a message. If
+        every item was a response, you are not interrupted at all.
+
+        Args:
+            requester_uuid: Your own identity.
+            items: The messages to send, each
+                `{"queried_partner_title": ..., "message": ..., "behavior": ...}`.
+        """
+        try:
+            result = core.send_batch(requester_uuid=requester_uuid, items=items)
+        except Rejected as exc:
+            return _rejected_body(exc)
+        except NeedsRemote as exc:
+            return _needs_remote_body(exc)
+        except RemoteFailure as exc:
+            return _remote_failed_body(exc)
+
+        if polling is not None:
+            for item in result["accepted"]:
+                try:
+                    polling.ensure_partner_thread(partner_id=item["partner_id"])
+                except Exception:
+                    pass
+            if result["interrupted_sender"] is not None:
+                try:
+                    polling.stop_partner_thread(partner_id=result["interrupted_sender"])
+                except Exception:
+                    pass
+
+        lines = [
+            f"{len(result['accepted'])} of {len(items)} accepted."
+        ]
+        for item in result["accepted"]:
+            lines.append(
+                f"  [{item['index']}] {item['behavior']} -> queued "
+                f"(depth now {item['queue_depth']})"
+            )
+        for bad in result["refused"]:
+            lines.append(
+                f"  [{bad['index']}] REFUSED {bad['code']}: {bad['message']}"
+                + (" -- but it IS queued; do not resend it"
+                   if bad.get("already_committed") else "")
+            )
+        if result["interrupted_sender"] is not None:
+            lines.append(
+                "You are now interrupted: your slot is empty and your own work is "
+                "paused in your queue. A response restarts you."
+            )
+        return responses.ok("\n".join(lines), anti_poll=True)
 
     @mcp.tool()
     def read(requester_uuid: str, partner_title: str, page: int = 1, page_size: int = 10) -> str:
@@ -777,6 +862,20 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _needs_remote_body(exc)
         except RemoteFailure as exc:
             return _remote_failed_body(exc)
+        # Correcting a permission set IS the restart signal for a partner that
+        # stopped on an approval [ERROR]. That [ERROR] replies with nothing, so
+        # no response message will ever arrive to refill its slot -- this is
+        # what puts it back to work, with whatever it was holding still queued.
+        # A no-op if the partner was not interrupted.
+        if polling is not None:
+            try:
+                target = core._resolve_live_partner_by_title(partner_title)
+                polling.restart_partner(partner_id=target["id"])
+            except Exception:
+                # Same reasoning as arming after send: a receipt already earned
+                # must not become a failure because the restart was slow. The
+                # supervisor picks the queue up either way.
+                pass
         granted = ", ".join(result["granted"]) or "(nothing new)"
         return responses.ok(
             f"Granted to {partner_title!r}: {granted}. "
@@ -812,6 +911,20 @@ def build_server(*, name: str, core: MessagingCore, polling: PollingServer | Non
             return _needs_remote_body(exc)
         except RemoteFailure as exc:
             return _remote_failed_body(exc)
+        # Correcting a permission set IS the restart signal for a partner that
+        # stopped on an approval [ERROR]. That [ERROR] replies with nothing, so
+        # no response message will ever arrive to refill its slot -- this is
+        # what puts it back to work, with whatever it was holding still queued.
+        # A no-op if the partner was not interrupted.
+        if polling is not None:
+            try:
+                target = core._resolve_live_partner_by_title(partner_title)
+                polling.restart_partner(partner_id=target["id"])
+            except Exception:
+                # Same reasoning as arming after send: a receipt already earned
+                # must not become a failure because the restart was slow. The
+                # supervisor picks the queue up either way.
+                pass
         revoked = ", ".join(result["revoked"]) or "(nothing was held)"
         return responses.ok(
             f"Revoked from {partner_title!r}: {revoked}. It now allows "

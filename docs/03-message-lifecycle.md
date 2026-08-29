@@ -184,79 +184,71 @@ over instead of continue.
 
 The row's `body` stays the **original request** throughout, precisely so this holds.
 
-## An agent that cannot continue on its own
+## Interruption belongs to the sender
 
-Any agent — Caller or Partner, it makes no difference — sometimes hits something only
-another one can resolve: a path it was not granted, a question about what was actually
-meant. It sends a `[QUERY]` or an `[ERROR]`, and **that act stops it.**
+An agent that sends a `[RESEARCH]`, `[ERROR]` or `[QUERY]` has handed work away and is
+waiting on the outcome. **That act interrupts it** — not the agent it sent to.
 
-The stopping is the part worth explaining. Without it the next queued message reaches an
-agent that is blocked on an unanswered question, and the two interleave in one context with
-nothing marking where either begins. So `send` does three things for a blocking label, in
-this order: it stops the sender's remote, pushes whatever the sender was working on back
-into the sender's own queue marked `in_process`, and puts the question itself into the
-sender's working slot.
+`send` does four things for a request label, in this order: it stops the sender's remote,
+pushes whatever the sender was working on back into the sender's own queue marked
+`in_process`, empties the sender's working slot, and sets `partners.interrupted`. The
+Polling Server then stops that agent's drain thread and deletes its `drain_threads` row.
 
-There is one condition, not three: the label is `[QUERY]` or `[ERROR]`. Direction does not
-matter, and neither does whether the sender held work. A Caller that asks a question has
-said exactly what a Partner does when it asks one — *I need this before I go on* — and an
-orchestrator that keeps working on other things while blocked is an orchestrator producing
-work it will have to redo. An agent with nothing in flight still needs its wait represented,
-or the next arrival would look like something it can act on.
+**The recipient is not disturbed at all.** It finds a job in its queue and drains it in
+priority order like anything else. There is no capability anywhere for one agent to stop
+another; being stopped is always something you did to yourself by asking.
 
-**The question is the hold.** There is no separate label for stopping. The question sits in
-the slot at its own natural priority — `[QUERY]` and `[ERROR]` are never raised above the 2
-they already hold — and that alone makes it a blocker: only `[TRUTHFUL-REPORT]`, at 1,
-outranks it. Everything else queues behind it.
+There is one condition, not three: the label is a request. Direction does not matter, and
+neither does whether the sender held work. A Caller dispatching work has said the same
+thing a Partner does when it asks a question — *I have handed this off and I am waiting* —
+and an orchestrator that keeps working while its workers run is producing work it will have
+to redo. An agent with nothing in flight is still marked, because it has still said it is
+waiting on something.
 
-Nothing is delivered for a wait. The remote was just stopped; handing it a paragraph would
-give it something to act on when the whole point is that it does nothing until it hears
-back. The drain thread does not poll a waiting agent for completion, does not report
-anything back for it, and the supervisor does not arm a thread for one.
+**An interrupted agent is exactly three things:** an empty working slot, the
+`partners.interrupted` flag, and no drain thread. Nothing occupies the slot in the meantime.
+There is no placeholder task, because a placeholder is a row a reader could mistake for
+work, and one that every count, cap and prompt would then have to exclude by hand.
 
-An agent already waiting is refused a second question, `already_awaiting_an_answer`. It is
-stopped; a question it cannot act on the answer to is not a question.
+The flag is not redundant with the empty slot. A slot is *also* empty between two ordinary
+tasks, and in that state the thread is still running and should promote the next row. The
+emptiness alone cannot tell those apart; the flag is what does.
 
-On the receiving side nothing new is needed. The `[QUERY]` or `[ERROR]` arrives at priority
-2 and goes to the front of everything below it, displacing a running task unless that task
-ties or outranks it — that displacement *is* the interruption on that end. There is no
-capability for one agent to stop another; being stopped is always a consequence of what
-arrives, or of what you yourself sent.
+## What restarts it
 
-## The answer, and what it is folded into
+A **response** — a label whose `reply_behavior IS NULL`, which is `[MESSAGE-RESPONSE]` and
+`[TRUTHFUL-REPORT]`. It takes the empty slot, clears the flag, and the agent runs again. It
+is delivered as an ordinary message, with no special prompt: there is nothing to fold it
+into, because the slot it lands in is empty by construction.
 
-The wait ends when a `[MESSAGE-RESPONSE]` reaches the head of the waiting agent's queue.
-`advance` then does something it does for no other label: it **consumes** the answer's row
-without promoting it as a task, discards the question in the slot (never requeuing it — it
-was asked, and it was answered), and re-reads the head to find what the agent should
-actually do next.
+Two details in the selection, each closing a different failure.
 
-The reason is that a bare response is close to useless as a prompt. An agent handed only
-"the 2024 set" is holding a fact and no instruction, and has to guess whether to resume, to
-wait, or to start something. What it should do next is already decided and sitting at the
-head of its own queue, so the two are delivered as one prompt. Three shapes, from
-`templates.resolution`:
+**It is chosen by label, not taken from the head.** A response does not necessarily outrank
+everything queued — `[MESSAGE-RESPONSE]` is second, so an agent holding a `[TRUTHFUL-REPORT]`
+has a head that is not the answer. Reading the head would find that work, refuse to displace
+an equal-or-better slot, and return nothing on every pass forever: the agent waiting for an
+answer that had already arrived.
 
-| What the head holds | What the agent is told |
-|---|---|
-| a new job | `Resolution attempt on <label> is returned.` / `Response: …` / `Resume your work with this new job: …` |
-| its own paused work | `Resolution attempt on <label> is returned.` / `Response: …` / `Resume your work on: <label>` |
-| nothing | `Resolution attempt on <label> is returned.` / `Response: …` |
+**It must be fresh.** Interrupting pushes the agent's own working task back into its queue,
+so if that task carried a response label the queue now holds a response row. A rule that
+accepted any response would fire on the agent's own pushed-back work — the act of
+interrupting would supply the thing that undoes it. Only a response that *arrived* counts,
+which is why the lookup is scoped to `in_process = 0`.
 
-The last is the one case where a bare response *is* right, because there is nothing to
-attach it to.
+While interrupted, a request arriving is admitted and left in the queue. It is drained after
+the restart, in priority order, like everything else.
 
-## A displaced question is still a question
+## The one route with no response: an approval `[ERROR]`
 
-A `[TRUTHFUL-REPORT]` outranks a waiting agent, so a summary really can take the slot from
-one. The question is not lost: the row that goes back into the queue carries
-`awaiting_resolution = 1`.
+`[ERROR]` replies with nothing. So when a Partner stops on a permission it does not hold and
+the Polling Server reports that upward as an `[ERROR]`, no response will ever come back to
+restart it.
 
-That column earns its place twice. It makes the row outrank everything else in that agent's
-queue, so the wait is what resumes when the summary finishes rather than some job the agent
-cannot do. And it makes the resumed row re-enter the wait — nothing rendered, nothing
-delivered — instead of coming back looking like an ordinary `[QUERY]` a caller had sent, and
-being handed to the agent as work it has already asked.
+The Caller corrects the permissions with `add_permissions` or `delete_permissions`, and
+**that correction is itself the signal**: the Polling Server clears the flag and arms a
+thread, and the Partner resumes with the work it was already holding still queued. The
+Caller is told not to message the Partner back and not to resend the work, because both
+would be duplicates of something the system does on its own.
 
 ## What is stored, and what is only transported
 

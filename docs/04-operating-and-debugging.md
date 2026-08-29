@@ -219,38 +219,47 @@ Check the adapter's own error; each raises a named exception rather than failing
 status(requester_uuid=<the partner's own uuid>)
 ```
 
-A `working` task the Partner sent *itself* — a `[QUERY]` or `[ERROR]` whose `caller_id` is
-the agent it asked — means the Partner stopped itself on a question. Whatever it was doing is
-in the queue, paused:
+An **empty** `working` slot is the symptom, and `partners.interrupted` is what
+distinguishes a stopped agent from one that is merely between tasks:
+
+```sql
+SELECT title, interrupted FROM partners WHERE id = :partner_id;
+```
+
+If `interrupted = 1`, whatever it was doing is in its own queue, paused:
 
 ```sql
 SELECT id, caller_id, behavior, in_process, enqueued_at
-  FROM message_queue WHERE partner_id = :partner_id AND in_process = 1;
-```
-
-**Mitigate.** None needed — the Partner stopped itself, deliberately. Nothing is being lost.
-
-**Diagnose.** A wait is released by exactly one thing: a `[MESSAGE-RESPONSE]` reaching the
-head of this Partner's queue. Not by time, and there is no timeout. So the question is not
-"why is it stuck" but "who owes it an answer" — and that is the agent named by `caller_id` on
-the working task, which is the agent it asked.
-
-To see the question itself, read the `[QUERY]` back out of `messages` (`[QUERY]` is stored;
-`[ERROR]` is not, so a Partner blocked on an `[ERROR]` shows only in `working`).
-
-**Resolve.** That agent answers with a `[MESSAGE-RESPONSE]`. The answer is not delivered on
-its own: `advance` consumes it, discards the question, and folds the response into whatever
-the queue holds next — a new job, the paused task the question interrupted, or nothing at all
-if the queue is empty.
-
-If a `[TRUTHFUL-REPORT]` displaced the wait, the question is in the queue with
-`awaiting_resolution = 1`. That is not a stall: it outranks everything else in that queue and
-re-enters the wait when the summary finishes.
-
-```sql
-SELECT id, caller_id, behavior, in_process, awaiting_resolution, enqueued_at
   FROM message_queue WHERE partner_id = :partner_id ORDER BY id;
 ```
+
+**Mitigate.** None needed — the Partner interrupted itself by sending a request, which is
+what it is supposed to do. Nothing is being lost; everything it held is in that queue.
+
+**Diagnose.** An interruption is released by exactly one thing: a **fresh response** —
+`[MESSAGE-RESPONSE]` or `[TRUTHFUL-REPORT]` — arriving in this Partner's queue. Not by time,
+and there is no timeout. So the question is not "why is it stuck" but "who owes it a
+response", and that is whoever it sent its request to. Find that from `messages`:
+
+```sql
+SELECT to_partner, behavior, created_at FROM messages
+ WHERE from_partner = :partner_id ORDER BY id DESC LIMIT 5;
+```
+
+Note that a `[QUERY]` is stored and an `[ERROR]` is not, so a Partner that stopped on an
+`[ERROR]` leaves no row here — its queue is the record.
+
+Also confirm it has **no drain thread**, which it should not:
+
+```sql
+SELECT 1 FROM drain_threads WHERE partner_id = :partner_id;
+```
+
+A row here alongside `interrupted = 1` is a genuine inconsistency: it claims a thread is
+running for an agent that should have none, and a restart would see it and spawn nothing.
+
+**Resolve.** Whoever owes the response sends one, and the Partner restarts on its own — the
+response takes the empty slot, the flag clears, and a thread is armed.
 
 If the interruption was caused by a permission prompt, correct the grant first — that is what
 the doctrine in `docs/05` §20 requires, and sending work again without correcting it produces

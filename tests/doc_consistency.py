@@ -321,14 +321,23 @@ for fn in sorted(tmpl):
 #    render is NOT proof a diagram is right, so this is checked rather than
 #    eyeballed. Bracketed and quoted labels are safe, which is why this looks
 #    only at the `:` transition form.
+#    The same footgun exists in a sequenceDiagram message, where it is worse:
+#    there it is a hard parse error, so the render fails rather than quietly
+#    producing nonsense. Both are checked here so neither reaches a commit.
 for _name, _text in sorted(MMD.items()):
-    if "stateDiagram" not in _text:
-        continue
-    for _line in _text.splitlines():
-        if "-->" in _line and ":" in _line.split("-->", 1)[1] and ";" in _line:
-            check(False, f"mmd/state-label/{_name}",
-                  "a ';' in a state transition label splits it into phantom "
-                  f"states: {_line.strip()[:80]}")
+    if "stateDiagram" in _text:
+        for _line in _text.splitlines():
+            if "-->" in _line and ":" in _line.split("-->", 1)[1] and ";" in _line:
+                check(False, f"mmd/state-label/{_name}",
+                      "a ';' in a state transition label splits it into phantom "
+                      f"states: {_line.strip()[:80]}")
+    if "sequenceDiagram" in _text:
+        for _line in _text.splitlines():
+            _stripped = _line.strip()
+            if re.match(r"^\w+\s*-+>>?\s*\w+\s*:", _stripped) and ";" in _stripped:
+                check(False, f"mmd/sequence-message/{_name}",
+                      "a ';' in a sequence message is a statement separator and "
+                      f"fails the parse outright: {_stripped[:80]}")
 
 # 6. A rendered image that disagrees with its source is worse than no image: it
 #    reads as authoritative and it is wrong, and nobody re-reads the .mmd to

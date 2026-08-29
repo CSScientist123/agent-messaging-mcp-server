@@ -456,44 +456,15 @@ class _RecordingEvent:
         return self._set
 
 
-def test_a_waiting_agent_waits_instead_of_spinning(db, core, server):
-    """A waiting Partner is deliberately stopped and has nothing to poll.
 
-    `drain_once` returns False for an agent awaiting an answer -- correctly,
-    since the queue may hold the work its question displaced, so the thread
-    must not retire. But the loop then waited a QUARTER of the poll interval,
-    which at the default is a wake-up roughly sixteen times a second, forever,
-    for a Partner that will not change until the answer arrives.
+def test_the_drain_loop_has_one_cadence(db, core, server):
+    """One polling cadence now, not two.
+
+    The coarse `hold_interval` existed only for an agent waiting on its own
+    question -- a state that no longer exists. An interrupted agent has no drain
+    thread at all, so there is nothing left to poll slowly, and the second
+    cadence went with the model that needed it.
     """
-    caller = make_orchestrator(core)
-    worker = make_worker(core, caller, "science_")
-    # The worker asks its caller a question and is stopped by it, with nothing
-    # queued behind it. That is what makes the wait PERSIST: the answer would
-    # end it immediately, and this is the state that used to spin.
-    core.send(
-        requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-        message="which dataset?", behavior="[QUERY]",
-    )
-    working = core.working_task(partner_id=worker["id"])
-    assert working is not None and working["awaiting_resolution"], (
-        f"setup failed: expected the worker to be waiting on its own [QUERY], got {working}"
-    )
-    assert queued_behaviors(db, worker["id"]) == [], (
-        "setup failed: a queued task would change what the loop does"
-    )
-
-    event = _RecordingEvent(stop_after=2)
-    server._drain_loop(worker["id"], event)
-
-    assert event.waits, "the loop should have waited at least once"
-    assert all(w == server.hold_interval for w in event.waits), (
-        f"a wait must poll at hold_interval ({server.hold_interval}s), not a fraction "
-        f"of the poll interval; recorded waits: {event.waits}"
-    )
-
-
-def test_a_working_partner_is_still_polled_at_the_poll_interval(db, core, server):
-    """The slow path is for waits only -- real work must not be slowed down."""
     caller = make_orchestrator(core)
     worker = make_worker(core, caller, "science_")
     core.send(
@@ -501,12 +472,16 @@ def test_a_working_partner_is_still_polled_at_the_poll_interval(db, core, server
         message="investigate x", behavior="[RESEARCH]",
     )
     working = core.working_task(partner_id=worker["id"])
-    assert working is not None and working["behavior"] != "[IDLE]"
+    assert working is not None, "setup failed: the worker should be holding the task"
 
     event = _RecordingEvent(stop_after=1)
     server._drain_loop(worker["id"], event)
 
     assert event.waits, "the loop should have waited at least once"
-    assert all(w != server.hold_interval for w in event.waits), (
-        f"a working partner must not be polled at the hold interval; waits: {event.waits}"
+    expected = max(server.poll_interval / 4, 0.0)
+    assert all(w == expected for w in event.waits), (
+        f"every wait should be poll_interval/4 ({expected}s); waits: {event.waits}"
+    )
+    assert not hasattr(server, "hold_interval"), (
+        "hold_interval should be gone -- there is no slow path any more"
     )

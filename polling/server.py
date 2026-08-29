@@ -90,8 +90,11 @@ How to resolve it:
 - Call get_permissions for {title} to see what that conversation currently allows.
 - Call add_permissions (or delete_permissions) so the set covers the work you
   asked for. Write paths must include files that do not exist yet.
-- Then send the work again. Correcting the grant and sending again IS the
-  resumption; there is nothing else to resume.
+
+That is all. Do NOT message {title} back and do NOT send the work again -- an
+[ERROR] expects no reply, and correcting the grant is itself the signal. The
+Polling Server sees the permissions change and restarts {title} on its own, with
+the work it was already holding still queued.
 """
 
 
@@ -114,17 +117,11 @@ class PollingServer:
         poll_interval: float = 0.25,
         core: MessagingCore | None = None,
         supervisor_interval: float = 1.0,
-        hold_interval: float = 2.0,
     ) -> None:
         self.db = db
         self.extensions = extensions
         self.poll_interval = poll_interval
         self.supervisor_interval = supervisor_interval
-        #: How long a drain thread waits between passes while the agent is
-        #: waiting on its own unanswered question. Deliberately coarser than
-        #: `poll_interval` -- see the wait call in `_drain_loop` for why a slow
-        #: poll is safe here.
-        self.hold_interval = hold_interval
         # One core, holding the slots every per-source view shares.
         self.core = core if core is not None else MessagingCore(db)
 
@@ -225,6 +222,54 @@ class PollingServer:
         partner = self.db.read_one("SELECT uuid FROM partners WHERE id = ?", (partner_id,))
         label = partner["uuid"] if partner is not None else str(partner_id)
         return self._ensure_thread(partner_id, label)
+
+    def stop_partner_thread(self, *, partner_id: int) -> bool:
+        """Tear a partner's drain thread down because it has been interrupted.
+
+        An interrupted agent has an empty working slot and nothing to poll: its
+        remote was stopped as the interruption took effect, and everything it
+        held is back in its queue. A thread left running would wake, find an
+        empty slot, decide it is idle, and retire on its own -- but it would
+        also DELETE the `drain_threads` row on the way out via the ordinary
+        retirement path, which is the same outcome by a slower and less obvious
+        route. Doing it here makes the interruption a single visible act.
+
+        The row is deleted rather than left: a row is a claim that a thread is
+        running, and after an interruption none is. That is the same rule
+        retirement follows, and the deliberate opposite of `stop()`, which
+        leaves rows precisely so a restarting process can re-arm them.
+
+        Returns whether a live thread was actually signalled.
+        """
+        with self._lock:
+            event = self._stop_flags.get(partner_id)
+            thread = self._drain_threads.pop(partner_id, None)
+            self._stop_flags.pop(partner_id, None)
+        if event is not None:
+            event.set()
+        self.db.write(lambda conn: conn.execute(
+            "DELETE FROM drain_threads WHERE partner_id = ?", (partner_id,)
+        ))
+        logger.info("stopped the drain thread for interrupted partner %s", partner_id)
+        return thread is not None and thread.is_alive()
+
+    def restart_partner(self, *, partner_id: int) -> str:
+        """Clear a partner's interrupted mark and put a drain thread back.
+
+        The route out of an approval `[ERROR]`. An `[ERROR]` replies with
+        nothing, so no response message will arrive to refill the slot -- the
+        Caller corrects the permissions and that correction IS the signal. This
+        is what turns it into a running agent again: the flag is cleared, a
+        thread is armed, and the thread promotes whatever the queue holds.
+
+        A no-op on an agent that is not interrupted, so it is safe to call from
+        any permission change.
+        """
+        if not self.core.restart(partner_id):
+            return responses.nothing_new(
+                f"partner {partner_id} was not interrupted; nothing to restart"
+            )
+        return self.ensure_partner_thread(partner_id=partner_id)
 
     def _ensure_thread(self, partner_id: int, label: str) -> str:
         # Resolved and checked BEFORE anything is spawned or written. Two live
@@ -378,28 +423,7 @@ class PollingServer:
                             retire = False
                             return
                     continue
-                held_task = self.core.slots.get(partner_id)
-                if held_task is not None and held_task.get("awaiting_resolution"):
-                    # A wait is not something this thread waits to change --
-                    # it is something SOMEBODY ELSE changes. The message that
-                    # ends a wait is delivered by whoever answers: `send`
-                    # calls `advance()` directly, which consumes the answer
-                    # and delivers what comes next in the sender's own call,
-                    # synchronously. So this loop is never racing to notice a
-                    # resume; it is only re-checking a slot that, if it has
-                    # changed at all, already changed before this wait even
-                    # started. Polling it 16x/second, forever, for a
-                    # partner deliberately stopped and with nothing to poll,
-                    # bought nothing but wakeups.
-                    #
-                    # `hold_interval` is still kept small rather than backed
-                    # off indefinitely, though: once the swap DOES happen,
-                    # this is the only thread that will ever poll the new
-                    # task for completion, and a long sleep taken right
-                    # before that swap would delay noticing it.
-                    stop_event.wait(self.hold_interval)
-                else:
-                    stop_event.wait(max(self.poll_interval / 4, 0.0))
+                stop_event.wait(max(self.poll_interval / 4, 0.0))
             # Left because stop() asked, not because the work ran out.
             retire = False
         finally:
@@ -428,18 +452,6 @@ class PollingServer:
                 "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id = ?", (partner_id,)
             )["n"]
             return depth == 0
-
-        if task.get("awaiting_resolution"):
-            # The agent asked a blocking question and is stopped until it is
-            # answered. There is nothing to poll for and nothing to report: it
-            # is not running, and its own remote has no idea it is waiting.
-            #
-            # Retiring here would be wrong -- the queue holds the work this
-            # question displaced, and the answer that clears it arrives as an
-            # ordinary message. So the thread waits, and each pass calls
-            # `advance`, which is what notices the answer and folds it into
-            # whatever the agent should do next.
-            return False
 
         extension = core.extension
         remote_id = self._partner_remote_id(partner_id)
@@ -636,6 +648,25 @@ class PollingServer:
         back to the Caller.
         """
         if task["behavior"] == "[RESEARCH]":
+            # A summary is only asked for once NO-WORK holds: this agent's own
+            # queue is empty, nothing it dispatched is still queued anywhere,
+            # and every dependent has summarized or is itself no-work.
+            #
+            # A summary written while work is still moving underneath describes
+            # a situation that has already changed. `[TRUTHFUL-REPORT]` outranks
+            # `[MESSAGE-RESPONSE]`, so without this gate an orchestrator would
+            # summarize over the top of answers still arriving from the workers
+            # it is summarizing.
+            #
+            # Not finished means not summarized: the task stays in the slot and
+            # the next pass asks again. The drain loop keeps polling, so this is
+            # a wait rather than a refusal.
+            if not core.no_work(partner_id):
+                logger.debug(
+                    "partner %s finished its [RESEARCH] but is not no-work yet; "
+                    "deferring the summary request", partner_id,
+                )
+                return
             prompt = core.begin_summary_phase(partner_id=partner_id)
             if prompt is not None:
                 try:
@@ -756,16 +787,11 @@ class PollingServer:
         # and a thread can also die), a queue-only scan would look straight
         # past a remote that is working with nobody watching it.
         #
-        # An agent WAITING on its own question is the exception. Its remote was
-        # stopped when it asked, so there is no turn to harvest and no
-        # completion to notice -- a thread armed for it would poll a halted
-        # session forever. What ends the wait is the answer, and an answer is a
-        # queued row: it arms this partner through the branch above, in
-        # whichever process owns the remote.
+        # An INTERRUPTED agent has an empty slot, so it never appears here at
+        # all -- and that is correct. Its remote was stopped when it sent its
+        # request, so there is no turn to harvest; what restarts it is a response
+        # arriving, which is a queued row and arms it through the branch above.
         for partner_id in self.core.slots.occupied():
-            task = self.core.slots.get(partner_id)
-            if task is not None and task.get("awaiting_resolution"):
-                continue
             candidates.setdefault(partner_id, str(partner_id))
 
         armed = 0

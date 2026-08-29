@@ -448,15 +448,20 @@ at once — and **a column exists to be maintained.**
 _ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("message_queue", "summary_phase INTEGER NOT NULL DEFAULT 0 CHECK (summary_phase IN (0, 1))"),
     ("message_queue", "origin_behavior TEXT REFERENCES label_caps(behavior)"),
-    ("message_queue",
-     "awaiting_resolution INTEGER NOT NULL DEFAULT 0 "
-     "CHECK (awaiting_resolution IN (0, 1))"),
+    ("partners",
+     "interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1))"),
 )
 ```
 
-All three entries are on `message_queue`, and all three are **also** declared in
-`schema.sql`. On a fresh database this is a no-op; the list exists for databases
-created before each column was added.
+Every entry is also declared in `schema.sql`. On a fresh database this is a no-op;
+the list exists for databases created before each column was added.
+
+**And it shows you what this migration cannot do.** `message_queue` once carried a
+column called `awaiting_resolution`, from a design that is gone. A database created
+while it existed still has it — because this list is additive only and never
+`DROP`s. The column sits there, defaulted to 0, read by nothing. That is harmless,
+and removing it would need a real migration rather than another entry here, which is
+precisely the boundary the next paragraph draws.
 
 The scope statement is the part to internalise:
 

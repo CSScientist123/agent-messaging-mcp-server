@@ -581,8 +581,8 @@ def test_status_reports_queued_breakdown_highest_priority_first_and_paused(core,
     assert result["queue_depth"] == 3, f"expected queue_depth 3, got {result['queue_depth']}"
 
     behaviors_in_order = [q["behavior"] for q in result["queued"]]
-    assert behaviors_in_order == ["[QUERY]", "[MESSAGE-RESPONSE]", "[RESEARCH]"], (
-        f"expected queued ordered highest-priority-first (2, 3, 4), got {behaviors_in_order} "
+    assert behaviors_in_order == ["[MESSAGE-RESPONSE]", "[QUERY]", "[RESEARCH]"], (
+        f"expected queued ordered highest-priority-first (2, 4, 5), got {behaviors_in_order} "
         f"from {result['queued']!r}"
     )
     by_behavior = {q["behavior"]: q for q in result["queued"]}
@@ -1557,9 +1557,10 @@ def test_reply_behavior_matches_label_caps(core):
     cases = {
         "[RESEARCH]": "[TRUTHFUL-REPORT]",
         "[QUERY]": "[MESSAGE-RESPONSE]",
-        # An [ERROR] is answered like any other question. A Caller that corrects
-        # a blocked Partner otherwise has no way to know the correction landed.
-        "[ERROR]": "[MESSAGE-RESPONSE]",
+        # An [ERROR] expects NOTHING back. A reply to it carries nothing the
+        # sender could use; what resumes the work is the drain thread finding
+        # the paused row still marked in_process.
+        "[ERROR]": None,
         "[IDLE]": None,
         "[TRUTHFUL-REPORT]": None,
         "[MESSAGE-RESPONSE]": None,
@@ -1825,7 +1826,6 @@ def test_a_partner_on_an_uncancellable_remote_can_still_be_displaced(core, db, m
     # [QUERY] stops the asker, and the asker here holds no working task, hence
     # the None. The second is the displacement this test is about.
     assert core.uncancelled_displacements == [
-        (caller["id"], None, "[QUERY]"),
         (worker["id"], "[RESEARCH]", "[QUERY]"),
     ], (
         "a displacement that could not stop the previous turn must be recorded, because "
