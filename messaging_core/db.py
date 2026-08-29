@@ -55,6 +55,9 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("message_queue",
      "awaiting_resolution INTEGER NOT NULL DEFAULT 0 "
      "CHECK (awaiting_resolution IN (0, 1))"),
+    ("messages", "response_datetime TEXT"),
+    ("label_caps",
+     "is_request INTEGER NOT NULL DEFAULT 0 CHECK (is_request IN (0, 1))"),
 )
 
 
