@@ -1543,8 +1543,11 @@ class MessagingCore:
         rows = self.db.read(
             """
             SELECT m.id AS id, m.behavior AS behavior, m.body AS body, m.created_at AS created_at,
-                   p.title AS from_title
+                   m.response_datetime AS response_datetime,
+                   p.title AS from_title,
+                   r.body AS response_body
             FROM messages m JOIN partners p ON p.id = m.from_partner
+            LEFT JOIN message_response r ON r.message_id = m.id
             WHERE m.to_partner = ?
             ORDER BY m.id DESC
             LIMIT ? OFFSET ?
@@ -1558,6 +1561,12 @@ class MessagingCore:
                 "behavior": r["behavior"],
                 "body": r["body"],
                 "created_at": r["created_at"],
+                # LEFT JOIN, so an unanswered request still appears -- with its
+                # answer as None rather than being absent. `read` exists so an
+                # agent can recover context it has lost, and a question without
+                # its answer is half the context.
+                "response": r["response_body"],
+                "response_datetime": r["response_datetime"],
             }
             for r in rows
         ]

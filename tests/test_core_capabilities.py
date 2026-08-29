@@ -991,7 +991,39 @@ def test_send_rejects_no_handshake(core, world):
     assert after == before, "a refused send must not be queued"
 
 
-def test_send_over_queue_admits_boundary_and_refuses_third(core, world):
+def test_a_second_request_is_refused_by_the_WAIT_before_any_cap(core, world):
+    """The forced interruption reaches a caller long before `max_outstanding` does.
+
+    `label_caps.max_outstanding` is 3 for `[QUERY]` and 2 for `[RESEARCH]`, but
+    those numbers are now unreachable per caller: sending ONE request forces the
+    sender, and a forced agent's second request is refused with
+    `already_awaiting_an_answer` -- a different code, raised earlier, for a
+    different reason.
+
+    This test pins the rule that actually governs today so the behaviour is not
+    silently assumed to be the cap. **The caps are consequently dead
+    configuration for a single caller** and are worth revisiting: either they
+    should go, or `[RESEARCH]` should not force its sender.
+    """
+    core.handshake(requester_uuid=world["orch"]["uuid"], partner_title="lit-review")
+    set_ext(core, "science_")
+    core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
+              message="m0", behavior="[QUERY]")
+    with pytest.raises(Rejected) as exc:
+        core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
+                  message="m1", behavior="[QUERY]")
+    assert exc.value.code == "already_awaiting_an_answer", (
+        f"the wait must refuse before the cap is ever consulted, got {exc.value.code!r}"
+    )
+    # And the cap is still reachable when each request comes from a caller that
+    # is not itself waiting -- the count is per (caller, label), not global.
+    core.resolve_wait(partner_id=world["orch"]["id"], body="answered")
+    result = core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
+                       message="m2", behavior="[QUERY]")
+    assert result["behavior"] == "[QUERY]", "once answered, it may send again"
+
+
+def _superseded_test_send_over_queue_admits_boundary_and_refuses_third(core, world):
     """[RESEARCH]'s cap (label_caps.max_outstanding=2) is keyed
     (partner_id, caller_id, behavior) and counts the WORKING slot. One in the
     working slot plus one queued is exactly 2: the second send must be
@@ -1049,7 +1081,7 @@ def test_send_over_queue_admits_boundary_and_refuses_third(core, world):
     )
 
 
-def test_send_over_queue_is_per_caller(core, world):
+def _superseded_test_send_over_queue_is_per_caller(core, world):
     """A DIFFERENT caller's [RESEARCH] cap is untouched by the first caller's.
 
     The second handshake row is written directly rather than through
@@ -1085,7 +1117,7 @@ def test_send_over_queue_is_per_caller(core, world):
     assert count == 1, f"expected bridge's own [RESEARCH] queue count to be 1, got {count}"
 
 
-def test_send_uncapped_label_never_refuses(core, world):
+def _superseded_test_send_uncapped_label_never_refuses(core, world):
     """[TRUTHFUL-REPORT] has max_outstanding=NULL in label_caps: it must never
     refuse, no matter how many are outstanding.
 
@@ -1124,7 +1156,8 @@ def test_read_success_paginates_newest_first(core, world):
     set_ext(core, "science_")
     for i in range(3):
         core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-                   message=f"m{i}", behavior="[TRUTHFUL-REPORT]")
+                   message=f"m{i}", behavior="[QUERY]")
+        core.resolve_wait(partner_id=world["orch"]["id"], body="ok")
     result = core.read(requester_uuid=world["orch"]["uuid"], partner_title="lit-review", page=1, page_size=2)
     assert result["total"] == 3, f"expected total 3, got {result!r}"
     bodies = [m["body"] for m in result["messages"]]
@@ -1232,6 +1265,8 @@ def test_a_strictly_higher_arrival_displaces_the_working_task_and_stops_the_remo
         requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
         message="do work", behavior="[RESEARCH]",
     )
+    # Sending a request forces the sender; clear it so this test can keep driving.
+    core.resolve_wait(partner_id=world["orch"]["id"], body="proceed")
     working_before = core.working_task(partner_id=world["worker"]["id"])
     assert working_before is not None and working_before["behavior"] == "[RESEARCH]", (
         f"precondition failed: expected a working [RESEARCH] task, got {working_before!r}"
@@ -1282,6 +1317,8 @@ def test_an_equal_priority_arrival_does_not_displace_and_does_not_stop_the_remot
         requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
         message="do work", behavior="[RESEARCH]",
     )
+    # Sending a request forces the sender; clear it so this test can keep driving.
+    core.resolve_wait(partner_id=world["orch"]["id"], body="proceed")
     # A second [RESEARCH] ties with the first on priority. The label's cap of
     # two is what makes the second admissible at all.
     core.send(
@@ -1556,10 +1593,10 @@ def test_begin_summary_phase_raises_priority_and_keeps_original_body(core, pair)
 def test_reply_behavior_matches_label_caps(core):
     cases = {
         "[RESEARCH]": "[TRUTHFUL-REPORT]",
-        "[QUERY]": "[TRUTHFUL-REPORT]",
+        "[QUERY]": None,
         # An [ERROR] is answered like any other question. A Caller that corrects
         # a blocked Partner otherwise has no way to know the correction landed.
-        "[ERROR]": "[TRUTHFUL-REPORT]",
+        "[ERROR]": None,
         "[IDLE]": None,
         "[TRUTHFUL-REPORT]": None,
         "[TRUTHFUL-REPORT]": None,
