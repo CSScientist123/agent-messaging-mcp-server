@@ -378,8 +378,11 @@ class PollingServer:
                             retire = False
                             return
                     continue
-                held_task = self.core.slots.get(partner_id)
-                if held_task is not None and held_task.get("awaiting_resolution"):
+                # A forced interruption leaves the slot EMPTY, so the wait is
+                # read from the flag rather than from a task that no longer
+                # exists. Keying on a slot occupant here used to work only
+                # because the question was parked IN the slot; now it is not.
+                if self.core.slots.is_forced(partner_id):
                     # A wait is not something this thread waits to change --
                     # it is something SOMEBODY ELSE changes. The message that
                     # ends a wait is delivered by whoever answers: `send`
@@ -449,6 +452,12 @@ class PollingServer:
             depth = self.db.read_one(
                 "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id = ?", (partner_id,)
             )["n"]
+            # A forced interruption is NOT a reason to retire. The slot is empty
+            # and the queue may be too, which looks exactly like "nothing to do"
+            # -- but the agent is waiting on an answer, and retiring here would
+            # take away the thread that has to notice it arriving.
+            if self.core.slots.is_forced(partner_id):
+                return False
             return depth == 0
 
         if task.get("awaiting_resolution"):
@@ -728,9 +737,33 @@ class PollingServer:
         # window where the next turn can start against a remote whose previous
         # output has not been fetched -- and what comes back then belongs to
         # neither turn.
-        body = self._read_result(extension, remote_id) if reply is not None else None
+        needs_body = reply is not None or bool(task.get("is_request_reply", True))
+        body = self._read_result(extension, remote_id) if needs_body else None
 
         released = core.release(partner_id=partner_id)
+
+        # A finished REQUEST whose sender is still waiting is answered through
+        # `resolve_wait`, not through the queue. That is the whole point of
+        # dropping [MESSAGE-RESPONSE] as a label: the answer is not a message, so
+        # it does not queue, does not compete on priority, and cannot be
+        # outranked by the very work it unblocks.
+        #
+        # `reply_behavior` is NULL for [QUERY] and [ERROR] precisely so this
+        # branch is the only way their answers travel.
+        if reply is None and released is not None and body is not None:
+            caller_id = released["caller_id"]
+            if core.slots.is_forced(caller_id):
+                core.resolve_wait(
+                    partner_id=caller_id, body=body, from_partner_id=partner_id,
+                )
+                caller = self.db.read_one(
+                    "SELECT uuid FROM partners WHERE id = ? AND archived_at IS NULL",
+                    (caller_id,),
+                )
+                if caller is not None:
+                    self._ensure_thread(caller_id, caller["uuid"])
+                return
+
         if reply is None or released is None:
             # [ERROR], [MESSAGE-RESPONSE] and [TRUTHFUL-REPORT] arriving as
             # deliveries are answers already. Replying to an answer is how two
@@ -742,6 +775,17 @@ class PollingServer:
             behavior=reply,
             body=body,
         )
+        # A labelled answer -- today only [TRUTHFUL-REPORT], answering a
+        # [RESEARCH]. It goes through the queue like any message, AND it lifts
+        # the force, because the caller has now had the thing it was waiting for.
+        # Without the lift the report would sit in a queue whose slot is held
+        # shut by the very request the report answers.
+        if core.slots.is_forced(released["caller_id"]):
+            core.resolve_wait(
+                partner_id=released["caller_id"], body=body or "",
+                from_partner_id=partner_id,
+            )
+
         caller = self.db.read_one(
             "SELECT uuid FROM partners WHERE id = ? AND archived_at IS NULL",
             (released["caller_id"],),
@@ -798,9 +842,11 @@ class PollingServer:
         # queued row: it arms this partner through the branch above, in
         # whichever process owns the remote.
         for partner_id in self.core.slots.occupied():
-            task = self.core.slots.get(partner_id)
-            if task is not None and task.get("awaiting_resolution"):
-                continue
+            candidates.setdefault(partner_id, str(partner_id))
+        # A forced interruption has an EMPTY slot, so `occupied()` does not see
+        # it -- but such a partner still needs a thread, because the answer that
+        # lifts the force has to be noticed by somebody.
+        for partner_id in self.core.slots.forced():
             candidates.setdefault(partner_id, str(partner_id))
 
         armed = 0

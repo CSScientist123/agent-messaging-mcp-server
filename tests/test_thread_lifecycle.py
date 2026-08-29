@@ -155,6 +155,11 @@ def queue_one(core: MessagingCore, caller: dict, worker: dict, source_prefix: st
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
         message="what is x?", behavior="[QUERY]",
     )
+    # The send forces its sender. These tests are about which partners a process
+    # will DRAIN, not about who is waiting, so clear the caller's interruption --
+    # otherwise the supervisor legitimately arms a thread for it and the counts
+    # measure something else.
+    core.resolve_wait(partner_id=caller["id"], body="answered")
     core.extension = StubExtension(source_prefix="science_")
 
 
@@ -474,9 +479,11 @@ def test_a_waiting_agent_waits_instead_of_spinning(db, core, server):
         requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
         message="which dataset?", behavior="[QUERY]",
     )
-    working = core.working_task(partner_id=worker["id"])
-    assert working is not None and working["awaiting_resolution"], (
-        f"setup failed: expected the worker to be waiting on its own [QUERY], got {working}"
+    assert core.working_task(partner_id=worker["id"]) is None, (
+        "a forced interruption leaves the slot EMPTY -- that is what it means"
+    )
+    assert core.slots.is_forced(worker["id"]), (
+        "setup failed: expected the worker to be forced on its own [QUERY]"
     )
     assert queued_behaviors(db, worker["id"]) == [], (
         "setup failed: a queued task would change what the loop does"
