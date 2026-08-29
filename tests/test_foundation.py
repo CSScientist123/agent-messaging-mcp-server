@@ -350,7 +350,7 @@ def test_the_blocking_labels_are_the_two_that_stop_their_sender():
     # Sending either stops the sender and gives its slot to the question. They
     # are ordinary labels an agent may send -- there is no separate hold label
     # any more, so both must be ones validate_behavior accepts.
-    assert set(BLOCKING_BEHAVIORS) == {"[QUERY]", "[ERROR]"}
+    assert set(BLOCKING_BEHAVIORS) == {"[QUERY]", "[ERROR]", "[RESEARCH]"}
     for behavior in BLOCKING_BEHAVIORS:
         validate_behavior(behavior)  # must not raise
 
@@ -362,7 +362,7 @@ def test_there_is_no_hold_label():
         validate_behavior("[IDLE]")
 
 
-def test_behaviors_contains_exactly_the_five_labels_the_design_names():
+def test_behaviors_contains_exactly_the_four_labels_the_design_names():
     # Membership, not order or count-as-shape: what matters behaviourally is
     # that every label the rest of the system refers to by name is one
     # validate_behavior will accept, and nothing else sneaks in.
@@ -370,12 +370,72 @@ def test_behaviors_contains_exactly_the_five_labels_the_design_names():
         "[TRUTHFUL-REPORT]",
         "[QUERY]",
         "[ERROR]",
-        "[MESSAGE-RESPONSE]",
         "[RESEARCH]",
     ):
         assert name in BEHAVIORS
         validate_behavior(name)
-    assert len(BEHAVIORS) == 5
+    assert len(BEHAVIORS) == 4
+
+
+def test_the_python_label_tuples_agree_with_label_caps():
+    """`labels.py` mirrors `label_caps`; a mirror that can drift is a second opinion.
+
+    `REQUEST_BEHAVIORS` exists so the hot path need not query for a fact the
+    table already holds. That is only safe while the two agree, so the agreement
+    is asserted rather than assumed -- a divergence is a failing test, not a
+    silent second authority.
+    """
+    import sqlite3
+    from messaging_core.config import schema_path
+    from messaging_core.labels import REQUEST_BEHAVIORS, SHORTCUT_BEHAVIORS
+
+    db = sqlite3.connect(":memory:")
+    db.executescript(schema_path().read_text())
+
+    live = tuple(r[0] for r in db.execute(
+        "SELECT behavior FROM label_caps ORDER BY priority"))
+    assert BEHAVIORS == live, (
+        f"labels.BEHAVIORS is {BEHAVIORS}, label_caps holds {live} in priority order"
+    )
+
+    live_requests = {r[0] for r in db.execute(
+        "SELECT behavior FROM label_caps WHERE is_request = 1")}
+    assert set(REQUEST_BEHAVIORS) == live_requests, (
+        f"REQUEST_BEHAVIORS is {set(REQUEST_BEHAVIORS)}, "
+        f"label_caps says is_request=1 for {live_requests}"
+    )
+
+    # The shortcut set is deliberately NARROWER than the request set: [RESEARCH]
+    # is a request but has no business on a channel meant for mid-task
+    # clarification. Assert the containment so a future label added to one is a
+    # deliberate decision about the other rather than an accident.
+    assert set(SHORTCUT_BEHAVIORS) < set(REQUEST_BEHAVIORS), (
+        "the shortcut set must be a strict subset of the request set"
+    )
+    assert "[RESEARCH]" not in SHORTCUT_BEHAVIORS
+
+
+def test_every_label_has_a_distinct_priority():
+    """The [QUERY]/[ERROR] tie is gone, and something depends on it staying gone.
+
+    While two labels shared a rank, "same priority" was wider than "same label"
+    and the head read had to be careful about it. With every rank distinct, the
+    two phrases mean the same set -- which is what lets the tie-break be stated
+    without an exception.
+    """
+    import sqlite3
+    from messaging_core.config import schema_path
+    db = sqlite3.connect(":memory:")
+    db.executescript(schema_path().read_text())
+    rows = db.execute("SELECT behavior, priority FROM label_caps ORDER BY priority").fetchall()
+    priorities = [p for _, p in rows]
+    assert len(set(priorities)) == len(priorities), (
+        f"two labels share a priority, so 'same priority' is wider than 'same "
+        f"label' again: {rows}"
+    )
+    assert [b for b, _ in rows] == [
+        "[TRUTHFUL-REPORT]", "[ERROR]", "[QUERY]", "[RESEARCH]"
+    ], f"the ladder is not in the designed order: {rows}"
 
 
 # ---------------------------------------------------------------------------

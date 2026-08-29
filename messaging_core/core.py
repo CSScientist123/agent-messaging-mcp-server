@@ -2253,16 +2253,22 @@ class MessagingCore:
         project = self._project_by_id(partner["project_id"])
         lock = self.slots.lock_for(partner_id)
         with lock:
-            label = self.db.read_one(_HEAD_LABEL_SQL, {"pid": partner_id})
-            if label is None:
+            # A forced interruption is checked BEFORE the queue is read, because
+            # an empty queue is not a reason to do nothing here: the answer that
+            # lifts a force is not a queue row, and returning early on an empty
+            # queue would strand an agent whose answer has already arrived.
+            if self.slots.is_forced(partner_id):
                 return None
-            head = self.db.read_one(
+
+            label = self.db.read_one(_HEAD_LABEL_SQL, {"pid": partner_id})
+            head = None if label is None else self.db.read_one(
                 _HEAD_ROW_SQL, {"pid": partner_id, "behavior": label["behavior"]}
             )
-            if head is None:
+            if head is None and partner_id not in self._pending_resolution:
+                # Nothing queued and no answer waiting to be handed over.
                 return None
             working = self.slots.get(partner_id)
-            head_priority = head["priority"]
+            head_priority = None if head is None else head["priority"]
 
             # A FORCED interruption: this agent sent a request and cannot
             # proceed until it is answered. Its slot is empty and must stay
@@ -2280,9 +2286,6 @@ class MessagingCore:
             # the slot from the queue -- folding the answer into whatever comes
             # next via `templates.resolution`, because a bare response is close
             # to useless as a prompt.
-            if self.slots.is_forced(partner_id):
-                return None
-
             _pending = self._pending_resolution.pop(partner_id, None)
             asked, resolution_text = _pending if _pending else (None, None)
             if head is None:

@@ -569,7 +569,7 @@ def test_status_reports_queued_breakdown_highest_priority_first_and_paused(core,
     core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
               message="r1", behavior="[RESEARCH]")
     core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-              message="mr1", behavior="[MESSAGE-RESPONSE]")
+              message="mr1", behavior="[TRUTHFUL-REPORT]")
 
     result = core.status(requester_uuid=target["uuid"])
     assert result["working"] is not None and result["working"]["behavior"] == "[TRUTHFUL-REPORT]", (
@@ -581,7 +581,7 @@ def test_status_reports_queued_breakdown_highest_priority_first_and_paused(core,
     assert result["queue_depth"] == 3, f"expected queue_depth 3, got {result['queue_depth']}"
 
     behaviors_in_order = [q["behavior"] for q in result["queued"]]
-    assert behaviors_in_order == ["[QUERY]", "[MESSAGE-RESPONSE]", "[RESEARCH]"], (
+    assert behaviors_in_order == ["[QUERY]", "[TRUTHFUL-REPORT]", "[RESEARCH]"], (
         f"expected queued ordered highest-priority-first (2, 3, 4), got {behaviors_in_order} "
         f"from {result['queued']!r}"
     )
@@ -593,8 +593,8 @@ def test_status_reports_queued_breakdown_highest_priority_first_and_paused(core,
     assert by_behavior["[RESEARCH]"]["paused"] == 0, (
         f"the fresh [RESEARCH] must not be reported paused, got {by_behavior['[RESEARCH]']!r}"
     )
-    assert by_behavior["[MESSAGE-RESPONSE]"]["priority"] == priority_of(core.db, "[MESSAGE-RESPONSE]"), (
-        f"expected the correct priority reported, got {by_behavior['[MESSAGE-RESPONSE]']!r}"
+    assert by_behavior["[TRUTHFUL-REPORT]"]["priority"] == priority_of(core.db, "[TRUTHFUL-REPORT]"), (
+        f"expected the correct priority reported, got {by_behavior['[TRUTHFUL-REPORT]']!r}"
     )
 
 
@@ -1086,12 +1086,12 @@ def test_send_over_queue_is_per_caller(core, world):
 
 
 def test_send_uncapped_label_never_refuses(core, world):
-    """[MESSAGE-RESPONSE] has max_outstanding=NULL in label_caps: it must never
+    """[TRUTHFUL-REPORT] has max_outstanding=NULL in label_caps: it must never
     refuse, no matter how many are outstanding.
 
     [ERROR] is uncapped too, but it is a blocking label -- sending one stops
     the sender, so a second send from the same agent is refused for a reason
-    that has nothing to do with caps. [MESSAGE-RESPONSE] isolates the cap
+    that has nothing to do with caps. [TRUTHFUL-REPORT] isolates the cap
     question.
     """
     core.handshake(requester_uuid=world["orch"]["uuid"], partner_title="lit-review")
@@ -1099,15 +1099,15 @@ def test_send_uncapped_label_never_refuses(core, world):
     for i in range(10):
         result = core.send(
             requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-            message=f"msg-{i}", behavior="[MESSAGE-RESPONSE]",
+            message=f"msg-{i}", behavior="[TRUTHFUL-REPORT]",
         )
-        assert result["behavior"] == "[MESSAGE-RESPONSE]", (
+        assert result["behavior"] == "[TRUTHFUL-REPORT]", (
             f"send #{i} of an uncapped label must not refuse, got {result!r}"
         )
     total = queue_count(core.db, world["worker"]["id"], caller_id=world["orch"]["id"],
-                        behavior="[MESSAGE-RESPONSE]")
+                        behavior="[TRUTHFUL-REPORT]")
     working = core.working_task(partner_id=world["worker"]["id"])
-    working_is_error = working is not None and working["behavior"] == "[MESSAGE-RESPONSE]"
+    working_is_error = working is not None and working["behavior"] == "[TRUTHFUL-REPORT]"
     assert total + (1 if working_is_error else 0) == 10, (
         f"expected 10 tasks in flight total (queued + working), got {total} queued and "
         f"working={working['behavior'] if working else None}"
@@ -1124,7 +1124,7 @@ def test_read_success_paginates_newest_first(core, world):
     set_ext(core, "science_")
     for i in range(3):
         core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-                   message=f"m{i}", behavior="[MESSAGE-RESPONSE]")
+                   message=f"m{i}", behavior="[TRUTHFUL-REPORT]")
     result = core.read(requester_uuid=world["orch"]["uuid"], partner_title="lit-review", page=1, page_size=2)
     assert result["total"] == 3, f"expected total 3, got {result!r}"
     bodies = [m["body"] for m in result["messages"]]
@@ -1556,13 +1556,13 @@ def test_begin_summary_phase_raises_priority_and_keeps_original_body(core, pair)
 def test_reply_behavior_matches_label_caps(core):
     cases = {
         "[RESEARCH]": "[TRUTHFUL-REPORT]",
-        "[QUERY]": "[MESSAGE-RESPONSE]",
+        "[QUERY]": "[TRUTHFUL-REPORT]",
         # An [ERROR] is answered like any other question. A Caller that corrects
         # a blocked Partner otherwise has no way to know the correction landed.
-        "[ERROR]": "[MESSAGE-RESPONSE]",
+        "[ERROR]": "[TRUTHFUL-REPORT]",
         "[IDLE]": None,
         "[TRUTHFUL-REPORT]": None,
-        "[MESSAGE-RESPONSE]": None,
+        "[TRUTHFUL-REPORT]": None,
     }
     for behavior, expected in cases.items():
         actual = core.reply_behavior(behavior)
@@ -1573,18 +1573,18 @@ def test_report_back_pushes_without_auto_delivering(core, pair):
     tid = pair["caller1"]["id"]
     result = core.report_back(
         to_partner_id=tid, from_partner_id=pair["target"]["id"],
-        behavior="[MESSAGE-RESPONSE]", body="the answer",
+        behavior="[TRUTHFUL-REPORT]", body="the answer",
     )
     assert result["queue_depth"] == 1, f"expected queue_depth 1, got {result!r}"
     assert core.working_task(partner_id=tid) is None, "report_back only enqueues; it must not deliver on its own"
     stored = core.db.read_one("SELECT * FROM messages WHERE id = ?", (result["message_id"],))
-    assert stored is not None and stored["behavior"] == "[MESSAGE-RESPONSE]", (
+    assert stored is not None and stored["behavior"] == "[TRUTHFUL-REPORT]", (
         f"a stored label must be written to messages, got {stored!r}"
     )
 
     set_ext(core, "science_")
     delivered = core.advance(partner_id=tid)
-    assert delivered is not None and delivered["delivered"] == "[MESSAGE-RESPONSE]", (
+    assert delivered is not None and delivered["delivered"] == "[TRUTHFUL-REPORT]", (
         f"a later advance() must deliver what report_back queued, got {delivered!r}"
     )
 
@@ -1600,9 +1600,9 @@ def test_report_back_has_no_handshake_requirement(core, pair):
     assert handshake_count == 0, "precondition: no handshake should exist between these two"
     result = core.report_back(
         to_partner_id=pair["caller1"]["id"], from_partner_id=pair["target"]["id"],
-        behavior="[MESSAGE-RESPONSE]", body="it broke",
+        behavior="[TRUTHFUL-REPORT]", body="it broke",
     )
-    assert result["behavior"] == "[MESSAGE-RESPONSE]", f"report_back must succeed with no handshake, got {result!r}"
+    assert result["behavior"] == "[TRUTHFUL-REPORT]", f"report_back must succeed with no handshake, got {result!r}"
 
 
 def test_report_back_refuses_delegation_and_holds_but_carries_every_report(core, world):
@@ -1631,7 +1631,7 @@ def test_report_back_refuses_delegation_and_holds_but_carries_every_report(core,
         )["n"]
         assert depth == 0, f"{behavior} was refused but still queued ({depth} rows)"
 
-    for behavior in ("[QUERY]", "[ERROR]", "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]"):
+    for behavior in ("[QUERY]", "[ERROR]", "[TRUTHFUL-REPORT]", "[TRUTHFUL-REPORT]"):
         result = core.report_back(to_partner_id=caller["id"], from_partner_id=worker["id"],
                                   behavior=behavior, body=f"a {behavior}")
         assert result["behavior"] == behavior, (

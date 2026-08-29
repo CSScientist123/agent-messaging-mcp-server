@@ -433,7 +433,7 @@ def test_report_back_still_runs_real_admission_for_a_reply_label(world: World):
     longer be reached through it (both reply labels are uncapped today; see
     the next test for that mechanism specifically), so this asserts against
     something else observable that a bypass would also get wrong: a
-    `[MESSAGE-RESPONSE]` (stored=1 per `label_caps`) actually gets written
+    `[TRUTHFUL-REPORT]` (stored=1 per `label_caps`) actually gets written
     to `messages`, and the returned `queue_depth` reflects the real insert.
     """
     depth0 = world.db.read_one(
@@ -445,7 +445,7 @@ def test_report_back_still_runs_real_admission_for_a_reply_label(world: World):
     )["n"]
 
     result = world.sci.report_back(
-        to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior="[MESSAGE-RESPONSE]", body="a real answer"
+        to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior="[TRUTHFUL-REPORT]", body="a real answer"
     )
     assert result["queue_depth"] == depth0 + 1
 
@@ -453,47 +453,47 @@ def test_report_back_still_runs_real_admission_for_a_reply_label(world: World):
         "SELECT COUNT(*) AS n FROM messages WHERE from_partner=? AND to_partner=?",
         (world.orch["id"], world.worker["id"]),
     )["n"]
-    assert messages_after == messages_before + 1, "[MESSAGE-RESPONSE] is stored=1; report_back must still write it"
+    assert messages_after == messages_before + 1, "[TRUTHFUL-REPORT] is stored=1; report_back must still write it"
 
 
 def test_report_back_cap_holds_if_a_reply_label_is_ever_capped(world: World):
     """Neither label `report_back` currently accepts is capped
-    (`max_outstanding IS NULL` for both `[MESSAGE-RESPONSE]` and
+    (`max_outstanding IS NULL` for both `[TRUTHFUL-REPORT]` and
     `[TRUTHFUL-REPORT]` today), so there is no live way to observe the cap
     through `report_back` against the current seed data. `label_caps` is
     data, not a hardcoded rule, so this tests the MECHANISM rather than
-    today's seed values: temporarily cap `[MESSAGE-RESPONSE]` at 2 in this
+    today's seed values: temporarily cap `[TRUTHFUL-REPORT]` at 2 in this
     test's own database, confirm `report_back` still enforces it exactly
     like `send` would, then restore the row.
     """
     def _set_cap(n):
         return lambda conn: conn.execute(
-            "UPDATE label_caps SET max_outstanding = ? WHERE behavior = '[MESSAGE-RESPONSE]'", (n,)
+            "UPDATE label_caps SET max_outstanding = ? WHERE behavior = '[TRUTHFUL-REPORT]'", (n,)
         )
 
     world.db.write(_set_cap(2))
     try:
         for i in range(2):
             world.sci.report_back(
-                to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior="[MESSAGE-RESPONSE]", body=f"r{i}"
+                to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior="[TRUTHFUL-REPORT]", body=f"r{i}"
             )
         with pytest.raises(Rejected) as exc:
             world.sci.report_back(
-                to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior="[MESSAGE-RESPONSE]", body="over"
+                to_partner_id=world.worker["id"], from_partner_id=world.orch["id"], behavior="[TRUTHFUL-REPORT]", body="over"
             )
         assert exc.value.code == "over_queue"
     finally:
         world.db.write(_set_cap(None))
 
     depth = world.db.read_one(
-        "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=? AND caller_id=? AND behavior='[MESSAGE-RESPONSE]'",
+        "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=? AND caller_id=? AND behavior='[TRUTHFUL-REPORT]'",
         (world.worker["id"], world.orch["id"]),
     )["n"]
     # report_back never calls advance(), so the working slot never absorbs
-    # one of these -- every admitted [MESSAGE-RESPONSE] stays queued.
+    # one of these -- every admitted [TRUTHFUL-REPORT] stays queued.
     assert depth == 2
 
-    row = world.db.read_one("SELECT max_outstanding FROM label_caps WHERE behavior = '[MESSAGE-RESPONSE]'")
+    row = world.db.read_one("SELECT max_outstanding FROM label_caps WHERE behavior = '[TRUTHFUL-REPORT]'")
     assert row["max_outstanding"] is None, "the temporary cap must be restored, not left mutated"
 
 
@@ -514,7 +514,7 @@ def test_equal_priority_never_displaces_no_ping_pong(world: World):
     message never displaces one of equal priority already being worked,
     regardless of who sent either.
 
-    The label is `[MESSAGE-RESPONSE]` because the attack needs one caller to
+    The label is `[TRUTHFUL-REPORT]` because the attack needs one caller to
     send repeatedly. A blocking label would stop the attacker after its first
     message and end the experiment for a reason unrelated to the rule under
     test; the strict-beat comparison itself is label-agnostic.
@@ -524,9 +524,9 @@ def test_equal_priority_never_displaces_no_ping_pong(world: World):
 
     r1 = world.sci.send(
         requester_uuid=world.orch["uuid"], queried_partner_title="bridgeA", message="a1",
-        behavior="[MESSAGE-RESPONSE]"
+        behavior="[TRUTHFUL-REPORT]"
     )
-    assert r1["delivered"] == "[MESSAGE-RESPONSE]"
+    assert r1["delivered"] == "[TRUTHFUL-REPORT]"
     working_before = world.sci.working_task(partner_id=world.bridge["id"])
     assert working_before["caller_id"] == world.orch["id"]
 
@@ -541,7 +541,7 @@ def test_equal_priority_never_displaces_no_ping_pong(world: World):
         # actually holds a matching extension.
         r2 = world.sci.send(
             requester_uuid=world.code_partner["uuid"], queried_partner_title="bridgeA", message=f"b{i}",
-            behavior="[MESSAGE-RESPONSE]"
+            behavior="[TRUTHFUL-REPORT]"
         )
         assert r2["delivered"] is None, "an equal-priority message displaced the working task"
         working_now = world.sci.working_task(partner_id=world.bridge["id"])
@@ -848,7 +848,7 @@ def test_nlm_can_never_send_anything(world: World):
     (can_send=0). Held: refused with `source_cannot_send` for every label
     tried, before admission.
     """
-    for behavior in ("[QUERY]", "[ERROR]", "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]", "[RESEARCH]"):
+    for behavior in ("[QUERY]", "[ERROR]", "[TRUTHFUL-REPORT]", "[TRUTHFUL-REPORT]", "[RESEARCH]"):
         with pytest.raises(Rejected) as exc:
             world.nlm.send(
                 requester_uuid=world.nlm_partner["uuid"],
@@ -901,7 +901,7 @@ def test_report_back_refuses_a_non_reply_behavior_no_research_upward(world: Worl
     already refused the identical from/to pair. It now checks `behavior`
     against `label_caps.reply_behavior` first and refuses anything that is
     not some label's actual reply with `not_a_reply_behavior` --
-    `[MESSAGE-RESPONSE]` and `[TRUTHFUL-REPORT]` are the only two values that
+    `[TRUTHFUL-REPORT]` and `[TRUTHFUL-REPORT]` are the only two values that
     ever pass.
 
     Exact reproduction that must now be refused:
@@ -950,7 +950,7 @@ def test_report_back_refuses_a_non_reply_behavior_no_research_upward(world: Worl
     assert depth_after == depth_before, "a refused report_back call still enqueued something"
 
     # Everything a Partner can genuinely report must still be admitted.
-    for real_reply in ("[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]", "[QUERY]", "[ERROR]"):
+    for real_reply in ("[TRUTHFUL-REPORT]", "[TRUTHFUL-REPORT]", "[QUERY]", "[ERROR]"):
         result = world.sci.report_back(
             to_partner_id=world.orch["id"], from_partner_id=world.bridge["id"], behavior=real_reply, body="a real answer"
         )
@@ -1381,11 +1381,11 @@ def test_work_queued_before_archiving_is_discarded_not_delivered(world: World):
     working slot is cleared; no new `deliver_message` call is made for it.
     """
     world.sci.handshake(requester_uuid=world.orch["uuid"], partner_title="workerA")
-    # Two messages of one label from one caller. [MESSAGE-RESPONSE] rather
+    # Two messages of one label from one caller. [TRUTHFUL-REPORT] rather
     # than [QUERY], because a [QUERY] would stop the orchestrator after the
     # first and the second could never be sent.
-    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m1", behavior="[MESSAGE-RESPONSE]")
-    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m2", behavior="[MESSAGE-RESPONSE]")
+    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m1", behavior="[TRUTHFUL-REPORT]")
+    world.sci.send(requester_uuid=world.orch["uuid"], queried_partner_title="workerA", message="m2", behavior="[TRUTHFUL-REPORT]")
 
     depth_before = world.db.read_one(
         "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id=?", (world.worker["id"],)
@@ -1665,7 +1665,7 @@ def test_antigravity_poll_completion_raises_rather_than_answering_a_prompt(monke
 #                        admission (storage + queue_depth) for the reply
 #                        labels it does accept, and the cap MECHANISM itself
 #                        (not just today's uncapped reply labels) is
-#                        confirmed by temporarily capping [MESSAGE-RESPONSE].
+#                        confirmed by temporarily capping [TRUTHFUL-REPORT].
 # Claim 2 (priority):   held -- no ping-pong, no cross-label tie-break theft,
 #                        [IDLE] never requeued after being displaced.
 # Claim 3 (hierarchy):  held through send(). A prior finding against

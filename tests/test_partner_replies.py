@@ -64,7 +64,7 @@ def test_a_partner_can_answer_the_caller_that_handshook_it(db, core):
 
     result = core.send(
         requester_uuid=worker["uuid"], queried_partner_title=caller["title"],
-        message="here is what I found", behavior="[MESSAGE-RESPONSE]",
+        message="here is what I found", behavior="[TRUTHFUL-REPORT]",
     )
 
     assert result["partner_id"] == caller["id"], (
@@ -175,7 +175,7 @@ def test_a_partner_can_still_answer_a_caller_that_outranks_it(db, core):
     """The whole point: everything that is not delegation still travels back."""
     # A fresh pair per label. Two of these four are blocking: sending one stops
     # the worker until it is answered, so a single worker cannot send all four.
-    for behavior in ("[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]", "[QUERY]", "[ERROR]"):
+    for behavior in ("[TRUTHFUL-REPORT]", "[TRUTHFUL-REPORT]", "[QUERY]", "[ERROR]"):
         caller, worker = make_pair(core)
         result = core.send(
             requester_uuid=worker["uuid"], queried_partner_title=caller["title"],

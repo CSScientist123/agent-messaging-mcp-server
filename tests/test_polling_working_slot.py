@@ -278,8 +278,8 @@ def test_query_round_trip(db, stub, core, server, monkeypatch):
         "the working slot must be released once the QUERY completes"
     )
     behaviors = queued_behaviors(db, caller["id"])
-    assert behaviors == ["[MESSAGE-RESPONSE]"], (
-        f"expected exactly one [MESSAGE-RESPONSE] queued for the caller, got: {behaviors}"
+    assert behaviors == ["[TRUTHFUL-REPORT]"], (
+        f"expected exactly one [TRUTHFUL-REPORT] queued for the caller, got: {behaviors}"
     )
 
 
@@ -352,17 +352,17 @@ def test_research_round_trip_runs_the_summary_phase_exactly_once(db, stub, core,
 
 
 # ---------------------------------------------------------------------------
-# 7. Termination: [MESSAGE-RESPONSE] and a delivered [TRUTHFUL-REPORT] must
+# 7. Termination: [TRUTHFUL-REPORT] and a delivered [TRUTHFUL-REPORT] must
 #    each send nothing back.
 #
 #    [ERROR] is deliberately NOT in this set. It is a question -- "this is what
-#    stopped me" -- and is answered with a [MESSAGE-RESPONSE], which is itself
+#    stopped me" -- and is answered with a [TRUTHFUL-REPORT], which is itself
 #    the label that replies with nothing. The exchange still terminates, one
 #    hop later.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("behavior", ["[MESSAGE-RESPONSE]"])
+@pytest.mark.parametrize("behavior", ["[TRUTHFUL-REPORT]"])
 def test_termination_produces_nothing_back(db, stub, core, server, behavior):
     """The single most important property in this file: a completed task whose
     label's `reply_behavior` is NULL must push nothing back to the caller, or
@@ -389,7 +389,7 @@ def test_termination_produces_nothing_back(db, stub, core, server, behavior):
 def test_termination_delivered_truthful_report_produces_nothing_back(db, stub, core, server):
     """A [TRUTHFUL-REPORT] sent directly (not as the second phase of a
     [RESEARCH] round trip -- see the previous test) must terminate exactly
-    like [ERROR] and [MESSAGE-RESPONSE]. `_complete` distinguishes a promoted
+    like [ERROR] and [TRUTHFUL-REPORT]. `_complete` distinguishes a promoted
     research summary from a directly-sent [TRUTHFUL-REPORT] by an explicit
     `summary_phase` marker `begin_summary_phase` sets on the working-slot
     dict, not by the label alone -- two directly-sendable behaviors carrying
@@ -478,7 +478,7 @@ def test_needs_remote_from_poll_completion_is_treated_as_finished(db, monkeypatc
             "left occupying the working slot forever"
         )
         behaviors = queued_behaviors(db, caller["id"])
-        assert behaviors == ["[MESSAGE-RESPONSE]"], (
+        assert behaviors == ["[TRUTHFUL-REPORT]"], (
             f"expected the QUERY to be answered anyway, got: {behaviors}"
         )
     finally:
@@ -597,18 +597,18 @@ def test_drain_once_with_no_registered_extension_loses_nothing(db, stub, core):
     caller, worker = make_pair(core)
     core.send(
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-        message="first", behavior="[MESSAGE-RESPONSE]",
+        message="first", behavior="[TRUTHFUL-REPORT]",
     )
     # A second message of the same label ties with the one already occupying
     # the working slot, so it stays queued rather than being delivered --
     # exactly the "still waiting" state a no_extension failure must not lose.
     #
-    # [MESSAGE-RESPONSE] rather than [QUERY], because sending a [QUERY] would
+    # [TRUTHFUL-REPORT] rather than [QUERY], because sending a [QUERY] would
     # stop the CALLER: an agent that asks a blocking question is interrupted
     # and cannot ask a second one until it is answered.
     core.send(
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-        message="second", behavior="[MESSAGE-RESPONSE]",
+        message="second", behavior="[TRUTHFUL-REPORT]",
     )
 
     before_queue = db.read(
@@ -670,10 +670,10 @@ def test_lower_priority_number_wins_across_different_labels(db, stub, core):
     )
     core.send(
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-        message="an answer", behavior="[MESSAGE-RESPONSE]",
+        message="an answer", behavior="[TRUTHFUL-REPORT]",
     )
     queued = queued_behaviors(db, worker["id"])
-    assert set(queued) == {"[ERROR]", "[MESSAGE-RESPONSE]"}, (
+    assert set(queued) == {"[ERROR]", "[TRUTHFUL-REPORT]"}, (
         f"setup failed: expected both to be genuinely queued (neither beats priority 1 "
         f"held by [TRUTHFUL-REPORT]), got: {queued}"
     )
@@ -690,7 +690,7 @@ def test_lower_priority_number_wins_across_different_labels(db, stub, core):
 
     promoted = core.working_task(partner_id=worker["id"])
     assert promoted is not None and promoted["behavior"] == "[ERROR]", (
-        "[ERROR] (priority 2) must be promoted ahead of [MESSAGE-RESPONSE] (priority 3) -- a "
+        "[ERROR] (priority 2) must be promoted ahead of [TRUTHFUL-REPORT] (priority 3) -- a "
         f"lower priority number is supposed to win; got: {promoted}"
     )
 

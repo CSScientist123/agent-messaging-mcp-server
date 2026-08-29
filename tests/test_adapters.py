@@ -1310,7 +1310,7 @@ def test_antigravity_deliver_message_returns_when_the_turn_is_too_fast_to_observ
 # Before these were implemented, `PollingServer._read_result` fell back to the
 # literal placeholder "[result reported by the remote through its own channel]"
 # for every science_ and gemini_ turn -- and because [TRUTHFUL-REPORT] and
-# [MESSAGE-RESPONSE] are stored, that placeholder was what `read` returned. The
+# [TRUTHFUL-REPORT] are stored, that placeholder was what `read` returned. The
 # answer existed on the remote and never reached the agent that asked for it.
 
 
@@ -1612,7 +1612,7 @@ def test_antigravity_read_remote_result_keeps_the_pane_with_no_recorded_delivery
 # Also found live, one step past the readiness gate. The prompt WAS delivered
 # -- the pane showed it -- but `_await_busy`'s six-second budget expired before
 # the model produced its first token, `poll_completion` read the absent busy
-# footer as FINISHED, and the Caller got a [MESSAGE-RESPONSE] with an empty
+# footer as FINISHED, and the Caller got a [TRUTHFUL-REPORT] with an empty
 # body while the agent was still about to answer. From one pane read, "not
 # started yet" and "already finished" look identical.
 
