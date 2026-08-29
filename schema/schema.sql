@@ -101,27 +101,21 @@ INSERT INTO agent_layers (source_prefix, orchestrator_type, layer) VALUES
 -- produced a message, and two agents would talk to each other until one was archived.
 CREATE TABLE label_caps (
     behavior        TEXT PRIMARY KEY
-                    CHECK (behavior IN ('[TRUTHFUL-REPORT]', '[ERROR]',
-                                        '[QUERY]', '[RESEARCH]')),
+                    CHECK (behavior IN ('[TRUTHFUL-REPORT]', '[QUERY]', '[ERROR]',
+                                        '[MESSAGE-RESPONSE]', '[RESEARCH]')),
     priority        INTEGER NOT NULL,
     max_outstanding INTEGER CHECK (max_outstanding IS NULL OR max_outstanding > 0),
     stored          INTEGER NOT NULL DEFAULT 0 CHECK (stored IN (0, 1)),
-    -- Whether sending this label FORCES the sender to wait. A request asks
-    -- somebody for something and the sender cannot proceed until it is answered,
-    -- so its working task is pushed back and its slot is left EMPTY. Data rather
-    -- than a tuple in Python for the same reason every other per-label fact is:
-    -- a second authority is a second thing to disagree with.
-    is_request      INTEGER NOT NULL DEFAULT 0 CHECK (is_request IN (0, 1)),
     reply_behavior  TEXT REFERENCES label_caps(behavior),
     CHECK (reply_behavior IS NULL OR reply_behavior <> behavior)
 );
 
-INSERT INTO label_caps
-    (behavior, priority, max_outstanding, stored, is_request, reply_behavior) VALUES
-    ('[TRUTHFUL-REPORT]',  1, NULL, 0, 0, NULL),
-    ('[ERROR]',            2, NULL, 0, 1, NULL),
-    ('[QUERY]',            3,    3, 1, 1, NULL),
-    ('[RESEARCH]',         4,    2, 1, 1, '[TRUTHFUL-REPORT]');
+INSERT INTO label_caps (behavior, priority, max_outstanding, stored, reply_behavior) VALUES
+    ('[TRUTHFUL-REPORT]',  1, NULL, 1, NULL),
+    ('[QUERY]',            2,    3, 1, '[MESSAGE-RESPONSE]'),
+    ('[ERROR]',            2, NULL, 0, '[MESSAGE-RESPONSE]'),
+    ('[MESSAGE-RESPONSE]', 3, NULL, 1, NULL),
+    ('[RESEARCH]',         4,    2, 0, '[TRUTHFUL-REPORT]');
 
 CREATE TABLE projects (
     id                INTEGER PRIMARY KEY,
@@ -244,10 +238,6 @@ CREATE TABLE messages (
     -- decided.
     behavior      TEXT NOT NULL REFERENCES label_caps(behavior),
     body          TEXT NOT NULL,
-    -- When the answer to this request came back. NULL means unanswered. Stamped
-    -- in the same transaction that writes the message_response row, so a request
-    -- can never read as answered without the answer existing.
-    response_datetime TEXT,
     created_at    TEXT NOT NULL
                   DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -262,81 +252,6 @@ BEFORE INSERT ON messages
 BEGIN
     SELECT RAISE(ABORT, 'this behavior is transport-only and is never stored')
      WHERE (SELECT stored FROM label_caps WHERE behavior = NEW.behavior) IS NOT 1;
-END;
-
--- The answer to a request in `messages`.
---
--- **It carries no label, and that is the point.** A response is not a message --
--- that is why `[MESSAGE-RESPONSE]` was removed as a label. What kind of answer
--- this is, is already fully determined by the request it answers: the answer to a
--- `[RESEARCH]` is a report, the answer to a `[QUERY]` is the clarification asked
--- for. Storing a label here would be storing a fact that `messages.behavior`
--- already carries, one join away.
---
--- Separate table rather than more rows in `messages`, because a request and its
--- answer are different things: one is asked and one is given, only the request has
--- a cap and a priority, and only the answer has a moment it arrived.
---
--- UNIQUE (message_id): one answer per request. A second would make
--- `messages.response_datetime` ambiguous about which arrival it records.
-CREATE TABLE message_response (
-    id            INTEGER PRIMARY KEY,
-    message_id    INTEGER NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
-    from_partner  INTEGER NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-    body          TEXT NOT NULL,
-    created_at    TEXT NOT NULL
-                  DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Only a request can be answered. `messages` holds only requests today, so this
--- is belt-and-braces rather than a live gate -- but `is_request` is the fact that
--- decides it, and reading the column keeps the rule true if `messages` ever widens.
-CREATE TRIGGER message_response_answers_a_request
-BEFORE INSERT ON message_response
-BEGIN
-    SELECT RAISE(ABORT, 'only a request can be answered')
-     WHERE (SELECT c.is_request FROM messages m
-              JOIN label_caps c ON c.behavior = m.behavior
-             WHERE m.id = NEW.message_id) IS NOT 1;
-END;
-
--- The shortcut channel: a SECOND, temporary priority queue.
---
--- A forced interruption empties a Partner's working slot and keeps it empty, so
--- nothing from the main queue can reach that agent until its answer arrives. That
--- is the point -- but it strands the one message that must still get through: a
--- Partner hitting a mid-task [QUERY] or [ERROR] needs to reach a Caller that is
--- itself waiting, and the main queue cannot carry it there in time.
---
--- So this table exists for exactly the lifetime of one wait. Rows are pushed here
--- instead of the main queue while an interruption is open, ordered by the same
--- label_caps.priority rule, and the whole channel is DELETED when the awaited
--- response arrives. A row here can never outlive the interruption it routed
--- around -- the same reasoning that keeps the working slot out of the database.
-CREATE TABLE shortcut_channel (
-    id           INTEGER PRIMARY KEY,
-    -- The agent that is waiting, and whose slot is held empty.
-    waiting_partner INTEGER NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-    -- The agent speaking to it through the shortcut.
-    from_partner INTEGER NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-    behavior     TEXT NOT NULL REFERENCES label_caps(behavior),
-    body         TEXT NOT NULL,
-    enqueued_at  TEXT NOT NULL
-                 DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    CHECK (waiting_partner <> from_partner)
-);
-
-CREATE INDEX shortcut_channel_order ON shortcut_channel(waiting_partner, enqueued_at);
-
--- Only a request may travel the shortcut. Today that is [QUERY] and [ERROR]; the
--- rule is read from label_caps.is_request rather than naming them, so the channel
--- widens by data if a fifth request label is ever added. A [TRUTHFUL-REPORT] has
--- no business here: it is an answer, and answers go through the main queue.
-CREATE TRIGGER shortcut_channel_requests_only
-BEFORE INSERT ON shortcut_channel
-BEGIN
-    SELECT RAISE(ABORT, 'only a request label may use the shortcut channel')
-     WHERE (SELECT is_request FROM label_caps WHERE behavior = NEW.behavior) IS NOT 1;
 END;
 
 -- ONE queue, ordered by priority. Every message is a push; there is no separate reply

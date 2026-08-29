@@ -25,34 +25,23 @@ from .errors import Rejected
 #: order is documentation; `label_caps.priority` is what the code reads.
 BEHAVIORS: tuple[str, ...] = (
     "[TRUTHFUL-REPORT]",
-    "[ERROR]",
     "[QUERY]",
+    "[ERROR]",
+    "[MESSAGE-RESPONSE]",
     "[RESEARCH]",
 )
 
-#: The labels that are REQUESTS: they ask somebody for something, and the sender
-#: cannot proceed until it is answered. Sending one forces an interruption --
-#: the sender's working task is pushed back paused and its slot is left EMPTY
-#: until the answer arrives.
+#: The two labels an agent uses to say it cannot continue on its own -- a
+#: question about what was meant, or a statement that something blocked it.
+#: Sending either stops the sender: its working task is pushed back paused and
+#: the question itself takes the slot until an answer arrives.
 #:
-#: A mirror of `label_caps.is_request`, which is the authority. This tuple exists
-#: only so the hot path does not need a query to ask a question the table has
-#: already answered; `tests/test_foundation.py` asserts the two agree, so a
-#: divergence is a failing test rather than a silent second opinion.
-#:
-#: Note this is a strictly wider set than the labels that may travel the shortcut
-#: channel. `[RESEARCH]` is a request and forces a wait like any other, but
-#: delegating new work down a channel that exists for mid-task clarification is
-#: not what it is for -- `send` refuses it there by name.
-REQUEST_BEHAVIORS: tuple[str, ...] = ("[ERROR]", "[QUERY]", "[RESEARCH]")
-
-#: Backwards-compatible alias. Every request blocks its sender, so the two sets
-#: are the same thing named from two directions -- "what it is" and "what it does".
-BLOCKING_BEHAVIORS: tuple[str, ...] = REQUEST_BEHAVIORS
-
-#: What may be pushed into the shortcut channel today. Narrower than
-#: REQUEST_BEHAVIORS on purpose; see its note above.
-SHORTCUT_BEHAVIORS: tuple[str, ...] = ("[ERROR]", "[QUERY]")
+#: Their rank in `label_caps.priority` is the entire interruption mechanism:
+#: nothing below it can reach an agent while it waits. There is no separate
+#: hold label, because the question IS the hold. Only a `[TRUTHFUL-REPORT]`
+#: outranks a waiting agent, which is the one interruption worth allowing --
+#: a summary must not be contaminated by other traffic.
+BLOCKING_BEHAVIORS: tuple[str, ...] = ("[QUERY]", "[ERROR]")
 
 
 def validate_behavior(behavior: str) -> None:

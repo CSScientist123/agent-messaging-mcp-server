@@ -1,15 +1,4 @@
-"""NOTE ON THE FORCED-INTERRUPTION MIGRATION.
-
-Tests below prefixed `_superseded_` were written against the previous model, in
-which a [QUERY]'s answer was a queued [MESSAGE-RESPONSE] and a waiting agent's
-question OCCUPIED its working slot. Neither is true now: a response is not a
-message, and a forced interruption leaves the slot EMPTY.
-
-They are renamed rather than deleted so the coverage they gave stays visible to
-whoever finishes the migration. The new model's behaviour is covered in full by
-`tests/test_interruption_flow.py`.
-
-Tests for `polling.server.PollingServer` against the current model: no state
+"""Tests for `polling.server.PollingServer` against the current model: no state
 machine, no `polling_tasks` table -- a task is queued, or it holds the
 in-memory working slot, or it is neither.
 
@@ -170,7 +159,6 @@ def test_retirement_deletes_the_drain_threads_row(db, stub, core, server, monkey
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
         message="what is x?", behavior="[QUERY]",
     )
-    core.resolve_wait(partner_id=caller["id"], body="driving the test")
 
     outcome = server.notify_partner_push(partner_uuid=worker["uuid"])
     assert outcome.startswith("[ok]"), f"expected an [ok] response spawning a thread, got: {outcome!r}"
@@ -270,7 +258,7 @@ def test_notify_partner_push_unknown_uuid(server):
 # ---------------------------------------------------------------------------
 
 
-def _superseded_test_query_round_trip(db, stub, core, server, monkeypatch):
+def test_query_round_trip(db, stub, core, server, monkeypatch):
     caller, worker = make_pair(core)
     suppress_no_op(monkeypatch, server)
 
@@ -290,20 +278,8 @@ def _superseded_test_query_round_trip(db, stub, core, server, monkeypatch):
         "the working slot must be released once the QUERY completes"
     )
     behaviors = queued_behaviors(db, caller["id"])
-    # The answer to a [QUERY] is NOT a message any more: it does not queue, it
-    # is recorded against the request and lifts the caller's interruption.
-    assert behaviors == [], (
-        f"a [QUERY]'s answer must not be queued as a message, got: {behaviors}"
-    )
-    assert core.slots.is_forced(caller["id"]) is False, (
-        "answering the [QUERY] must lift the caller's forced interruption"
-    )
-    answered = db.read(
-        "SELECT m.behavior AS behavior, r.body AS body FROM messages m "
-        "JOIN message_response r ON r.message_id = m.id"
-    )
-    assert [a["behavior"] for a in answered] == ["[QUERY]"], (
-        f"the answer must be recorded against the [QUERY] it answers, got {answered}"
+    assert behaviors == ["[MESSAGE-RESPONSE]"], (
+        f"expected exactly one [MESSAGE-RESPONSE] queued for the caller, got: {behaviors}"
     )
 
 
@@ -312,7 +288,7 @@ def _superseded_test_query_round_trip(db, stub, core, server, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _superseded_test_research_round_trip_runs_the_summary_phase_exactly_once(db, stub, core, server, monkeypatch):
+def test_research_round_trip_runs_the_summary_phase_exactly_once(db, stub, core, server, monkeypatch):
     caller, worker = make_pair(core)
     suppress_no_op(monkeypatch, server)
 
@@ -365,20 +341,8 @@ def _superseded_test_research_round_trip_runs_the_summary_phase_exactly_once(db,
         "the working slot must be released once the summary itself completes"
     )
     behaviors = queued_behaviors(db, caller["id"])
-    # The answer to a [QUERY] is NOT a message any more: it does not queue, it
-    # is recorded against the request and lifts the caller's interruption.
-    assert behaviors == [], (
-        f"a [QUERY]'s answer must not be queued as a message, got: {behaviors}"
-    )
-    assert core.slots.is_forced(caller["id"]) is False, (
-        "answering the [QUERY] must lift the caller's forced interruption"
-    )
-    answered = db.read(
-        "SELECT m.behavior AS behavior, r.body AS body FROM messages m "
-        "JOIN message_response r ON r.message_id = m.id"
-    )
-    assert [a["behavior"] for a in answered] == ["[QUERY]"], (
-        f"the answer must be recorded against the [QUERY] it answers, got {answered}"
+    assert behaviors == ["[TRUTHFUL-REPORT]"], (
+        f"expected exactly one [TRUTHFUL-REPORT] queued for the caller, got: {behaviors}"
     )
 
     # Pass 3: nothing left to do for worker at all.
@@ -388,17 +352,17 @@ def _superseded_test_research_round_trip_runs_the_summary_phase_exactly_once(db,
 
 
 # ---------------------------------------------------------------------------
-# 7. Termination: [TRUTHFUL-REPORT] and a delivered [TRUTHFUL-REPORT] must
+# 7. Termination: [MESSAGE-RESPONSE] and a delivered [TRUTHFUL-REPORT] must
 #    each send nothing back.
 #
 #    [ERROR] is deliberately NOT in this set. It is a question -- "this is what
-#    stopped me" -- and is answered with a [TRUTHFUL-REPORT], which is itself
+#    stopped me" -- and is answered with a [MESSAGE-RESPONSE], which is itself
 #    the label that replies with nothing. The exchange still terminates, one
 #    hop later.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("behavior", ["[TRUTHFUL-REPORT]"])
+@pytest.mark.parametrize("behavior", ["[MESSAGE-RESPONSE]"])
 def test_termination_produces_nothing_back(db, stub, core, server, behavior):
     """The single most important property in this file: a completed task whose
     label's `reply_behavior` is NULL must push nothing back to the caller, or
@@ -425,7 +389,7 @@ def test_termination_produces_nothing_back(db, stub, core, server, behavior):
 def test_termination_delivered_truthful_report_produces_nothing_back(db, stub, core, server):
     """A [TRUTHFUL-REPORT] sent directly (not as the second phase of a
     [RESEARCH] round trip -- see the previous test) must terminate exactly
-    like [ERROR] and [TRUTHFUL-REPORT]. `_complete` distinguishes a promoted
+    like [ERROR] and [MESSAGE-RESPONSE]. `_complete` distinguishes a promoted
     research summary from a directly-sent [TRUTHFUL-REPORT] by an explicit
     `summary_phase` marker `begin_summary_phase` sets on the working-slot
     dict, not by the label alone -- two directly-sendable behaviors carrying
@@ -453,7 +417,7 @@ def test_termination_delivered_truthful_report_produces_nothing_back(db, stub, c
 # ---------------------------------------------------------------------------
 
 
-def _superseded_test_a_waiting_agent_is_not_polled_and_does_not_retire(db, stub, core, server):
+def test_a_waiting_agent_is_not_polled_and_does_not_retire(db, stub, core, server):
     """The agent asked something and is stopped until it is answered.
 
     There is nothing to poll for -- it is not running -- and nothing to report.
@@ -493,7 +457,7 @@ class _NoCompletionCheckExtension(StubExtension):
         raise NeedsRemote("poll_completion", "this stub never supports polling for completion.")
 
 
-def _superseded_test_needs_remote_from_poll_completion_is_treated_as_finished(db, monkeypatch):
+def test_needs_remote_from_poll_completion_is_treated_as_finished(db, monkeypatch):
     ext = _NoCompletionCheckExtension(source_prefix="science_")
     core = MessagingCore(db, extension=ext)
     srv = PollingServer(db, extensions={"science_": ext}, poll_interval=0.01, core=core)
@@ -514,7 +478,7 @@ def _superseded_test_needs_remote_from_poll_completion_is_treated_as_finished(db
             "left occupying the working slot forever"
         )
         behaviors = queued_behaviors(db, caller["id"])
-        assert behaviors == ["[TRUTHFUL-REPORT]"], (
+        assert behaviors == ["[MESSAGE-RESPONSE]"], (
             f"expected the QUERY to be answered anyway, got: {behaviors}"
         )
     finally:
@@ -633,18 +597,18 @@ def test_drain_once_with_no_registered_extension_loses_nothing(db, stub, core):
     caller, worker = make_pair(core)
     core.send(
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-        message="first", behavior="[TRUTHFUL-REPORT]",
+        message="first", behavior="[MESSAGE-RESPONSE]",
     )
     # A second message of the same label ties with the one already occupying
     # the working slot, so it stays queued rather than being delivered --
     # exactly the "still waiting" state a no_extension failure must not lose.
     #
-    # [TRUTHFUL-REPORT] rather than [QUERY], because sending a [QUERY] would
+    # [MESSAGE-RESPONSE] rather than [QUERY], because sending a [QUERY] would
     # stop the CALLER: an agent that asks a blocking question is interrupted
     # and cannot ask a second one until it is answered.
     core.send(
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-        message="second", behavior="[TRUTHFUL-REPORT]",
+        message="second", behavior="[MESSAGE-RESPONSE]",
     )
 
     before_queue = db.read(
@@ -687,7 +651,7 @@ def test_drain_once_with_no_registered_extension_loses_nothing(db, stub, core):
 # ---------------------------------------------------------------------------
 
 
-def _superseded_test_lower_priority_number_wins_across_different_labels(db, stub, core):
+def test_lower_priority_number_wins_across_different_labels(db, stub, core):
     caller, worker = make_pair(core)
 
     core.send(
@@ -706,10 +670,10 @@ def _superseded_test_lower_priority_number_wins_across_different_labels(db, stub
     )
     core.send(
         requester_uuid=caller["uuid"], queried_partner_title=worker["title"],
-        message="an answer", behavior="[TRUTHFUL-REPORT]",
+        message="an answer", behavior="[MESSAGE-RESPONSE]",
     )
     queued = queued_behaviors(db, worker["id"])
-    assert set(queued) == {"[ERROR]", "[TRUTHFUL-REPORT]"}, (
+    assert set(queued) == {"[ERROR]", "[MESSAGE-RESPONSE]"}, (
         f"setup failed: expected both to be genuinely queued (neither beats priority 1 "
         f"held by [TRUTHFUL-REPORT]), got: {queued}"
     )
@@ -726,7 +690,7 @@ def _superseded_test_lower_priority_number_wins_across_different_labels(db, stub
 
     promoted = core.working_task(partner_id=worker["id"])
     assert promoted is not None and promoted["behavior"] == "[ERROR]", (
-        "[ERROR] (priority 2) must be promoted ahead of [TRUTHFUL-REPORT] (priority 3) -- a "
+        "[ERROR] (priority 2) must be promoted ahead of [MESSAGE-RESPONSE] (priority 3) -- a "
         f"lower priority number is supposed to win; got: {promoted}"
     )
 

@@ -378,11 +378,8 @@ class PollingServer:
                             retire = False
                             return
                     continue
-                # A forced interruption leaves the slot EMPTY, so the wait is
-                # read from the flag rather than from a task that no longer
-                # exists. Keying on a slot occupant here used to work only
-                # because the question was parked IN the slot; now it is not.
-                if self.core.slots.is_forced(partner_id):
+                held_task = self.core.slots.get(partner_id)
+                if held_task is not None and held_task.get("awaiting_resolution"):
                     # A wait is not something this thread waits to change --
                     # it is something SOMEBODY ELSE changes. The message that
                     # ends a wait is delivered by whoever answers: `send`
@@ -424,40 +421,12 @@ class PollingServer:
             # it writes anything -- so this is worth recording and retrying
             # rather than treating as a lost message.
             self._record_error(exc)
-        except Rejected as exc:
-            if exc.code != "approval_is_an_error":
-                raise
-            # An approval can block a DELIVERY, not only a poll. The Antigravity
-            # adapter raises the same code from `deliver_message`, and that path
-            # used to escape this method entirely: the blanket handler in
-            # `_drain_loop` caught it, recorded it, and retried with backoff
-            # FOREVER while nobody was told. `advance` has already requeued the
-            # task by then, so the work survives -- but the Caller never hears,
-            # which is exactly what the approval doctrine exists to prevent.
-            #
-            # Route it the same way a poll-time approval goes.
-            task = core.working_task(partner_id=partner_id)
-            remote_id = self._partner_remote_id(partner_id)
-            if remote_id is not None:
-                extension = self.extensions.get(self._source_prefix_for(partner_id))
-                if extension is not None:
-                    self._stop_quietly(extension, remote_id, "stopped on an approval prompt")
-            self._raise_approval_to_caller(
-                core, partner_id, task or {"caller_id": None}, exc.message
-            )
-            return False
 
         task = core.working_task(partner_id=partner_id)
         if task is None:
             depth = self.db.read_one(
                 "SELECT COUNT(*) AS n FROM message_queue WHERE partner_id = ?", (partner_id,)
             )["n"]
-            # A forced interruption is NOT a reason to retire. The slot is empty
-            # and the queue may be too, which looks exactly like "nothing to do"
-            # -- but the agent is waiting on an answer, and retiring here would
-            # take away the thread that has to notice it arriving.
-            if self.core.slots.is_forced(partner_id):
-                return False
             return depth == 0
 
         if task.get("awaiting_resolution"):
@@ -621,21 +590,8 @@ class PollingServer:
         not an unconditional pre-emption, and describing it as the latter would
         promise a latency this does not provide.
         """
-        # PARK, do not destroy.
-        #
-        # This used to call `core.release`, which pops the slot and discards what
-        # it held. The partner's in-flight work was silently lost: nothing
-        # requeued it, and for a [RESEARCH] the request text was not in `messages`
-        # either, so the Caller was told "send the work again" without being shown
-        # what the work was.
-        #
-        # Parking is what an agent that raises an [ERROR] itself already gets --
-        # its task pushed back paused and its slot held empty until an answer
-        # arrives. An approval detected by the Polling Server is the same
-        # situation reached from the outside, so it gets the same treatment, and
-        # the answer then resolves it through the same path.
-        parked = core.park_for_approval(partner_id=partner_id)
-        caller_id = (parked or task)["caller_id"]
+        released = core.release(partner_id=partner_id)
+        caller_id = (released or task)["caller_id"]
         partner = self.db.read_one(
             "SELECT title, partner_id_in_remote FROM partners WHERE id = ?", (partner_id,)
         )
@@ -737,33 +693,9 @@ class PollingServer:
         # window where the next turn can start against a remote whose previous
         # output has not been fetched -- and what comes back then belongs to
         # neither turn.
-        needs_body = reply is not None or bool(task.get("is_request_reply", True))
-        body = self._read_result(extension, remote_id) if needs_body else None
+        body = self._read_result(extension, remote_id) if reply is not None else None
 
         released = core.release(partner_id=partner_id)
-
-        # A finished REQUEST whose sender is still waiting is answered through
-        # `resolve_wait`, not through the queue. That is the whole point of
-        # dropping [MESSAGE-RESPONSE] as a label: the answer is not a message, so
-        # it does not queue, does not compete on priority, and cannot be
-        # outranked by the very work it unblocks.
-        #
-        # `reply_behavior` is NULL for [QUERY] and [ERROR] precisely so this
-        # branch is the only way their answers travel.
-        if reply is None and released is not None and body is not None:
-            caller_id = released["caller_id"]
-            if core.slots.is_forced(caller_id):
-                core.resolve_wait(
-                    partner_id=caller_id, body=body, from_partner_id=partner_id,
-                )
-                caller = self.db.read_one(
-                    "SELECT uuid FROM partners WHERE id = ? AND archived_at IS NULL",
-                    (caller_id,),
-                )
-                if caller is not None:
-                    self._ensure_thread(caller_id, caller["uuid"])
-                return
-
         if reply is None or released is None:
             # [ERROR], [MESSAGE-RESPONSE] and [TRUTHFUL-REPORT] arriving as
             # deliveries are answers already. Replying to an answer is how two
@@ -775,17 +707,6 @@ class PollingServer:
             behavior=reply,
             body=body,
         )
-        # A labelled answer -- today only [TRUTHFUL-REPORT], answering a
-        # [RESEARCH]. It goes through the queue like any message, AND it lifts
-        # the force, because the caller has now had the thing it was waiting for.
-        # Without the lift the report would sit in a queue whose slot is held
-        # shut by the very request the report answers.
-        if core.slots.is_forced(released["caller_id"]):
-            core.resolve_wait(
-                partner_id=released["caller_id"], body=body or "",
-                from_partner_id=partner_id,
-            )
-
         caller = self.db.read_one(
             "SELECT uuid FROM partners WHERE id = ? AND archived_at IS NULL",
             (released["caller_id"],),
@@ -842,11 +763,9 @@ class PollingServer:
         # queued row: it arms this partner through the branch above, in
         # whichever process owns the remote.
         for partner_id in self.core.slots.occupied():
-            candidates.setdefault(partner_id, str(partner_id))
-        # A forced interruption has an EMPTY slot, so `occupied()` does not see
-        # it -- but such a partner still needs a thread, because the answer that
-        # lifts the force has to be noticed by somebody.
-        for partner_id in self.core.slots.forced():
+            task = self.core.slots.get(partner_id)
+            if task is not None and task.get("awaiting_resolution"):
+                continue
             candidates.setdefault(partner_id, str(partner_id))
 
         armed = 0

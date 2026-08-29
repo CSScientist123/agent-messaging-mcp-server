@@ -1,12 +1,5 @@
 """Tests for a `[RESEARCH]` summary phase that gets interrupted.
 
-Two cap tests here are prefixed `_superseded_`: forced interruption stops a
-caller on its first request, so a per-caller `[RESEARCH]` cap of 2 can never be
-reached and `origin_behavior`'s contribution to it can no longer be observed
-from the outside. The marker itself is still carried and still asserted by
-`test_a_summary_whose_delivery_fails_still_reports_its_result_to_the_caller`.
-
-
 A research round trip is two exchanges against one remote inside ONE working
 slot: do the work, then report on it. `MessagingCore.begin_summary_phase`
 performs the switch by mutating the in-memory slot in place -- it relabels the
@@ -229,7 +222,7 @@ def test_a_resumed_summary_is_asked_for_again_rather_than_told_to_resume(
 # ---------------------------------------------------------------------------
 
 
-def _superseded_test_the_research_cap_counts_a_task_that_is_writing_its_summary(db, stub, core, server, monkeypatch):
+def test_the_research_cap_counts_a_task_that_is_writing_its_summary(db, stub, core, server, monkeypatch):
     """A summary phase runs at [TRUTHFUL-REPORT]'s priority but is still the same work.
 
     `[RESEARCH]` is capped at 2 per caller per partner. Once the slot has been
@@ -259,7 +252,7 @@ def _superseded_test_the_research_cap_counts_a_task_that_is_writing_its_summary(
     )
 
 
-def _superseded_test_the_research_cap_counts_a_displaced_summary_sitting_in_the_queue(
+def test_the_research_cap_counts_a_displaced_summary_sitting_in_the_queue(
     db, stub, core, server, monkeypatch
 ):
     """Same rule, read from the queue instead of the slot.

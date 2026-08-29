@@ -555,7 +555,7 @@ def test_status_success_reports_identity_and_layer(core, world):
     assert result["queue_depth"] == 0, f"expected queue_depth 0, got {result['queue_depth']}"
 
 
-def _superseded_test_status_reports_queued_breakdown_highest_priority_first_and_paused(core, world):
+def test_status_reports_queued_breakdown_highest_priority_first_and_paused(core, world):
     core.handshake(requester_uuid=world["orch"]["uuid"], partner_title="lit-review")
     set_ext(core, "science_")
     target = world["worker"]
@@ -569,7 +569,7 @@ def _superseded_test_status_reports_queued_breakdown_highest_priority_first_and_
     core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
               message="r1", behavior="[RESEARCH]")
     core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-              message="mr1", behavior="[TRUTHFUL-REPORT]")
+              message="mr1", behavior="[MESSAGE-RESPONSE]")
 
     result = core.status(requester_uuid=target["uuid"])
     assert result["working"] is not None and result["working"]["behavior"] == "[TRUTHFUL-REPORT]", (
@@ -581,7 +581,7 @@ def _superseded_test_status_reports_queued_breakdown_highest_priority_first_and_
     assert result["queue_depth"] == 3, f"expected queue_depth 3, got {result['queue_depth']}"
 
     behaviors_in_order = [q["behavior"] for q in result["queued"]]
-    assert behaviors_in_order == ["[QUERY]", "[TRUTHFUL-REPORT]", "[RESEARCH]"], (
+    assert behaviors_in_order == ["[QUERY]", "[MESSAGE-RESPONSE]", "[RESEARCH]"], (
         f"expected queued ordered highest-priority-first (2, 3, 4), got {behaviors_in_order} "
         f"from {result['queued']!r}"
     )
@@ -593,8 +593,8 @@ def _superseded_test_status_reports_queued_breakdown_highest_priority_first_and_
     assert by_behavior["[RESEARCH]"]["paused"] == 0, (
         f"the fresh [RESEARCH] must not be reported paused, got {by_behavior['[RESEARCH]']!r}"
     )
-    assert by_behavior["[TRUTHFUL-REPORT]"]["priority"] == priority_of(core.db, "[TRUTHFUL-REPORT]"), (
-        f"expected the correct priority reported, got {by_behavior['[TRUTHFUL-REPORT]']!r}"
+    assert by_behavior["[MESSAGE-RESPONSE]"]["priority"] == priority_of(core.db, "[MESSAGE-RESPONSE]"), (
+        f"expected the correct priority reported, got {by_behavior['[MESSAGE-RESPONSE]']!r}"
     )
 
 
@@ -991,39 +991,7 @@ def test_send_rejects_no_handshake(core, world):
     assert after == before, "a refused send must not be queued"
 
 
-def test_a_second_request_is_refused_by_the_WAIT_before_any_cap(core, world):
-    """The forced interruption reaches a caller long before `max_outstanding` does.
-
-    `label_caps.max_outstanding` is 3 for `[QUERY]` and 2 for `[RESEARCH]`, but
-    those numbers are now unreachable per caller: sending ONE request forces the
-    sender, and a forced agent's second request is refused with
-    `already_awaiting_an_answer` -- a different code, raised earlier, for a
-    different reason.
-
-    This test pins the rule that actually governs today so the behaviour is not
-    silently assumed to be the cap. **The caps are consequently dead
-    configuration for a single caller** and are worth revisiting: either they
-    should go, or `[RESEARCH]` should not force its sender.
-    """
-    core.handshake(requester_uuid=world["orch"]["uuid"], partner_title="lit-review")
-    set_ext(core, "science_")
-    core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-              message="m0", behavior="[QUERY]")
-    with pytest.raises(Rejected) as exc:
-        core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-                  message="m1", behavior="[QUERY]")
-    assert exc.value.code == "already_awaiting_an_answer", (
-        f"the wait must refuse before the cap is ever consulted, got {exc.value.code!r}"
-    )
-    # And the cap is still reachable when each request comes from a caller that
-    # is not itself waiting -- the count is per (caller, label), not global.
-    core.resolve_wait(partner_id=world["orch"]["id"], body="answered")
-    result = core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-                       message="m2", behavior="[QUERY]")
-    assert result["behavior"] == "[QUERY]", "once answered, it may send again"
-
-
-def _superseded_test_send_over_queue_admits_boundary_and_refuses_third(core, world):
+def test_send_over_queue_admits_boundary_and_refuses_third(core, world):
     """[RESEARCH]'s cap (label_caps.max_outstanding=2) is keyed
     (partner_id, caller_id, behavior) and counts the WORKING slot. One in the
     working slot plus one queued is exactly 2: the second send must be
@@ -1081,7 +1049,7 @@ def _superseded_test_send_over_queue_admits_boundary_and_refuses_third(core, wor
     )
 
 
-def _superseded_test_send_over_queue_is_per_caller(core, world):
+def test_send_over_queue_is_per_caller(core, world):
     """A DIFFERENT caller's [RESEARCH] cap is untouched by the first caller's.
 
     The second handshake row is written directly rather than through
@@ -1117,13 +1085,13 @@ def _superseded_test_send_over_queue_is_per_caller(core, world):
     assert count == 1, f"expected bridge's own [RESEARCH] queue count to be 1, got {count}"
 
 
-def _superseded_test_send_uncapped_label_never_refuses(core, world):
-    """[TRUTHFUL-REPORT] has max_outstanding=NULL in label_caps: it must never
+def test_send_uncapped_label_never_refuses(core, world):
+    """[MESSAGE-RESPONSE] has max_outstanding=NULL in label_caps: it must never
     refuse, no matter how many are outstanding.
 
     [ERROR] is uncapped too, but it is a blocking label -- sending one stops
     the sender, so a second send from the same agent is refused for a reason
-    that has nothing to do with caps. [TRUTHFUL-REPORT] isolates the cap
+    that has nothing to do with caps. [MESSAGE-RESPONSE] isolates the cap
     question.
     """
     core.handshake(requester_uuid=world["orch"]["uuid"], partner_title="lit-review")
@@ -1131,15 +1099,15 @@ def _superseded_test_send_uncapped_label_never_refuses(core, world):
     for i in range(10):
         result = core.send(
             requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-            message=f"msg-{i}", behavior="[TRUTHFUL-REPORT]",
+            message=f"msg-{i}", behavior="[MESSAGE-RESPONSE]",
         )
-        assert result["behavior"] == "[TRUTHFUL-REPORT]", (
+        assert result["behavior"] == "[MESSAGE-RESPONSE]", (
             f"send #{i} of an uncapped label must not refuse, got {result!r}"
         )
     total = queue_count(core.db, world["worker"]["id"], caller_id=world["orch"]["id"],
-                        behavior="[TRUTHFUL-REPORT]")
+                        behavior="[MESSAGE-RESPONSE]")
     working = core.working_task(partner_id=world["worker"]["id"])
-    working_is_error = working is not None and working["behavior"] == "[TRUTHFUL-REPORT]"
+    working_is_error = working is not None and working["behavior"] == "[MESSAGE-RESPONSE]"
     assert total + (1 if working_is_error else 0) == 10, (
         f"expected 10 tasks in flight total (queued + working), got {total} queued and "
         f"working={working['behavior'] if working else None}"
@@ -1156,8 +1124,7 @@ def test_read_success_paginates_newest_first(core, world):
     set_ext(core, "science_")
     for i in range(3):
         core.send(requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
-                   message=f"m{i}", behavior="[QUERY]")
-        core.resolve_wait(partner_id=world["orch"]["id"], body="ok")
+                   message=f"m{i}", behavior="[MESSAGE-RESPONSE]")
     result = core.read(requester_uuid=world["orch"]["uuid"], partner_title="lit-review", page=1, page_size=2)
     assert result["total"] == 3, f"expected total 3, got {result!r}"
     bodies = [m["body"] for m in result["messages"]]
@@ -1251,7 +1218,7 @@ def test_extend_project_rejects_cross_source(core, world):
 # ---------------------------------------------------------------------------
 
 
-def _superseded_test_a_strictly_higher_arrival_displaces_the_working_task_and_stops_the_remote(core, world):
+def test_a_strictly_higher_arrival_displaces_the_working_task_and_stops_the_remote(core, world):
     """No agent decides to stop another agent.
 
     There is no interrupt capability. A partner is stopped only as a side
@@ -1265,8 +1232,6 @@ def _superseded_test_a_strictly_higher_arrival_displaces_the_working_task_and_st
         requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
         message="do work", behavior="[RESEARCH]",
     )
-    # Sending a request forces the sender; clear it so this test can keep driving.
-    core.resolve_wait(partner_id=world["orch"]["id"], body="proceed")
     working_before = core.working_task(partner_id=world["worker"]["id"])
     assert working_before is not None and working_before["behavior"] == "[RESEARCH]", (
         f"precondition failed: expected a working [RESEARCH] task, got {working_before!r}"
@@ -1304,7 +1269,7 @@ def _superseded_test_a_strictly_higher_arrival_displaces_the_working_task_and_st
     )
 
 
-def _superseded_test_an_equal_priority_arrival_does_not_displace_and_does_not_stop_the_remote(core, world):
+def test_an_equal_priority_arrival_does_not_displace_and_does_not_stop_the_remote(core, world):
     """The counterpart: a tie leaves the working task alone.
 
     This is the rule that keeps two callers at the same priority from
@@ -1317,8 +1282,6 @@ def _superseded_test_an_equal_priority_arrival_does_not_displace_and_does_not_st
         requester_uuid=world["orch"]["uuid"], queried_partner_title="lit-review",
         message="do work", behavior="[RESEARCH]",
     )
-    # Sending a request forces the sender; clear it so this test can keep driving.
-    core.resolve_wait(partner_id=world["orch"]["id"], body="proceed")
     # A second [RESEARCH] ties with the first on priority. The label's cap of
     # two is what makes the second admissible at all.
     core.send(
@@ -1593,35 +1556,35 @@ def test_begin_summary_phase_raises_priority_and_keeps_original_body(core, pair)
 def test_reply_behavior_matches_label_caps(core):
     cases = {
         "[RESEARCH]": "[TRUTHFUL-REPORT]",
-        "[QUERY]": None,
+        "[QUERY]": "[MESSAGE-RESPONSE]",
         # An [ERROR] is answered like any other question. A Caller that corrects
         # a blocked Partner otherwise has no way to know the correction landed.
-        "[ERROR]": None,
+        "[ERROR]": "[MESSAGE-RESPONSE]",
         "[IDLE]": None,
         "[TRUTHFUL-REPORT]": None,
-        "[TRUTHFUL-REPORT]": None,
+        "[MESSAGE-RESPONSE]": None,
     }
     for behavior, expected in cases.items():
         actual = core.reply_behavior(behavior)
         assert actual == expected, f"reply_behavior({behavior!r}): expected {expected!r}, got {actual!r}"
 
 
-def _superseded_test_report_back_pushes_without_auto_delivering(core, pair):
+def test_report_back_pushes_without_auto_delivering(core, pair):
     tid = pair["caller1"]["id"]
     result = core.report_back(
         to_partner_id=tid, from_partner_id=pair["target"]["id"],
-        behavior="[TRUTHFUL-REPORT]", body="the answer",
+        behavior="[MESSAGE-RESPONSE]", body="the answer",
     )
     assert result["queue_depth"] == 1, f"expected queue_depth 1, got {result!r}"
     assert core.working_task(partner_id=tid) is None, "report_back only enqueues; it must not deliver on its own"
     stored = core.db.read_one("SELECT * FROM messages WHERE id = ?", (result["message_id"],))
-    assert stored is not None and stored["behavior"] == "[TRUTHFUL-REPORT]", (
+    assert stored is not None and stored["behavior"] == "[MESSAGE-RESPONSE]", (
         f"a stored label must be written to messages, got {stored!r}"
     )
 
     set_ext(core, "science_")
     delivered = core.advance(partner_id=tid)
-    assert delivered is not None and delivered["delivered"] == "[TRUTHFUL-REPORT]", (
+    assert delivered is not None and delivered["delivered"] == "[MESSAGE-RESPONSE]", (
         f"a later advance() must deliver what report_back queued, got {delivered!r}"
     )
 
@@ -1637,9 +1600,9 @@ def test_report_back_has_no_handshake_requirement(core, pair):
     assert handshake_count == 0, "precondition: no handshake should exist between these two"
     result = core.report_back(
         to_partner_id=pair["caller1"]["id"], from_partner_id=pair["target"]["id"],
-        behavior="[TRUTHFUL-REPORT]", body="it broke",
+        behavior="[MESSAGE-RESPONSE]", body="it broke",
     )
-    assert result["behavior"] == "[TRUTHFUL-REPORT]", f"report_back must succeed with no handshake, got {result!r}"
+    assert result["behavior"] == "[MESSAGE-RESPONSE]", f"report_back must succeed with no handshake, got {result!r}"
 
 
 def test_report_back_refuses_delegation_and_holds_but_carries_every_report(core, world):
@@ -1668,7 +1631,7 @@ def test_report_back_refuses_delegation_and_holds_but_carries_every_report(core,
         )["n"]
         assert depth == 0, f"{behavior} was refused but still queued ({depth} rows)"
 
-    for behavior in ("[QUERY]", "[ERROR]", "[TRUTHFUL-REPORT]", "[TRUTHFUL-REPORT]"):
+    for behavior in ("[QUERY]", "[ERROR]", "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]"):
         result = core.report_back(to_partner_id=caller["id"], from_partner_id=worker["id"],
                                   behavior=behavior, body=f"a {behavior}")
         assert result["behavior"] == behavior, (
@@ -1812,7 +1775,7 @@ def test_get_permissions_reports_drift(core, world):
     )
 
 
-def _superseded_test_a_partner_on_an_uncancellable_remote_can_still_be_displaced(core, db, monkeypatch):
+def test_a_partner_on_an_uncancellable_remote_can_still_be_displaced(core, db, monkeypatch):
     """A remote with no cancel must not be undisplaceable.
 
     Claude Science has no usable interrupt — its only route needs an execution
@@ -1870,7 +1833,7 @@ def _superseded_test_a_partner_on_an_uncancellable_remote_can_still_be_displaced
     )
 
 
-def _superseded_test_a_cancel_that_genuinely_fails_still_stops_the_displacement(core, db, monkeypatch):
+def test_a_cancel_that_genuinely_fails_still_stops_the_displacement(core, db, monkeypatch):
     """"This remote has no cancel" and "the cancel failed" are different facts.
 
     The first must not block a displacement; the second must, because the

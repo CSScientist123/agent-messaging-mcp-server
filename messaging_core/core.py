@@ -65,7 +65,7 @@ from extension.base import RemoteExtension, RemoteFailure
 from messaging_core import templates
 from messaging_core.db import Database
 from messaging_core.errors import NeedsRemote, Rejected
-from messaging_core.labels import BEHAVIORS, BLOCKING_BEHAVIORS, SHORTCUT_BEHAVIORS
+from messaging_core.labels import BEHAVIORS, BLOCKING_BEHAVIORS
 from messaging_core.slots import WorkingSlots
 
 # No `logging.basicConfig` here or anywhere else in this module -- that
@@ -334,15 +334,6 @@ class MessagingCore:
         self.db = db
         self.extension = extension
         self.slots = slots if slots is not None else WorkingSlots()
-        # Answers that have arrived and not yet been folded into a prompt, keyed
-        # by the partner that was waiting. In memory beside the slots and for the
-        # same reason: it describes one turn, and it is consumed by the very next
-        # `advance` on that partner.
-        self._pending_resolution: dict[int, tuple[str, str]] = {}
-        # Which request label each waiting partner is waiting on. The answer
-        # itself carries no label -- that is the design -- so the REQUEST's label
-        # is what the resolution prompt names back to the agent.
-        self._waiting_on: dict[int, str] = {}
         # Displacements where the previous turn could not be stopped because the
         # remote has no cancel, as `(partner_id, displaced_label, new_label)`.
         # Not part of the contract; the record exists so an operator can see
@@ -1543,11 +1534,8 @@ class MessagingCore:
         rows = self.db.read(
             """
             SELECT m.id AS id, m.behavior AS behavior, m.body AS body, m.created_at AS created_at,
-                   m.response_datetime AS response_datetime,
-                   p.title AS from_title,
-                   r.body AS response_body
+                   p.title AS from_title
             FROM messages m JOIN partners p ON p.id = m.from_partner
-            LEFT JOIN message_response r ON r.message_id = m.id
             WHERE m.to_partner = ?
             ORDER BY m.id DESC
             LIMIT ? OFFSET ?
@@ -1561,12 +1549,6 @@ class MessagingCore:
                 "behavior": r["behavior"],
                 "body": r["body"],
                 "created_at": r["created_at"],
-                # LEFT JOIN, so an unanswered request still appears -- with its
-                # answer as None rather than being absent. `read` exists so an
-                # agent can recover context it has lost, and a question without
-                # its answer is half the context.
-                "response": r["response_body"],
-                "response_datetime": r["response_datetime"],
             }
             for r in rows
         ]
@@ -2073,73 +2055,6 @@ class MessagingCore:
                         "in that direction.",
                     )
 
-        # Refused BEFORE anything is admitted. This check used to run after the
-        # push had already committed, so a caller told "you are still waiting"
-        # had nonetheless just put its message in the target's queue -- a refusal
-        # that half-applied, which is the one outcome a rejection must never be.
-        if behavior in BLOCKING_BEHAVIORS and self._already_waiting(requester["id"]):
-            # It asked something and has not been answered, so it is stopped --
-            # a stopped agent is not sending anything, and a second question
-            # would push the first back into the queue as a paused row,
-            # breaking the one-paused-row-per-label rule the resume prompt
-            # depends on.
-            raise Rejected(
-                "already_awaiting_an_answer",
-                "This agent has already asked a question that has not been answered; it "
-                "is stopped until it is. Ask again once the answer arrives.",
-            )
-
-        # THE SHORTCUT CHANNEL.
-        #
-        # If the target is itself under a forced interruption, its slot is empty
-        # and staying empty -- so a row pushed into its main queue would sit
-        # there unread until its own answer arrives. That is exactly backwards
-        # for the message most likely to be sent at this moment: a Partner that
-        # hit a mid-task problem needs to reach a Caller that is waiting, and it
-        # needs to reach it NOW, because the Caller is waiting on something this
-        # message may be the answer to.
-        #
-        # So a request aimed at a waiting agent goes into the shortcut channel
-        # instead: a second, temporary priority queue read ahead of the main one
-        # and destroyed when the wait ends.
-        #
-        # `[RESEARCH]` is excluded by name even though it is a request. The
-        # channel exists for mid-task clarification; delegating NEW work to an
-        # agent that has already said it cannot proceed is not clarification, and
-        # it would still be sitting there unstarted when the channel is deleted.
-        if self.slots.is_forced(target["id"]) and behavior in SHORTCUT_BEHAVIORS:
-            def _shortcut(conn: sqlite3.Connection) -> int:
-                conn.execute(
-                    "INSERT INTO shortcut_channel "
-                    "(waiting_partner, from_partner, behavior, body) VALUES (?, ?, ?, ?)",
-                    (target["id"], requester["id"], behavior, message),
-                )
-                return conn.execute(
-                    "SELECT COUNT(*) FROM shortcut_channel WHERE waiting_partner = ?",
-                    (target["id"],),
-                ).fetchone()[0]
-
-            depth = self.db.write(_shortcut)
-            logger.info("%s reached waiting %s through the shortcut channel (%s, depth %s)",
-                        requester["title"], target["title"], behavior, depth)
-            return {
-                "message_id": None,
-                "behavior": behavior,
-                "queue_depth": depth,
-                "partner_id": target["id"],
-                "delivered": None,
-                "shortcut": True,
-            }
-
-        if self.slots.is_forced(target["id"]) and behavior == "[RESEARCH]":
-            raise Rejected(
-                "target_is_waiting",
-                "That partner sent a request of its own and cannot proceed until it is "
-                "answered, so it cannot take on new delegated work right now.",
-                next_call="Answer what it is waiting on, or send the [RESEARCH] once it "
-                "is no longer waiting.",
-            )
-
         store = self._stored(behavior)
         lock = self.slots.lock_for(target["id"])
 
@@ -2189,6 +2104,17 @@ class MessagingCore:
         # at the 2 they already hold, which leaves exactly one label -- a
         # `[TRUTHFUL-REPORT]` at 1 -- able to displace a waiting agent. The
         # question IS the hold.
+        if behavior in BLOCKING_BEHAVIORS and self._already_waiting(requester["id"]):
+            # It asked something and has not been answered, so it is stopped --
+            # a stopped agent is not sending anything, and a second question
+            # would push the first back into the queue as a paused row,
+            # breaking the one-paused-row-per-label rule the resume prompt
+            # depends on.
+            raise Rejected(
+                "already_awaiting_an_answer",
+                "This agent has already asked a question that has not been answered; it "
+                "is stopped until it is. Ask again once the answer arrives.",
+            )
         if behavior in BLOCKING_BEHAVIORS:
             self._await_answer(
                 requester, behavior=behavior,
@@ -2267,41 +2193,84 @@ class MessagingCore:
         project = self._project_by_id(partner["project_id"])
         lock = self.slots.lock_for(partner_id)
         with lock:
-            # A forced interruption is checked BEFORE the queue is read, because
-            # an empty queue is not a reason to do nothing here: the answer that
-            # lifts a force is not a queue row, and returning early on an empty
-            # queue would strand an agent whose answer has already arrived.
-            if self.slots.is_forced(partner_id):
-                return None
-
             label = self.db.read_one(_HEAD_LABEL_SQL, {"pid": partner_id})
-            head = None if label is None else self.db.read_one(
+            if label is None:
+                return None
+            head = self.db.read_one(
                 _HEAD_ROW_SQL, {"pid": partner_id, "behavior": label["behavior"]}
             )
-            if head is None and partner_id not in self._pending_resolution:
-                # Nothing queued and no answer waiting to be handed over.
+            if head is None:
                 return None
             working = self.slots.get(partner_id)
-            head_priority = None if head is None else head["priority"]
+            head_priority = head["priority"]
 
-            # A FORCED interruption: this agent sent a request and cannot
-            # proceed until it is answered. Its slot is empty and must stay
-            # empty -- no arrival of any priority may fill it.
+            # An agent waiting on its own question is the one case where the
+            # slot's occupant does not defend it by priority -- because the
+            # thing that clears it is not a displacement, it is the answer.
             #
-            # This is what makes the two kinds of interruption ordered rather
-            # than racing. A priority interruption displaces a working task; a
-            # forced one means there is no working task to displace and none may
-            # start. While a force is open, priority interruption simply does not
-            # occur.
-            #
-            # The answer does not arrive here as a queued message. It is recorded
-            # against the request in `message_response` and handed to
-            # `resolve_wait`, which cancels the force and lets the next pass fill
-            # the slot from the queue -- folding the answer into whatever comes
-            # next via `templates.resolution`, because a bare response is close
-            # to useless as a prompt.
-            _pending = self._pending_resolution.pop(partner_id, None)
-            asked, resolution_text = _pending if _pending else (None, None)
+            # `[MESSAGE-RESPONSE]` is the answer's label, so its arrival at the
+            # head is what ends the wait. The question is discarded here and
+            # never requeued: it was asked, it was answered, and requeuing it
+            # would ask again. The answer's own row is consumed too -- it is
+            # not promoted as a task in its own right, because a bare response
+            # is close to useless as a prompt. Its text is folded into whatever
+            # the queue holds NEXT, which is what `resolution` renders.
+            resolution_text = None
+            if working is not None and working.get("awaiting_resolution"):
+                # The answer is looked for BY LABEL rather than taken from the
+                # head, and that is not an optimisation -- it is what keeps the
+                # wait from deadlocking.
+                #
+                # `[MESSAGE-RESPONSE]` sits at priority 3, below `[QUERY]` and
+                # `[ERROR]` at 2 and `[TRUTHFUL-REPORT]` at 1. So an agent whose
+                # paused work happens to carry one of those labels has a queue
+                # whose head is NOT the answer, however long the answer has been
+                # sitting there. Reading the head would find that work, refuse
+                # to displace an equal-or-better slot, and return None on every
+                # pass forever: the agent waits for an answer that has already
+                # arrived, and the work waits for an agent that will never be
+                # released.
+                #
+                # Priority orders WORK. It has nothing to say about the one
+                # message that ends a wait, because that message is not work --
+                # it is the thing that lets everything else start moving again.
+                answer = self.db.read_one(
+                    _HEAD_ROW_SQL, {"pid": partner_id, "behavior": "[MESSAGE-RESPONSE]"}
+                )
+                if answer is None:
+                    # No answer yet. Fall through to the ordinary strict-beat
+                    # comparison, where the question is defended at its own
+                    # natural priority -- which is the point of not raising it.
+                    # `[QUERY]` and `[ERROR]` sit at 2, so only a
+                    # `[TRUTHFUL-REPORT]` at 1 can take the slot from a waiting
+                    # agent; everything else queues behind the question, and
+                    # that is what makes an unanswered question a blocker.
+                    #
+                    # A `[TRUTHFUL-REPORT]` winning does not lose the question:
+                    # the swap below carries `awaiting_resolution` onto the
+                    # requeued row, so when it comes back it re-enters the wait
+                    # instead of being handed to the agent as work it asked.
+                    pass
+                else:
+                    head = answer
+                    head_priority = head["priority"]
+                    resolution_text = head["body"]
+                    asked = working["behavior"]
+                    answered_by = head["caller_id"]
+                    consumed_id = head["id"]
+                    self.db.write(lambda conn: conn.execute(
+                        "DELETE FROM message_queue WHERE id = ?", (consumed_id,)
+                    ))
+                    self.slots.clear(partner_id)
+                    working = None
+                    # Re-read the head: it is now whatever the agent should do
+                    # next, and it may be nothing at all.
+                    label = self.db.read_one(_HEAD_LABEL_SQL, {"pid": partner_id})
+                    head = None if label is None else self.db.read_one(
+                        _HEAD_ROW_SQL, {"pid": partner_id, "behavior": label["behavior"]}
+                    )
+                    head_priority = None if head is None else head["priority"]
+
             if head is None:
                 # The answer arrived and there is nothing waiting behind it.
                 # This is the one case where a bare response IS the right
@@ -2319,18 +2288,18 @@ class MessagingCore:
                 )
                 remote_call_id = ext.deliver_message(
                     partner_id_in_remote=partner["partner_id_in_remote"],
-                    behavior=asked, body=prompt,
+                    behavior="[MESSAGE-RESPONSE]", body=prompt,
                 )
                 self.slots.set(partner_id, {
-                    "id": None, "partner_id": partner_id, "caller_id": partner["id"],
-                    "behavior": asked, "body": resolution_text,
+                    "id": None, "partner_id": partner_id, "caller_id": answered_by,
+                    "behavior": "[MESSAGE-RESPONSE]", "body": resolution_text,
                     "in_process": 0, "message_id": None, "enqueued_at": _now(),
-                    "started_at": _now(), "priority": self._priority_of(asked),
+                    "started_at": _now(), "priority": self._priority_of("[MESSAGE-RESPONSE]"),
                     "prompt": prompt, "remote_call_id": remote_call_id,
                 })
                 logger.info("delivered a resolved %s to partner %s with nothing behind it",
                             asked, partner_id)
-                return {"delivered": None, "resolved": asked,
+                return {"delivered": "[MESSAGE-RESPONSE]", "resolved": asked,
                         "resumed": False, "displaced": None,
                         "remote_call_id": remote_call_id}
 
@@ -2757,92 +2726,6 @@ class MessagingCore:
             "delivered": delivered,
         }
 
-    def park_for_approval(self, *, partner_id: int) -> dict | None:
-        """Park a Partner the Polling Server found blocked on an approval.
-
-        The same state `_await_answer` produces when an agent raises an `[ERROR]`
-        itself: the working task pushed back paused, the slot emptied, and a
-        forced interruption opened so nothing fills it until the Caller answers.
-
-        The difference is only who noticed. An agent that hits a problem says so;
-        an agent stopped on an approval prompt cannot say anything, so the
-        Polling Server says it on the agent's behalf. Both must leave the Partner
-        in the same state, or the answer would resolve one and not the other.
-
-        Returns what the slot held, so the caller can attribute the `[ERROR]`.
-        """
-        with self.slots.lock_for(partner_id):
-            working = self.slots.get(partner_id)
-            if working is not None:
-                self._requeue(working)
-            self.slots.clear(partner_id)
-            self.slots.force(partner_id)
-            self._waiting_on[partner_id] = "[ERROR]"
-        logger.info("parked partner %s on an approval prompt", partner_id)
-        return working
-
-    def resolve_wait(self, *, partner_id: int, body: str,
-                     from_partner_id: int | None = None) -> bool:
-        """Answer the request a partner is waiting on, ending its interruption.
-
-        This is what replaces `[MESSAGE-RESPONSE]` as a label. A response is not
-        a message: it is not queued, it never competes for the slot on priority,
-        and it cannot be outranked by the very work it unblocks. It arrives here,
-        cancels the force, and is folded into the next prompt.
-
-        Three things happen, and the order matters. The answer is recorded
-        against its request in `message_response` and the request is stamped
-        answered -- both in one transaction, so a request can never read as
-        answered without the answer existing. The shortcut channel opened for
-        this wait is destroyed, because a row in it can never outlive the
-        interruption it routed around. And the force is lifted, which is what
-        lets the next `advance` fill the slot from the queue.
-
-        Returns whether a wait was actually open. Answering an agent that is not
-        waiting is a no-op rather than an error: a response can be observed by a
-        drain thread and by a push at the same moment, and the second observer
-        must not raise.
-        """
-        with self.slots.lock_for(partner_id):
-            if not self.slots.is_forced(partner_id):
-                return False
-
-            def _record(conn: sqlite3.Connection) -> None:
-                # The request being answered is the newest unanswered one this
-                # partner sent. `message_response` is keyed on the request, so
-                # an unstored request -- an `[ERROR]`, which is system-handled
-                # and deliberately has no row -- simply has nothing to record
-                # against, and the wait still resolves.
-                row = conn.execute(
-                    "SELECT id FROM messages "
-                    " WHERE from_partner = ? AND response_datetime IS NULL "
-                    " ORDER BY id DESC LIMIT 1",
-                    (partner_id,),
-                ).fetchone()
-                if row is not None:
-                    conn.execute(
-                        "INSERT INTO message_response (message_id, from_partner, body) "
-                        "VALUES (?, ?, ?)",
-                        (row[0], from_partner_id or partner_id, body),
-                    )
-                    conn.execute(
-                        "UPDATE messages SET response_datetime = ? WHERE id = ?",
-                        (_now(), row[0]),
-                    )
-                # The channel existed only for the duration of this wait.
-                conn.execute(
-                    "DELETE FROM shortcut_channel WHERE waiting_partner = ?", (partner_id,)
-                )
-
-            self.db.write(_record)
-            self._pending_resolution[partner_id] = (
-                self._waiting_on.pop(partner_id, "[QUERY]"), body,
-            )
-            self.slots.release_force(partner_id)
-
-        logger.info("wait resolved for partner %s", partner_id)
-        return True
-
     def release(self, *, partner_id: int) -> dict | None:
         """Empty the working slot because the remote finished its turn.
 
@@ -2912,26 +2795,30 @@ class MessagingCore:
                     "could not stop %s while it waits on a %s", requester["title"], behavior
                 )
 
-            # The working task goes back to the queue paused, and the slot is
-            # left EMPTY -- not filled with a placeholder standing in for the
-            # question.
-            #
-            # An earlier design put the question itself in the slot, so that
-            # `advance` would find the slot occupied and leave it alone. That
-            # worked, but it made the slot lie: `status` reported an agent as
-            # working on a task it had not been given, and the placeholder had to
-            # carry a `caller_id` it did not really have just to satisfy a CHECK
-            # it would never be measured against.
-            #
-            # Empty plus a flag says the true thing. `slots.force` marks the
-            # partner as waiting on its own request; `advance` refuses to fill a
-            # forced slot no matter what arrives, which is what makes a forced
-            # interruption outrank a priority one rather than race it.
             if working is not None:
                 self._requeue(working)
-            self.slots.clear(requester["id"])
-            self.slots.force(requester["id"])
-            self._waiting_on[requester["id"]] = behavior
+            self.slots.set(requester["id"], {
+                "id": None,
+                "partner_id": requester["id"],
+                # The agent that was asked. A queue row may never name its own
+                # recipient as its sender (`CHECK (caller_id <> partner_id)`),
+                # and although this task is never requeued, carrying an illegal
+                # value would make any future path that touched it fail on a
+                # constraint rather than on the rule it broke.
+                "caller_id": target_id,
+                "behavior": behavior,
+                "body": templates.awaiting_resolution(
+                    asked_behavior=behavior, target_title=target_title
+                ),
+                "in_process": 0,
+                "message_id": None,
+                "enqueued_at": _now(),
+                "started_at": _now(),
+                "priority": self._priority_of(behavior),
+                "awaiting_resolution": True,
+                "prompt": None,
+                "remote_call_id": None,
+            })
         logger.info("%s is waiting on a %s it sent to %s",
                     requester["title"], behavior, target_title)
 
@@ -2942,8 +2829,6 @@ class MessagingCore:
         `[TRUTHFUL-REPORT]` outranks a waiting agent, so a question really can
         be sitting displaced while the agent writes a summary.
         """
-        if self.slots.is_forced(partner_id):
-            return True
         working = self.slots.get(partner_id)
         if working is not None and working.get("awaiting_resolution"):
             return True

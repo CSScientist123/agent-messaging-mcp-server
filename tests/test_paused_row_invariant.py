@@ -32,7 +32,7 @@ from messaging_core.errors import NeedsRemote, Rejected
 
 from tests.test_polling_working_slot import make_pair
 
-SENDABLE = ["[QUERY]", "[ERROR]", "[TRUTHFUL-REPORT]", "[TRUTHFUL-REPORT]", "[RESEARCH]"]
+SENDABLE = ["[QUERY]", "[ERROR]", "[MESSAGE-RESPONSE]", "[TRUTHFUL-REPORT]", "[RESEARCH]"]
 
 # Sending one of these stops the sender and gives its slot to the question, so
 # a sequence that includes them exercises the interruption path as well as the

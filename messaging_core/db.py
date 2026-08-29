@@ -55,17 +55,7 @@ _ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("message_queue",
      "awaiting_resolution INTEGER NOT NULL DEFAULT 0 "
      "CHECK (awaiting_resolution IN (0, 1))"),
-    ("messages", "response_datetime TEXT"),
 )
-
-# `label_caps.is_request` is deliberately NOT in the list above, and neither are
-# the two new tables. A database that predates them also predates the four-label
-# seed those tables and that column are meaningful against -- adding the column
-# with DEFAULT 0 would say "nothing is a request", which is worse than absent.
-#
-# This is the case `_reconcile_added_columns` names as out of scope: not a column
-# with a default, but a change of what the data MEANS. It needs a real migration,
-# and for a development database the answer is to recreate it.
 
 
 class Database:
