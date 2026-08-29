@@ -2740,6 +2740,30 @@ class MessagingCore:
             "delivered": delivered,
         }
 
+    def park_for_approval(self, *, partner_id: int) -> dict | None:
+        """Park a Partner the Polling Server found blocked on an approval.
+
+        The same state `_await_answer` produces when an agent raises an `[ERROR]`
+        itself: the working task pushed back paused, the slot emptied, and a
+        forced interruption opened so nothing fills it until the Caller answers.
+
+        The difference is only who noticed. An agent that hits a problem says so;
+        an agent stopped on an approval prompt cannot say anything, so the
+        Polling Server says it on the agent's behalf. Both must leave the Partner
+        in the same state, or the answer would resolve one and not the other.
+
+        Returns what the slot held, so the caller can attribute the `[ERROR]`.
+        """
+        with self.slots.lock_for(partner_id):
+            working = self.slots.get(partner_id)
+            if working is not None:
+                self._requeue(working)
+            self.slots.clear(partner_id)
+            self.slots.force(partner_id)
+            self._waiting_on[partner_id] = "[ERROR]"
+        logger.info("parked partner %s on an approval prompt", partner_id)
+        return working
+
     def resolve_wait(self, *, partner_id: int, body: str,
                      from_partner_id: int | None = None) -> bool:
         """Answer the request a partner is waiting on, ending its interruption.

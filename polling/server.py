@@ -421,6 +421,28 @@ class PollingServer:
             # it writes anything -- so this is worth recording and retrying
             # rather than treating as a lost message.
             self._record_error(exc)
+        except Rejected as exc:
+            if exc.code != "approval_is_an_error":
+                raise
+            # An approval can block a DELIVERY, not only a poll. The Antigravity
+            # adapter raises the same code from `deliver_message`, and that path
+            # used to escape this method entirely: the blanket handler in
+            # `_drain_loop` caught it, recorded it, and retried with backoff
+            # FOREVER while nobody was told. `advance` has already requeued the
+            # task by then, so the work survives -- but the Caller never hears,
+            # which is exactly what the approval doctrine exists to prevent.
+            #
+            # Route it the same way a poll-time approval goes.
+            task = core.working_task(partner_id=partner_id)
+            remote_id = self._partner_remote_id(partner_id)
+            if remote_id is not None:
+                extension = self.extensions.get(self._source_prefix_for(partner_id))
+                if extension is not None:
+                    self._stop_quietly(extension, remote_id, "stopped on an approval prompt")
+            self._raise_approval_to_caller(
+                core, partner_id, task or {"caller_id": None}, exc.message
+            )
+            return False
 
         task = core.working_task(partner_id=partner_id)
         if task is None:
@@ -590,8 +612,21 @@ class PollingServer:
         not an unconditional pre-emption, and describing it as the latter would
         promise a latency this does not provide.
         """
-        released = core.release(partner_id=partner_id)
-        caller_id = (released or task)["caller_id"]
+        # PARK, do not destroy.
+        #
+        # This used to call `core.release`, which pops the slot and discards what
+        # it held. The partner's in-flight work was silently lost: nothing
+        # requeued it, and for a [RESEARCH] the request text was not in `messages`
+        # either, so the Caller was told "send the work again" without being shown
+        # what the work was.
+        #
+        # Parking is what an agent that raises an [ERROR] itself already gets --
+        # its task pushed back paused and its slot held empty until an answer
+        # arrives. An approval detected by the Polling Server is the same
+        # situation reached from the outside, so it gets the same treatment, and
+        # the answer then resolves it through the same path.
+        parked = core.park_for_approval(partner_id=partner_id)
+        caller_id = (parked or task)["caller_id"]
         partner = self.db.read_one(
             "SELECT title, partner_id_in_remote FROM partners WHERE id = ?", (partner_id,)
         )
