@@ -2073,6 +2073,22 @@ class MessagingCore:
                         "in that direction.",
                     )
 
+        # Refused BEFORE anything is admitted. This check used to run after the
+        # push had already committed, so a caller told "you are still waiting"
+        # had nonetheless just put its message in the target's queue -- a refusal
+        # that half-applied, which is the one outcome a rejection must never be.
+        if behavior in BLOCKING_BEHAVIORS and self._already_waiting(requester["id"]):
+            # It asked something and has not been answered, so it is stopped --
+            # a stopped agent is not sending anything, and a second question
+            # would push the first back into the queue as a paused row,
+            # breaking the one-paused-row-per-label rule the resume prompt
+            # depends on.
+            raise Rejected(
+                "already_awaiting_an_answer",
+                "This agent has already asked a question that has not been answered; it "
+                "is stopped until it is. Ask again once the answer arrives.",
+            )
+
         # THE SHORTCUT CHANNEL.
         #
         # If the target is itself under a forced interruption, its slot is empty
@@ -2173,17 +2189,6 @@ class MessagingCore:
         # at the 2 they already hold, which leaves exactly one label -- a
         # `[TRUTHFUL-REPORT]` at 1 -- able to displace a waiting agent. The
         # question IS the hold.
-        if behavior in BLOCKING_BEHAVIORS and self._already_waiting(requester["id"]):
-            # It asked something and has not been answered, so it is stopped --
-            # a stopped agent is not sending anything, and a second question
-            # would push the first back into the queue as a paused row,
-            # breaking the one-paused-row-per-label rule the resume prompt
-            # depends on.
-            raise Rejected(
-                "already_awaiting_an_answer",
-                "This agent has already asked a question that has not been answered; it "
-                "is stopped until it is. Ask again once the answer arrives.",
-            )
         if behavior in BLOCKING_BEHAVIORS:
             self._await_answer(
                 requester, behavior=behavior,
