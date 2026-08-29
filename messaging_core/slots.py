@@ -54,6 +54,16 @@ class WorkingSlots:
         self._guard = threading.Lock()
         self._locks: dict[int, threading.RLock] = {}
         self._slots: dict[int, dict[str, Any]] = {}
+        # Partners under a FORCED interruption: they sent a request and cannot
+        # proceed until it is answered. Their slot is empty and must STAY empty
+        # -- this set is what says "empty on purpose" rather than "idle", and it
+        # is the difference between a partner waiting for an answer and one
+        # waiting for work.
+        #
+        # In memory for the same reason the slots are: it describes a turn that
+        # does not survive a restart, and a row claiming an agent is mid-wait
+        # after a crash would be a lie a reader could not detect.
+        self._forced: set[int] = set()
 
     def lock_for(self, partner_id: int) -> threading.RLock:
         """The lock guarding this partner's slot. Re-entrant, and safe to hold across I/O."""
@@ -78,6 +88,28 @@ class WorkingSlots:
         """Empty the slot and return what it held, or None if it was empty."""
         with self._guard:
             return self._slots.pop(partner_id, None)
+
+    def force(self, partner_id: int) -> None:
+        """Begin a forced interruption: the slot is empty and stays empty."""
+        with self._guard:
+            self._forced.add(partner_id)
+
+    def release_force(self, partner_id: int) -> bool:
+        """End one. Returns whether a forced interruption was actually open."""
+        with self._guard:
+            was = partner_id in self._forced
+            self._forced.discard(partner_id)
+            return was
+
+    def is_forced(self, partner_id: int) -> bool:
+        """Whether this partner is waiting on an answer to its own request."""
+        with self._guard:
+            return partner_id in self._forced
+
+    def forced(self) -> list[int]:
+        """Every partner currently under a forced interruption."""
+        with self._guard:
+            return list(self._forced)
 
     def occupied(self) -> list[int]:
         """Partner ids that currently hold a working task."""
